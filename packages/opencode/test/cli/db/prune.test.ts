@@ -1,6 +1,7 @@
 import { afterAll, expect, spyOn, test } from "bun:test"
 import { Database, type SQLQueryBindings } from "bun:sqlite"
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { randomBytes } from "node:crypto"
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statfsSync, writeFileSync } from "node:fs"
 import {
   chmod,
   copyFile,
@@ -17,7 +18,9 @@ import {
   writeFile,
 } from "node:fs/promises"
 import path from "node:path"
-import { Effect } from "effect"
+import { Effect, Layer } from "effect"
+import { OnlineReclaimIndexes } from "@opencode-ai/core/database/online-reclaim-indexes"
+import { OnlineReclaimProof } from "@opencode-ai/core/database/online-reclaim-proof"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { EventWriter } from "@opencode-ai/core/event/writer"
 import { PruneCommand } from "@/cli/cmd/db-prune"
@@ -49,6 +52,7 @@ type ProducerResult = {
 type Create = {
   parentID?: string
   payloadBytes?: number
+  eventCount?: number
   pendingV1?: boolean
   preparingV1?: boolean
   withdrawnV1?: boolean
@@ -97,7 +101,7 @@ type Report = {
   noopReason?: string
   retirementTarget?: { directory: string; identity: string | null; state: string } | null
   database: string
-  cutoff: string
+  cutoff: string | null
   selectedSessions: { sessionID: string; directory: string; ownedRows: Record<string, number>; reasons: string[] }[]
   excludedSessions: { sessionID: string; directory: string | null; reasons: string[] }[]
   retainedSessions: { sessionID: string; directory: string; ownedRows: Record<string, number>; reasons: string[] }[]
@@ -109,6 +113,21 @@ type Report = {
   reclamation: {
     ready: boolean
     reasons: string[]
+    method?: string
+    autoVacuum?: string
+    pageSizeBytes?: number | null
+    pageCountBefore?: number | null
+    pageCountAfter?: number | null
+    freelistBefore?: number | null
+    freelistAfter?: number | null
+    reserveBytes?: number | null
+    availableBytes?: number | null
+    plannedPeakBytes?: number | null
+    bounds?: Record<string, number>
+    remainingFreelistPages?: number | null
+    remainingWalFrames?: number | null
+    outstanding?: string[]
+    steps?: Record<string, unknown>[]
     allocatedBytes?: { status: string; totalBytes?: number }
     allocatedBytesBefore?: { status: string; totalBytes?: number }
     allocatedBytesAfter?: { status: string; totalBytes?: number }
@@ -135,6 +154,13 @@ type Report = {
   changedRows: number
   committed?: boolean
   deletedSessionIDs?: string[]
+  partialSessionIDs?: string[]
+  remainingSessionIDs?: string[]
+  changedRowsByTable?: Record<string, number>
+  skippedSessions?: { sessionID: string; reasons: string[] }[]
+  batches?: Record<string, unknown>[]
+  sessionProgress?: Record<string, unknown>[]
+  proofPreparation?: { complete: boolean; batches: number; rows: number; remaining: string[] }
 }
 
 const ownedCounts = (filename: string, sessionID: string) => {
@@ -774,6 +800,2593 @@ test("CLI apply deletes only the selected whole old Session and reclaims allocat
   }
 })
 
+test("online prune bounds one large Session, retries partial progress, and never claims a missing ID", async () => {
+  await using store = await producedStore([{ payloadBytes: 4 * 1024 * 1024 }, { payloadBytes: 512 * 1024 }])
+  const selected = produce(store, { create: { payloadBytes: 4 * 1024 * 1024 } })
+  const unselected = produce(store, { create: { payloadBytes: 512 * 1024 } })
+  const selectedID = selected.created[0]!.id
+  const unselectedID = unselected.created[0]!.id
+  const cutoffAt = Date.now() - 5
+  const cutoff = new Date(cutoffAt).toISOString()
+  backdateSession(store.filename, selectedID, cutoffAt - 1_000)
+  backdateSession(store.filename, unselectedID, cutoffAt - 1_000)
+  const beforeSelected = ownedCounts(store.filename, selectedID)
+  const beforeUnselected = ownedCounts(store.filename, unselectedID)
+
+  const inventory = parseReport(
+    await runCLI(store, ["--online", "--before", cutoff, "--session", selectedID, "--reserve-bytes", "1"]),
+  )
+  expect(inventory.action).toBe("inventory")
+  expect(inventory.database).toBe(await realpath(store.filename))
+  expect(inventory.deletionScope.sessionIDs).toEqual([selectedID])
+  expect(inventory.reclamation.ready).toBe(true)
+  expect(inventory.reclamation.autoVacuum).toBe("incremental")
+  expect(ownedCounts(store.filename, selectedID)).toEqual(beforeSelected)
+  expect(ownedCounts(store.filename, unselectedID)).toEqual(beforeUnselected)
+
+  const partial = parseReport(
+    await runCLI(
+      store,
+      [
+        "--online",
+        "--before",
+        cutoff,
+        "--session",
+        selectedID,
+        "--apply",
+        "--reserve-bytes",
+        "1",
+        "--batch-rows",
+        "3",
+        "--max-batches",
+        "1",
+      ],
+      "nonzero",
+    ),
+  )
+  expect(partial.action).toBe("failed")
+  expect(partial.committed).toBe(true)
+  expect(partial.changedRows).toBeGreaterThan(0)
+  expect(partial.changedRows).toBeLessThanOrEqual(3)
+  expect(partial.deletedSessionIDs).toEqual([])
+  expect(partial.partialSessionIDs).toEqual([selectedID])
+  expect(partial.remainingSessionIDs).toEqual([selectedID])
+  expect(partial.batches).toHaveLength(1)
+  expect(ownedCounts(store.filename, selectedID).session).toBe(1)
+  expect(ownedCounts(store.filename, selectedID)).not.toEqual(beforeSelected)
+  expect(ownedCounts(store.filename, unselectedID)).toEqual(beforeUnselected)
+
+  const transientReclamationReasons = new Set(["wal-checkpoint-incomplete"])
+  const beforeReclaimOnly = ownedCounts(store.filename, selectedID)
+  const reclaimedOnly = (
+    await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      reclaimOnly: true,
+      apply: true,
+      reserveBytes: 1,
+    })
+  ).report
+  const reclaimOnlyWasTransient =
+    reclaimedOnly.action === "failed" &&
+    reclaimedOnly.refusalReasons?.length === 1 &&
+    transientReclamationReasons.has(reclaimedOnly.refusalReasons[0] ?? "")
+  if (reclaimedOnly.action !== "applied" && !reclaimOnlyWasTransient)
+    throw new Error(`unexpected reclaim-only report: ${JSON.stringify(reclaimedOnly, null, 2)}`)
+  expect(reclaimedOnly.changedRows).toBe(0)
+  expect(reclaimedOnly.deletedSessionIDs).toEqual([])
+  expect(reclaimedOnly.rawTranscriptWarning).toContain("does not delete Session history")
+  expect(ownedCounts(store.filename, selectedID)).toEqual(beforeReclaimOnly)
+
+  const beforeRetry = ownedCounts(store.filename, selectedID)
+  const remainingRows = Object.values(beforeRetry).reduce((sum, count) => sum + count, 0)
+  const completed = (
+    await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      before: cutoff,
+      session: [selectedID],
+      apply: true,
+      reserveBytes: 1,
+    })
+  ).report
+  const completionWasTransient =
+    completed.action === "failed" &&
+    completed.refusalReasons?.length === 1 &&
+    transientReclamationReasons.has(completed.refusalReasons[0] ?? "")
+  if (completed.action !== "applied" && !completionWasTransient)
+    throw new Error(`unexpected completed prune report: ${JSON.stringify(completed, null, 2)}`)
+  expect(completed.deletedSessionIDs).toEqual([selectedID])
+  expect(completed.changedRows).toBe(remainingRows)
+  expect(completed.partialSessionIDs).toEqual([])
+  expect(Object.values(ownedCounts(store.filename, selectedID)).every((count) => count === 0)).toBe(true)
+  expect(ownedCounts(store.filename, unselectedID)).toEqual(beforeUnselected)
+
+  const missingRetry = parseReport(
+    await runCLI(
+      store,
+      ["--online", "--before", cutoff, "--session", selectedID, "--apply", "--reserve-bytes", "1"],
+      "nonzero",
+    ),
+  )
+  expect(missingRetry.action).toBe("refused")
+  expect(missingRetry.changedRows).toBe(0)
+  expect(missingRetry.deletedSessionIDs).toEqual([])
+  expect(missingRetry.refusalReasons).toContain("session-not-found")
+})
+
+test.serial(
+  "online prune deletes an event history beyond the former validation cap in keyset batches",
+  async () => {
+    const create = { payloadBytes: 512 * 1024, eventCount: 10_100 }
+    await using store = await producedStore([create], { timeout: 240_000 })
+    const selected = produce(store, { create })
+    const sessionID = selected.created[0]!.id
+    const before = ownedCounts(store.filename, sessionID)
+
+    const applied = parseReport(
+      await runCLI(
+        store,
+        [
+          "--online",
+          "--session",
+          sessionID,
+          "--apply",
+          "--reserve-bytes",
+          "1",
+          "--batch-rows",
+          "256",
+          "--max-batches",
+          "100",
+        ],
+        "either",
+        { timeout: 300_000 },
+      ),
+    )
+    expect(applied.action).toBe(
+      applied.reclamation.outstanding?.includes("wal-checkpoint-incomplete") ? "failed" : "applied",
+    )
+    if (applied.action === "failed") expect(applied.refusalReasons).toContain("wal-checkpoint-incomplete")
+    expect(applied.deletedSessionIDs).toEqual([sessionID])
+    expect(applied.changedRows).toBeGreaterThan(10_000)
+    expect(applied.batches!.length).toBeGreaterThan(5)
+    expect(applied.batches!.every((batch) => Number(batch.changedRows) <= 256)).toBe(true)
+    expect(applied.batches!.every((batch) => typeof batch.lockDurationMs === "number")).toBe(true)
+    expect(Object.values(ownedCounts(store.filename, sessionID)).every((count) => count === 0)).toBe(true)
+    expect(before.event).toBeGreaterThan(10_000)
+  },
+  { timeout: 360_000 },
+)
+
+test.serial(
+  "online prune keyset-pages a large message history by time and ID",
+  async () => {
+    await using store = await producedStore([{ payloadBytes: 128 }])
+    const sessionID = produce(store, { create: { payloadBytes: 128 } }).created[0].id
+    await produceLive(store, { bulkMessages: { sessionID, count: 10_100 } })
+    await rm(store.project, { recursive: true, force: true })
+
+    const messagePages = new Array<string>()
+    const originalQuery = Database.prototype.query
+    const query = spyOn(Database.prototype, "query").mockImplementation(function <
+      ReturnType,
+      ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+    >(this: Database, statement: string) {
+      if (
+        statement.startsWith("SELECT") &&
+        statement.includes('FROM "message"') &&
+        statement.includes('ORDER BY "time_created" ASC, "id" ASC')
+      )
+        messagePages.push(statement)
+      return (originalQuery<ReturnType, ParamsType>).call(this, statement)
+    })
+    const result = await (async () => {
+      try {
+        return await invokeHandler(store, {
+          database: store.filename,
+          online: true,
+          session: [sessionID],
+          apply: true,
+          reserveBytes: 1,
+          batchRows: 256,
+          maxBatches: 100,
+        })
+      } finally {
+        query.mockRestore()
+      }
+    })()
+    expect(result.report.action).toBe(
+      result.report.reclamation.outstanding?.includes("wal-checkpoint-incomplete") ? "failed" : "applied",
+    )
+    if (result.report.action === "failed") expect(result.report.refusalReasons).toContain("wal-checkpoint-incomplete")
+    expect(result.report.deletedSessionIDs).toEqual([sessionID])
+    expect(result.report.changedRows).toBeGreaterThan(10_100)
+    expect(result.report.batches!.length).toBeGreaterThan(5)
+    expect(result.report.batches!.every((batch) => Number(batch.changedRows) <= 256)).toBe(true)
+    expect(result.report.batches!.every((batch) => typeof batch.lockDurationMs === "number")).toBe(true)
+    expect(messagePages.some((statement) => statement.includes('("time_created", "id") > (?, ?)'))).toBe(true)
+    expect(messagePages.every((statement) => statement.includes('ORDER BY "time_created" ASC, "id" ASC LIMIT ?'))).toBe(
+      true,
+    )
+    expect(Object.values(ownedCounts(store.filename, sessionID)).every((count) => count === 0)).toBe(true)
+  },
+  { timeout: 240_000 },
+)
+
+test("online inventory does not require offline activity and work indexes", async () => {
+  await using store = await producedStore([{ payloadBytes: 128 }])
+  const sessionID = store.metadata[0].created[0].id
+  const db = new Database(store.filename)
+  db.exec(`
+    DROP INDEX IF EXISTS message_session_time_updated_id_idx;
+    DROP INDEX IF EXISTS message_session_invalid_json_idx;
+    DROP INDEX IF EXISTS message_session_incomplete_assistant_idx;
+    DROP INDEX IF EXISTS part_session_time_created_id_idx;
+    DROP INDEX IF EXISTS part_session_time_updated_id_idx;
+    DROP INDEX IF EXISTS part_session_invalid_json_idx;
+    DROP INDEX IF EXISTS part_session_pending_running_idx;
+    DROP INDEX IF EXISTS part_session_idx;
+    DROP INDEX IF EXISTS part_message_id_session_idx;
+    DROP INDEX IF EXISTS session_prompt_queue_alias_item_idx;
+    DROP INDEX IF EXISTS todo_session_time_created_position_idx;
+    DROP INDEX IF EXISTS todo_session_time_updated_position_idx;
+    DROP INDEX IF EXISTS session_message_session_time_updated_id_idx;
+    DROP INDEX IF EXISTS session_message_session_invalid_json_idx;
+    DROP INDEX IF EXISTS session_message_session_incomplete_assistant_idx;
+    DROP INDEX IF EXISTS session_input_session_time_created_idx;
+    DROP INDEX IF EXISTS session_input_session_invalid_delivery_idx;
+    DROP INDEX IF EXISTS session_prompt_queue_session_open_idx;
+    DROP INDEX IF EXISTS session_prompt_queue_session_conflicted_idx;
+    DROP INDEX IF EXISTS session_prompt_queue_session_time_created_idx;
+    DROP INDEX IF EXISTS session_prompt_queue_session_time_promoted_idx;
+    DROP INDEX IF EXISTS session_prompt_queue_session_time_withdrawn_idx;
+    DROP INDEX IF EXISTS session_prompt_queue_session_time_preparing_idx;
+    DROP INDEX IF EXISTS session_prompt_receipt_session_pending_idx;
+    DROP INDEX IF EXISTS session_prompt_receipt_session_invalid_idx;
+    DROP INDEX IF EXISTS session_prompt_receipt_session_time_created_idx;
+    DROP INDEX IF EXISTS session_prompt_receipt_session_time_updated_idx;
+    DROP INDEX IF EXISTS session_ask_session_unsettled_idx;
+    DROP INDEX IF EXISTS session_ask_session_time_created_idx;
+    DROP INDEX IF EXISTS session_ask_session_time_settled_idx;
+    DROP INDEX IF EXISTS event_aggregate_unknown_type_idx;
+    DROP INDEX IF EXISTS event_aggregate_writer_activity_idx;
+  `)
+  db.close()
+
+  const inventory = parseReport(await runCLI(store, ["--online", "--session", sessionID, "--reserve-bytes", "1"]))
+  expect(inventory.action).toBe("inventory")
+  expect(inventory.reclamation.ready).toBe(true)
+  expect(inventory.reclamation.reasons).toEqual([])
+  expect(inventory.deletionScope.sessionIDs).toEqual([sessionID])
+})
+
+test("online unknown-event ownership uses the current manifest without its partial source index", async () => {
+  await using store = await producedStore([{}])
+  const sessionID = store.metadata[0]!.created[0]!.id
+  const unknownType = "fixture.unknown.durable.owner"
+  const db = new Database(store.filename)
+  const nextSequence = db
+    .query<{ seq: number }, [string]>("SELECT coalesce(max(seq), 0) + 1 AS seq FROM event WHERE aggregate_id = ?")
+    .get(sessionID)!.seq
+  db.query("INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?, ?, ?, ?, ?)").run(
+    "unknown-online-owner-event",
+    sessionID,
+    nextSequence,
+    unknownType,
+    "{}",
+  )
+  db.query("UPDATE event_sequence SET seq = ? WHERE aggregate_id = ?").run(nextSequence, sessionID)
+  db.exec("DROP INDEX IF EXISTS event_aggregate_unknown_type_idx")
+  db.close()
+  await rm(store.project, { recursive: true })
+
+  const inventory = await invokeHandler(store, {
+    database: store.filename,
+    online: true,
+    session: [sessionID],
+    reserveBytes: 1,
+  })
+  expect(inventory.report.reclamation.ready).toBe(true)
+  expect(inventory.report.excludedSessions.find((item) => item.sessionID === sessionID)?.reasons).toContain(
+    `unknown-durable-event-owner:${unknownType}`,
+  )
+})
+
+test.serial(
+  "online apply advances bounded proof pages while a live writer commits",
+  async () => {
+    if (process.platform !== "linux") return
+    await using store = await producedStore([{}, {}])
+    const sessionID = store.metadata[0]!.created[0]!.id
+    const peerID = store.metadata[1]!.created[0]!.id
+    const messageID = store.metadata[0]!.created[0]!.messageID
+    const db = new Database(store.filename)
+    const queueInsert = db.query(
+      `INSERT INTO session_prompt_queue (id, session_id, seq, delivery, input, time_created, time_promoted)
+     VALUES (?, ?, ?, 'queue', '{}', 0, 1)`,
+    )
+    const aliasInsert = db.query("INSERT INTO session_prompt_queue_alias (id, item_id) VALUES (?, ?)")
+    const partInsert = db.query(
+      `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+     VALUES (?, ?, ?, 0, 0, '{}')`,
+    )
+    const writerInsert = db.query(
+      `INSERT INTO event_writer_process (writer_id, pid, boot_id, start_ticks, time_registered)
+     VALUES (?, ?, ?, ?, ?)`,
+    )
+    db.transaction(() => {
+      Array.from({ length: 300 }, (_, index) => index).forEach((index) => {
+        const queueID = `que_live_proof_${String(index).padStart(4, "0")}`
+        queueInsert.run(queueID, sessionID, 400_000 + index)
+        aliasInsert.run(`alias_live_proof_${String(index).padStart(4, "0")}`, queueID)
+        partInsert.run(`part_live_proof_${String(index).padStart(4, "0")}`, messageID, sessionID)
+        writerInsert.run(`writer_live_proof_${String(index).padStart(4, "0")}`, 900_000 + index, "old-boot", "1", index)
+      })
+      partInsert.run("part_live_proof_cross", messageID, peerID)
+    })()
+    const before = ownedCounts(store.filename, sessionID)
+    db.exec(`
+    DELETE FROM online_reclaim_cross_session_part;
+    DELETE FROM online_reclaim_cross_part_scope;
+    DELETE FROM online_reclaim_cross_part_message;
+    DELETE FROM online_reclaim_queue_alias_scope;
+    DELETE FROM online_reclaim_queue_alias_owner;
+    DELETE FROM online_reclaim_writer_lifetime;
+    UPDATE online_reclaim_backfill
+    SET cursor = 0, high_water = -1, complete = 0
+    WHERE name = 'cross-session-part-scope';
+    UPDATE online_reclaim_backfill
+    SET cursor = 0, high_water = -1, complete = 0
+    WHERE name = 'cross-session-parts';
+    UPDATE online_reclaim_backfill
+    SET cursor = 0, high_water = (SELECT coalesce(max(rowid), 0) FROM session_prompt_queue_alias), complete = 0
+    WHERE name = 'queue-alias-scope';
+    UPDATE online_reclaim_stable_backfill
+    SET cursor = '', cursor_secondary = '', cursor_started = 0,
+        high_water = '', high_water_secondary = '', high_water_present = 0, complete = 0
+    WHERE name IN ('cross-session-part-scope', 'queue-alias-owners', 'event-writer-lifetimes');
+  `)
+    db.close()
+
+    const reader = startProducer(store, {
+      readerAfterSignal: { readyFile: path.join(store.directory, "online-proof-live-reader-ready") },
+    })
+    const readerReady = await readMatchingLine(reader, "PRUNE_READER_READY ")
+    const startFile = path.join(store.directory, "online-proof-live-writer-start")
+    const writerClosedFile = path.join(store.directory, "online-proof-live-writer-closed")
+    const writer = startProducer(store, {
+      queueAfterSignal: {
+        sessionID: peerID,
+        startFile,
+        readyFile: path.join(store.directory, "online-proof-live-writer-ready"),
+        closedFile: writerClosedFile,
+        registerBeforeSignal: true,
+        appendEvent: true,
+      },
+    })
+    await readMatchingLine(writer, "PRUNE_REGISTERED ")
+
+    const originalQuery = Database.prototype.query
+    const originalExec = Database.prototype.exec
+    let proofWriteSeen = false
+    let writerSignalled = false
+    let writerClosed = false
+    const sourceIndexBuilds = new Array<string>()
+    const query = spyOn(Database.prototype, "query").mockImplementation(function <
+      ReturnType,
+      ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+    >(this: Database, statement: string) {
+      if (statement.includes("INSERT INTO online_reclaim_cross_part_scope")) proofWriteSeen = true
+      return (originalQuery<ReturnType, ParamsType>).call(this, statement)
+    })
+    const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+      const result = originalExec.call(this, statement)
+      if (/^CREATE\s+(?:UNIQUE\s+)?INDEX\b/i.test(statement.trimStart())) sourceIndexBuilds.push(statement)
+      if (statement === "COMMIT" && proofWriteSeen && !writerSignalled) {
+        writerSignalled = true
+        writeFileSync(startFile, "start\n")
+        const deadline = Date.now() + 20_000
+        const wait = new Int32Array(new SharedArrayBuffer(4))
+        while (!existsSync(writerClosedFile)) {
+          if (Date.now() >= deadline) throw new Error("live proof producer did not commit after the proof batch")
+          Atomics.wait(wait, 0, 0, 5)
+        }
+        writerClosed = true
+      }
+      return result
+    })
+    try {
+      const input = {
+        database: store.filename,
+        online: true,
+        session: [sessionID],
+        apply: true,
+        reserveBytes: 1,
+        batchRows: 1,
+        maxBatches: 1,
+      }
+      const first = await invokeHandler(store, input)
+      expect(writerSignalled).toBe(true)
+      expect(writerClosed).toBe(true)
+      expect(readerReady).toContain(String(reader.child.pid))
+      expect(first.report.proofPreparation?.batches).toBeGreaterThan(1)
+      const result = first.report.proofPreparation?.complete ? first : await invokeHandler(store, input)
+      if (!first.report.proofPreparation?.complete) {
+        expect(first.report.action).toBe("refused")
+        expect(first.report.changedRows).toBe(0)
+        expect(first.report.refusalReasons).toContain("online-proof-backfill-busy:cross-session-part-scope")
+      }
+      const proofPreparation = result.report.proofPreparation
+      expect(proofPreparation).toEqual({
+        complete: true,
+        batches: expect.any(Number),
+        rows: expect.any(Number),
+        remaining: [],
+      })
+      if (!proofPreparation) throw new Error("online apply did not report proof preparation progress")
+      expect(proofPreparation.batches).toBeGreaterThan(1)
+      expect(proofPreparation.rows).toBeGreaterThan(600)
+      expect(sourceIndexBuilds).toEqual([])
+      expect(result.report.changedRows).toBe(0)
+      expect(result.report.refusalReasons).toContain("no-eligible-sessions")
+      expect(ownedCounts(store.filename, sessionID)).toEqual(before)
+    } finally {
+      exec.mockRestore()
+      query.mockRestore()
+      if (!existsSync(startFile)) writeFileSync(startFile, "release\n")
+      assertChildOutcome(await writer.finish(), 0)
+      reader.child.stdin.end()
+      assertChildOutcome(await reader.finish(), 0)
+    }
+  },
+  60_000,
+)
+
+test.serial(
+  "online apply caps proof batches and resumes the same existing-store census",
+  async () => {
+    await using store = await producedStore([{}])
+    const sessionID = store.metadata[0]!.created[0]!.id
+    const db = new Database(store.filename)
+    const insert = db.query(
+      `INSERT INTO event_writer_process (writer_id, pid, boot_id, start_ticks, time_registered)
+     VALUES (?, ?, ?, ?, ?)`,
+    )
+    db.transaction(() =>
+      Array.from({ length: 20_000 }, (_, index) => index).forEach((index) => {
+        insert.run(
+          `zzzz_online_proof_history_${String(index).padStart(5, "0")}`,
+          1_000_000 + index,
+          "old-boot",
+          "1",
+          index,
+        )
+      }),
+    )()
+    db.query(
+      `INSERT INTO session_prompt_queue (id, session_id, seq, delivery, input, time_created)
+     VALUES ('que_online_proof_gate', ?, 900_000, 'queue', '{}', 0)`,
+    ).run(sessionID)
+    db.exec(`
+    DELETE FROM online_reclaim_writer_lifetime;
+    UPDATE online_reclaim_stable_backfill
+    SET cursor = '', cursor_secondary = '', cursor_started = 0,
+        high_water = '', high_water_secondary = '', high_water_present = 0, complete = 0
+    WHERE name = 'event-writer-lifetimes';
+  `)
+    db.close()
+    const before = ownedCounts(store.filename, sessionID)
+
+    const first = await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      session: [sessionID],
+      apply: true,
+      reserveBytes: 1,
+    })
+    expect(first.report.action).toBe("refused")
+    expect(first.report.committed).toBe(false)
+    expect(first.report.changedRows).toBe(0)
+    expect(first.report.proofPreparation?.complete).toBe(false)
+    expect(first.report.proofPreparation?.batches).toBe(128)
+    expect(first.report.proofPreparation?.rows).toBeLessThanOrEqual(16_384)
+    expect(first.report.refusalReasons).toContain("online-proof-backfill-incomplete:event-writer-lifetimes")
+    expect(ownedCounts(store.filename, sessionID)).toEqual(before)
+
+    const second = await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      session: [sessionID],
+      apply: true,
+      reserveBytes: 1,
+    })
+    expect(second.report.proofPreparation?.complete).toBe(true)
+    expect(second.report.proofPreparation?.batches).toBeLessThan(128)
+    expect(second.report.action).toBe("refused")
+    expect(second.report.committed).toBe(false)
+    expect(second.report.changedRows).toBe(0)
+    expect(ownedCounts(store.filename, sessionID)).toEqual(before)
+  },
+  120_000,
+)
+
+test.serial("online apply refuses proof preparation before writes when reserve is unavailable", async () => {
+  await using store = await producedStore([{}])
+  const sessionID = store.metadata[0]!.created[0]!.id
+  const coreDatabase = await import("@opencode-ai/core/database/database")
+  await Effect.runPromise(Effect.scoped(Layer.build(coreDatabase.Database.layerFromPath(store.filename))))
+  const db = new Database(store.filename)
+  db.exec(`
+    DELETE FROM online_reclaim_cross_session_part;
+    DELETE FROM online_reclaim_cross_part_scope;
+    DELETE FROM online_reclaim_cross_part_message;
+    DELETE FROM online_reclaim_queue_alias_scope;
+    DELETE FROM online_reclaim_queue_alias_owner;
+    UPDATE online_reclaim_backfill
+    SET cursor = 0, high_water = -1, complete = 0
+    WHERE name IN ('cross-session-part-scope', 'cross-session-parts', 'queue-alias-scope');
+    UPDATE online_reclaim_stable_backfill
+    SET cursor = '', cursor_secondary = '', cursor_started = 0,
+        high_water = '', high_water_secondary = '', high_water_present = 0, complete = 0
+    WHERE name IN ('cross-session-part-scope', 'queue-alias-owners', 'event-writer-lifetimes');
+  `)
+  const before = {
+    legacyParts: db.query("SELECT * FROM online_reclaim_cross_session_part ORDER BY part_id").all(),
+    partScopes: db.query("SELECT * FROM online_reclaim_cross_part_scope ORDER BY session_id, part_id").all(),
+    messageParts: db
+      .query("SELECT * FROM online_reclaim_cross_part_message ORDER BY message_id, child_session_id")
+      .all(),
+    aliasScopes: db.query("SELECT * FROM online_reclaim_queue_alias_scope ORDER BY alias_rowid").all(),
+    aliasOwners: db.query("SELECT * FROM online_reclaim_queue_alias_owner ORDER BY item_id, alias_id").all(),
+    writerLifetimes: db.query("SELECT * FROM online_reclaim_writer_lifetime ORDER BY pid, boot_id, start_ticks").all(),
+    backfills: db.query("SELECT * FROM online_reclaim_backfill ORDER BY name").all(),
+    stableBackfills: db.query("SELECT * FROM online_reclaim_stable_backfill ORDER BY name").all(),
+  }
+  db.close()
+  await rm(store.project, { recursive: true })
+
+  const proofTransactions = new Array<string>()
+  const originalExec = Database.prototype.exec
+  const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+    if (statement === "BEGIN IMMEDIATE") proofTransactions.push(statement)
+    return originalExec.call(this, statement)
+  })
+  const refused = await (async () => {
+    try {
+      return await invokeHandler(store, {
+        database: store.filename,
+        online: true,
+        session: [sessionID],
+        apply: true,
+        reserveBytes: Number.MAX_SAFE_INTEGER,
+      })
+    } finally {
+      exec.mockRestore()
+    }
+  })()
+  expect(proofTransactions).toEqual([])
+  expect(refused.report.action).toBe("refused")
+  expect(refused.report.committed).toBe(false)
+  expect(refused.report.changedRows).toBe(0)
+  expect(refused.report.refusalReasons).toContain("free-space-reserve-would-be-violated")
+  expect(refused.report.proofPreparation).toMatchObject({ complete: false, batches: 0, rows: 0 })
+
+  const after = new Database(store.filename, { readonly: true })
+  expect({
+    legacyParts: after.query("SELECT * FROM online_reclaim_cross_session_part ORDER BY part_id").all(),
+    partScopes: after.query("SELECT * FROM online_reclaim_cross_part_scope ORDER BY session_id, part_id").all(),
+    messageParts: after
+      .query("SELECT * FROM online_reclaim_cross_part_message ORDER BY message_id, child_session_id")
+      .all(),
+    aliasScopes: after.query("SELECT * FROM online_reclaim_queue_alias_scope ORDER BY alias_rowid").all(),
+    aliasOwners: after.query("SELECT * FROM online_reclaim_queue_alias_owner ORDER BY item_id, alias_id").all(),
+    writerLifetimes: after
+      .query("SELECT * FROM online_reclaim_writer_lifetime ORDER BY pid, boot_id, start_ticks")
+      .all(),
+    backfills: after.query("SELECT * FROM online_reclaim_backfill ORDER BY name").all(),
+    stableBackfills: after.query("SELECT * FROM online_reclaim_stable_backfill ORDER BY name").all(),
+  }).toEqual(before)
+  after.close()
+})
+
+test.serial("online apply refuses unregistered holders before incomplete Part and alias proof writes", async () => {
+  if (process.platform !== "linux") return
+  await using store = await producedStore([{ payloadBytes: 128 }])
+  const sessionID = store.metadata[0]!.created[0]!.id
+  const startFile = path.join(store.directory, "online-missing-writer-lifetime-start")
+  const committedFile = path.join(store.directory, "online-missing-writer-lifetime-committed")
+  const writer = startProducer(store, {
+    eventAfterSignal: {
+      sessionID,
+      startFile,
+      committedFile,
+      closedFile: path.join(store.directory, "online-missing-writer-lifetime-closed"),
+    },
+    holdSessionID: sessionID,
+    hold: true,
+  })
+  try {
+    await readMatchingLine(writer, "PRUNE_EVENT_WAITING")
+    writeFileSync(startFile, "start\n")
+    await readMatchingLine(writer, "PRUNE_HOLD_READY ")
+    expect(existsSync(committedFile)).toBe(true)
+    const writerPID = writer.child.pid
+    if (!writerPID) throw new Error("live writer did not expose a PID")
+
+    const db = new Database(store.filename)
+    const identity = db
+      .query<
+        { boot_id: string; start_ticks: string },
+        [number]
+      >("SELECT boot_id, start_ticks FROM event_writer_process WHERE pid = ? ORDER BY time_registered DESC LIMIT 1")
+      .get(writerPID)
+    if (!identity) throw new Error(`live writer registration is missing:${writerPID}`)
+    expect(
+      db
+        .query("SELECT 1 FROM online_reclaim_writer_lifetime WHERE pid = ? AND boot_id = ? AND start_ticks = ?")
+        .get(writerPID, identity.boot_id, identity.start_ticks),
+    ).toBeTruthy()
+    db.query("DELETE FROM online_reclaim_writer_lifetime WHERE pid = ? AND boot_id = ? AND start_ticks = ?").run(
+      writerPID,
+      identity.boot_id,
+      identity.start_ticks,
+    )
+    db.query(
+      `UPDATE online_reclaim_stable_backfill
+       SET cursor = '', cursor_started = 0, high_water = '', high_water_present = 0, complete = 0
+       WHERE name = 'event-writer-lifetimes'`,
+    ).run()
+    db.close()
+    await rm(store.project, { recursive: true })
+
+    const input = { database: store.filename, online: true, session: [sessionID], reserveBytes: 1 }
+    const before = await invokeHandler(store, input)
+    expect(before.report.reclamation.reasons).toContain(`unregistered-database-holder:${writerPID}`)
+    expect(before.report.proofPreparation?.remaining).toContain(
+      "online-proof-backfill-incomplete:event-writer-lifetimes",
+    )
+
+    const applied = await invokeHandler(store, { ...input, apply: true })
+    expect(applied.report.proofPreparation?.complete).toBe(true)
+    expect(applied.report.proofPreparation?.rows).toBeGreaterThan(0)
+    expect(applied.report.action).toBe("refused")
+    expect(applied.report.refusalReasons).toContain("session-written-by-live-process")
+    expect(applied.report.refusalReasons).not.toContain(`unregistered-database-holder:${writerPID}`)
+
+    const missingLifetime = new Database(store.filename)
+    missingLifetime
+      .query("DELETE FROM online_reclaim_writer_lifetime WHERE pid = ? AND boot_id = ? AND start_ticks = ?")
+      .run(writerPID, identity.boot_id, identity.start_ticks)
+    const aliasItemID = "que_unregistered_holder_proof"
+    const aliasID = "alias_unregistered_holder_proof"
+    missingLifetime
+      .query(
+        `INSERT INTO session_prompt_queue (id, session_id, seq, delivery, input, time_created, time_promoted)
+         VALUES (?, ?, (SELECT coalesce(max(seq), 0) + 1 FROM session_prompt_queue WHERE session_id = ?), 'queue', '{}', 0, 1)`,
+      )
+      .run(aliasItemID, sessionID, sessionID)
+    missingLifetime
+      .query("INSERT INTO session_prompt_queue_alias (id, item_id) VALUES (?, ?)")
+      .run(aliasID, aliasItemID)
+    expect(
+      missingLifetime
+        .query<{ complete: number }, [string]>("SELECT complete FROM online_reclaim_stable_backfill WHERE name = ?")
+        .get("event-writer-lifetimes")?.complete,
+    ).toBe(1)
+    expect(
+      missingLifetime
+        .query("SELECT 1 FROM online_reclaim_queue_alias_owner WHERE item_id = ? AND alias_id = ?")
+        .get(aliasItemID, aliasID),
+    ).toBeTruthy()
+    missingLifetime.exec(`
+      DELETE FROM online_reclaim_cross_session_part;
+      DELETE FROM online_reclaim_cross_part_scope;
+      DELETE FROM online_reclaim_cross_part_message;
+      DELETE FROM online_reclaim_queue_alias_scope;
+      DELETE FROM online_reclaim_queue_alias_owner;
+      UPDATE online_reclaim_backfill
+      SET cursor = 0, high_water = -1, complete = 0
+      WHERE name IN ('cross-session-part-scope', 'cross-session-parts');
+      UPDATE online_reclaim_backfill
+      SET cursor = 0, high_water = (SELECT coalesce(max(rowid), 0) FROM session_prompt_queue_alias), complete = 0
+      WHERE name = 'queue-alias-scope';
+      UPDATE online_reclaim_stable_backfill
+      SET cursor = '', cursor_secondary = '', cursor_started = 0,
+          high_water = '', high_water_secondary = '', high_water_present = 0, complete = 0
+      WHERE name IN ('cross-session-part-scope', 'queue-alias-owners');
+    `)
+    expect(missingLifetime.query("SELECT 1 FROM part WHERE session_id = ? LIMIT 1").get(sessionID)).toBeTruthy()
+    expect(missingLifetime.query("SELECT 1 FROM session_prompt_queue_alias WHERE id = ?").get(aliasID)).toBeTruthy()
+    expect(
+      missingLifetime
+        .query<{ name: string; complete: number }, []>(
+          `SELECT name, complete FROM online_reclaim_stable_backfill
+           WHERE name IN ('cross-session-part-scope', 'queue-alias-owners', 'event-writer-lifetimes')
+           ORDER BY name`,
+        )
+        .all(),
+    ).toEqual([
+      { name: "cross-session-part-scope", complete: 0 },
+      { name: "event-writer-lifetimes", complete: 1 },
+      { name: "queue-alias-owners", complete: 0 },
+    ])
+    const proofState = {
+      writerLifetimes: missingLifetime
+        .query("SELECT * FROM online_reclaim_writer_lifetime ORDER BY pid, boot_id, start_ticks")
+        .all(),
+      partScopes: missingLifetime
+        .query("SELECT * FROM online_reclaim_cross_part_scope ORDER BY session_id, part_id")
+        .all(),
+      aliasScopes: missingLifetime.query("SELECT * FROM online_reclaim_queue_alias_scope ORDER BY alias_rowid").all(),
+      aliasOwners: missingLifetime
+        .query("SELECT * FROM online_reclaim_queue_alias_owner ORDER BY item_id, alias_id")
+        .all(),
+      backfills: missingLifetime.query("SELECT * FROM online_reclaim_backfill ORDER BY name").all(),
+      stableBackfills: missingLifetime.query("SELECT * FROM online_reclaim_stable_backfill ORDER BY name").all(),
+    }
+    missingLifetime.close()
+
+    const proofTransactions = new Array<string>()
+    const originalExec = Database.prototype.exec
+    const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+      if (statement === "BEGIN IMMEDIATE") proofTransactions.push(statement)
+      return originalExec.call(this, statement)
+    })
+    const holderRefused = await (async () => {
+      try {
+        return await invokeHandler(store, { ...input, apply: true })
+      } finally {
+        exec.mockRestore()
+      }
+    })()
+    expect(proofTransactions).toEqual([])
+    expect(holderRefused.report.action).toBe("refused")
+    expect(holderRefused.report.reclamation.reasons).toContain(`unregistered-database-holder:${writerPID}`)
+    expect(
+      holderRefused.report.reclamation.reasons.filter(
+        (reason) => !reason.startsWith("online-proof-backfill-incomplete:"),
+      ),
+    ).toEqual([`unregistered-database-holder:${writerPID}`])
+    expect(holderRefused.report.refusalReasons).toContain(`unregistered-database-holder:${writerPID}`)
+    expect(holderRefused.report.proofPreparation).toMatchObject({ complete: false, batches: 0, rows: 0 })
+    expect(holderRefused.report.proofPreparation?.remaining).toContain(
+      "online-proof-backfill-incomplete:cross-session-part-scope",
+    )
+    expect(holderRefused.report.proofPreparation?.remaining).toContain(
+      "online-proof-backfill-incomplete:queue-alias-owners",
+    )
+    const afterHolderRefusal = new Database(store.filename, { readonly: true })
+    expect({
+      writerLifetimes: afterHolderRefusal
+        .query("SELECT * FROM online_reclaim_writer_lifetime ORDER BY pid, boot_id, start_ticks")
+        .all(),
+      partScopes: afterHolderRefusal
+        .query("SELECT * FROM online_reclaim_cross_part_scope ORDER BY session_id, part_id")
+        .all(),
+      aliasScopes: afterHolderRefusal
+        .query("SELECT * FROM online_reclaim_queue_alias_scope ORDER BY alias_rowid")
+        .all(),
+      aliasOwners: afterHolderRefusal
+        .query("SELECT * FROM online_reclaim_queue_alias_owner ORDER BY item_id, alias_id")
+        .all(),
+      backfills: afterHolderRefusal.query("SELECT * FROM online_reclaim_backfill ORDER BY name").all(),
+      stableBackfills: afterHolderRefusal.query("SELECT * FROM online_reclaim_stable_backfill ORDER BY name").all(),
+    }).toEqual(proofState)
+    afterHolderRefusal.close()
+  } finally {
+    writer.child.stdin.write("release\n")
+    writer.child.stdin.end()
+    assertChildOutcome(await writer.finish(), 0)
+  }
+})
+
+test.serial("online prune bounds alias proofs across long alias-free and alias-sparse queue histories", async () => {
+  await using store = await producedStore([{}])
+  const sessionID = store.metadata[0].created[0].id
+  const queueRows = 60_000
+  const firstSequence = 100_000
+  const db = new Database(store.filename)
+  const insert = db.query(
+    `INSERT INTO session_prompt_queue (id, session_id, seq, delivery, input, time_created, time_promoted)
+     VALUES (?, ?, ?, 'queue', '{}', 0, 1)`,
+  )
+  db.transaction(() =>
+    Array.from({ length: queueRows }, (_, index) => index).forEach((index) =>
+      insert.run(`que_alias_history_${String(index).padStart(5, "0")}`, sessionID, firstSequence + index),
+    ),
+  )()
+  db.query(
+    `INSERT INTO session_prompt_queue_sequence (session_id, seq, aliases_indexed)
+     VALUES (?, ?, 1)
+     ON CONFLICT(session_id) DO UPDATE SET seq = excluded.seq, aliases_indexed = 1`,
+  ).run(sessionID, firstSequence + queueRows - 1)
+  const openQueueRows = db
+    .query<
+      { id: string; time_promoted: number | null; time_withdrawn: number | null; time_preparing: number | null },
+      [string]
+    >(
+      `SELECT id, time_promoted, time_withdrawn, time_preparing FROM session_prompt_queue
+       WHERE session_id = ? AND ((time_promoted IS NULL AND time_withdrawn IS NULL) OR time_preparing IS NOT NULL)
+       LIMIT 2`,
+    )
+    .all(sessionID)
+  if (openQueueRows.length > 0) throw new Error(JSON.stringify(openQueueRows))
+  db.close()
+  await rm(store.project, { recursive: true })
+
+  const beforeAlias = await invokeHandler(store, {
+    database: store.filename,
+    online: true,
+    session: [sessionID],
+    reserveBytes: 1,
+  })
+  expect(beforeAlias.report.action).toBe("inventory")
+  expect(beforeAlias.report.reclamation.ready).toBe(true)
+  expect(beforeAlias.report.deletionScope.sessionIDs).toEqual([sessionID])
+
+  const lastQueueID = `que_alias_history_${String(queueRows - 1).padStart(5, "0")}`
+  const alias = new Database(store.filename)
+  alias
+    .query("INSERT INTO session_prompt_queue_alias (id, item_id) VALUES (?, ?)")
+    .run("prt_alias_long_gap", lastQueueID)
+  alias
+    .query(
+      "DELETE FROM online_reclaim_queue_alias_scope WHERE alias_rowid = (SELECT max(rowid) FROM session_prompt_queue_alias)",
+    )
+    .run()
+  alias
+    .query("DELETE FROM online_reclaim_queue_alias_owner WHERE item_id = ? AND alias_id = ?")
+    .run(lastQueueID, "prt_alias_long_gap")
+  alias
+    .query(
+      `UPDATE online_reclaim_stable_backfill
+       SET cursor = '', cursor_secondary = '', cursor_started = 0,
+           high_water = '', high_water_secondary = '', high_water_present = 0, complete = 0
+       WHERE name = 'queue-alias-owners'`,
+    )
+    .run()
+  alias.close()
+
+  const pending = await invokeHandler(store, {
+    database: store.filename,
+    online: true,
+    session: [sessionID],
+    reserveBytes: 1,
+  })
+  expect(pending.report.reclamation.ready).toBe(false)
+  expect(pending.report.reclamation.reasons).toContain("online-proof-backfill-incomplete:queue-alias-owners")
+  const gateQueueID = "que_alias_proof_pending_gate"
+  const gate = new Database(store.filename)
+  gate
+    .query(
+      `INSERT INTO session_prompt_queue (id, session_id, seq, delivery, input, time_created)
+       VALUES (?, ?, ?, 'queue', '{}', 0)`,
+    )
+    .run(gateQueueID, sessionID, firstSequence + queueRows)
+  gate.close()
+  await mkdir(store.project, { recursive: true })
+  const appliedProof = await invokeHandler(store, {
+    database: store.filename,
+    online: true,
+    session: [sessionID],
+    apply: true,
+    reserveBytes: 1,
+    batchRows: 1,
+    maxBatches: 2,
+  })
+  expect(appliedProof.report.proofPreparation?.complete).toBe(true)
+  const proof = new Database(store.filename)
+  const aliasRow = proof
+    .query<
+      { alias_id: string; item_id: string; owner_alias_id: string; owner_item_id: string; owner_session_id: string },
+      [string]
+    >(
+      `SELECT alias.id AS alias_id, alias.item_id AS item_id,
+              owner.alias_id AS owner_alias_id, owner.item_id AS owner_item_id, owner.owner_session_id
+       FROM session_prompt_queue_alias alias
+       JOIN online_reclaim_queue_alias_owner owner
+         ON owner.alias_id = alias.id AND owner.item_id = alias.item_id
+       WHERE alias.item_id = ?`,
+    )
+    .get(lastQueueID)
+  if (!aliasRow) throw new Error("prepared alias census omitted its owner-scoped row")
+  expect(aliasRow.owner_session_id).toBe(sessionID)
+  expect(aliasRow.owner_alias_id).toBe(aliasRow.alias_id)
+  expect(aliasRow.owner_item_id).toBe(aliasRow.item_id)
+  proof.close()
+  await rm(store.project, { recursive: true, force: true })
+  const releaseGate = new Database(store.filename)
+  releaseGate.query("UPDATE session_prompt_queue SET time_promoted = 1 WHERE id = ?").run(gateQueueID)
+  releaseGate.close()
+
+  const aliasStatements = new Array<string>()
+  const originalQuery = Database.prototype.query
+  const query = spyOn(Database.prototype, "query").mockImplementation(function <
+    ReturnType,
+    ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+  >(this: Database, statement: string) {
+    if (
+      statement.startsWith("SELECT") &&
+      statement.includes("online_reclaim_queue_alias_owner") &&
+      statement.includes("owner_session_id = ?")
+    )
+      aliasStatements.push(statement)
+    return (originalQuery<ReturnType, ParamsType>).call(this, statement)
+  })
+  const result = await (async () => {
+    try {
+      return await invokeHandler(store, {
+        database: store.filename,
+        online: true,
+        session: [sessionID],
+        apply: true,
+        reserveBytes: 1,
+        batchRows: 1,
+        maxBatches: 2,
+      })
+    } finally {
+      query.mockRestore()
+    }
+  })()
+
+  if (result.report.action !== "failed") throw new Error(JSON.stringify(result.report, null, 2))
+  expect(result.report.committed).toBe(true)
+  expect(result.report.changedRowsByTable?.session_prompt_queue).toBe(1)
+  expect(result.report.changedRowsByTable?.session_prompt_queue_alias).toBe(1)
+  expect(
+    aliasStatements.some((statement) => statement.includes("scope.item_id") && statement.includes("scope.alias_id")),
+  ).toBe(true)
+  expect(aliasStatements.some((statement) => statement.includes('JOIN "session_prompt_queue_alias" alias'))).toBe(true)
+  expect(aliasStatements.every((statement) => !statement.includes("JOIN session_prompt_queue queue"))).toBe(true)
+  expect(aliasStatements.every((statement) => !statement.includes("scope.alias_rowid"))).toBe(true)
+
+  const explain = new Database(store.filename, { readonly: true })
+  try {
+    for (const statement of new Set(aliasStatements)) {
+      const bindings = Array.from({ length: statement.match(/\?/g)?.length ?? 0 }, (_, index) =>
+        index === 0 ? sessionID : 1,
+      )
+      const details = explain
+        .query<{ detail: string }, SQLQueryBindings[]>(`EXPLAIN QUERY PLAN ${statement}`)
+        .all(...bindings)
+        .map((row) => row.detail)
+      expect(details.some((detail) => detail.includes("online_reclaim_queue_alias_owner_session_idx"))).toBe(true)
+      expect(details.some((detail) => detail.includes("session_prompt_queue_session_seq_idx"))).toBe(false)
+    }
+  } finally {
+    explain.close()
+  }
+})
+
+test("online prune still protects parent cycles without a validation-row cap", async () => {
+  await using store = await producedStore([{}])
+  const sessionID = store.metadata[0].created[0].id
+  const db = new Database(store.filename)
+  db.query("UPDATE session SET parent_id = ? WHERE id = ?").run(sessionID, sessionID)
+  db.close()
+
+  const inventory = parseReport(await runCLI(store, ["--online", "--session", sessionID, "--reserve-bytes", "1"]))
+  const reasons = inventory.excludedSessions.find((item) => item.sessionID === sessionID)?.reasons ?? []
+  expect(reasons).toContain("parent-cycle")
+  expect(reasons).not.toContain("session-validation-bound-reached")
+  expect(inventory.deletionScope.sessionIDs).toEqual([])
+})
+
+test("online prune retains a payload row that exceeds the requested byte bound", async () => {
+  await using store = await producedStore([{ payloadBytes: 4 * 1024 * 1024 }])
+  const selected = produce(store, { create: { payloadBytes: 4 * 1024 * 1024 } })
+  const sessionID = selected.created[0]!.id
+  const cutoffAt = Date.now() - 5
+  const cutoff = new Date(cutoffAt).toISOString()
+  backdateSession(store.filename, sessionID, cutoffAt - 1_000)
+  const before = ownedCounts(store.filename, sessionID)
+
+  const partial = parseReport(
+    await runCLI(
+      store,
+      [
+        "--online",
+        "--before",
+        cutoff,
+        "--session",
+        sessionID,
+        "--apply",
+        "--reserve-bytes",
+        "1",
+        "--batch-bytes",
+        "1048576",
+      ],
+      "nonzero",
+    ),
+  )
+  expect(partial.action).toBe("failed")
+  expect(partial.committed).toBe(true)
+  expect(partial.partialSessionIDs).toEqual([sessionID])
+  expect(partial.refusalReasons).toContain(`session-payload-exceeds-batch-byte-bound:part:${sessionID}`)
+  expect(partial.batches?.[0]?.payloadBytes).toBeLessThanOrEqual(1_048_576)
+  expect(ownedCounts(store.filename, sessionID).part).toBe(before.part)
+  expect(ownedCounts(store.filename, sessionID).session).toBe(1)
+})
+
+test.serial("online prune bounds Session TEXT payload and checks reserve before deleting its row", async () => {
+  await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
+  const sessionID = store.metadata[0].created[0].id
+  const db = new Database(store.filename)
+  db.query("UPDATE session SET revert = ? WHERE id = ?").run(
+    JSON.stringify({ diff: "x".repeat(3 * 1024 * 1024) }),
+    sessionID,
+  )
+  db.close()
+
+  const sizeBound = await invokeHandler(store, {
+    database: store.filename,
+    online: true,
+    session: [sessionID],
+    apply: true,
+    reserveBytes: 1,
+    batchRows: 64,
+    batchBytes: 2 * 1024 * 1024,
+  })
+  expect(sizeBound.report.action).toBe("failed")
+  expect(sizeBound.report.partialSessionIDs).toEqual([sessionID])
+  expect(sizeBound.report.skippedSessions?.find((item) => item.sessionID === sessionID)?.reasons).toContain(
+    `session-payload-exceeds-batch-byte-bound:session:${sessionID}`,
+  )
+  expect(ownedCounts(store.filename, sessionID).session).toBe(1)
+
+  const update = new Database(store.filename)
+  update
+    .query("UPDATE session SET revert = ? WHERE id = ?")
+    .run(JSON.stringify({ diff: "x".repeat(2 * 1024 * 1024) }), sessionID)
+  update.close()
+  const probe = await invokeHandler(store, {
+    database: store.filename,
+    online: true,
+    session: [sessionID],
+    reserveBytes: 1,
+    batchRows: 1,
+    batchBytes: 4 * 1024 * 1024,
+  })
+  const availableBytes = probe.report.reclamation.availableBytes
+  const plannedPeakBytes = probe.report.reclamation.plannedPeakBytes
+  if (typeof availableBytes !== "number" || typeof plannedPeakBytes !== "number")
+    throw new Error("capacity fixture could not measure free space")
+  const capacityMarginBytes = 64 * 1024 * 1024
+  const reserveBytes = availableBytes - plannedPeakBytes - capacityMarginBytes
+  expect(reserveBytes).toBeGreaterThan(0)
+
+  const fillerPath = path.join(store.directory, "online-session-capacity-filler")
+  const fillerBytes = Math.floor(plannedPeakBytes + capacityMarginBytes - 3 * 1024 * 1024)
+  const capacityTarget = reserveBytes + 4 * 1024 * 1024
+  let additionalFillerBytes = 0
+  const original = Database.prototype.exec
+  let injected = false
+  let availableAfterFiller: number | undefined
+  const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+    const result = original.call(this, statement)
+    if (statement === "BEGIN IMMEDIATE" && !injected) {
+      injected = true
+      writeFileSync(fillerPath, randomBytes(fillerBytes))
+      let filesystem = statfsSync(store.directory)
+      availableAfterFiller = filesystem.bavail * filesystem.bsize
+      while (availableAfterFiller >= capacityTarget && additionalFillerBytes < capacityMarginBytes) {
+        const remainingMargin = capacityMarginBytes - additionalFillerBytes
+        const deficit = availableAfterFiller - capacityTarget + 1024 * 1024
+        const nextFillerBytes = Math.min(remainingMargin, Math.max(1024 * 1024, deficit))
+        appendFileSync(fillerPath, randomBytes(nextFillerBytes))
+        additionalFillerBytes += nextFillerBytes
+        filesystem = statfsSync(store.directory)
+        availableAfterFiller = filesystem.bavail * filesystem.bsize
+      }
+    }
+    return result
+  })
+  try {
+    const capacityBound = await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      session: [sessionID],
+      apply: true,
+      reserveBytes,
+      batchRows: 1,
+      batchBytes: 4 * 1024 * 1024,
+    })
+    if (!injected) throw new Error(`capacity fixture was not reached: ${JSON.stringify(capacityBound.report)}`)
+    if (availableAfterFiller === undefined) throw new Error("capacity fixture did not measure post-fill free space")
+    expect(availableAfterFiller).toBeLessThan(capacityTarget)
+    expect(capacityBound.report.action).toBe("refused")
+    expect(capacityBound.report.changedRows).toBe(0)
+    expect(capacityBound.report.refusalReasons).toContain("capacity-reserve-reached")
+    expect(capacityBound.report.remainingSessionIDs).toEqual([sessionID])
+    expect(ownedCounts(store.filename, sessionID).session).toBe(1)
+  } finally {
+    exec.mockRestore()
+    await rm(fillerPath, { force: true })
+  }
+})
+
+test("online prune revalidates and completes a durable event history over several batches", async () => {
+  const create = { payloadBytes: 512 * 1024, eventCount: 600 }
+  await using store = await producedStore([create], { timeout: 90_000 })
+  const selected = produce(store, { create })
+  const sessionID = selected.created[0]!.id
+  const cutoffAt = Date.now() - 5
+  const cutoff = new Date(cutoffAt).toISOString()
+  backdateSession(store.filename, sessionID, cutoffAt - 1_000)
+  await rm(store.project, { recursive: true })
+
+  const sequenceRevalidations = new Array<{ inTransaction: boolean }>()
+  const originalQuery = Database.prototype.query
+  const query = spyOn(Database.prototype, "query").mockImplementation(function <
+    ReturnType,
+    ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+  >(this: Database, statement: string) {
+    if (statement.includes("SELECT seq, owner_id FROM event_sequence"))
+      sequenceRevalidations.push({ inTransaction: this.inTransaction })
+    return (originalQuery<ReturnType, ParamsType>).call(this, statement)
+  })
+  const applied = await (async () => {
+    try {
+      return await invokeHandler(store, {
+        database: store.filename,
+        online: true,
+        before: cutoff,
+        session: [sessionID],
+        apply: true,
+        reserveBytes: 1,
+        batchRows: 256,
+        maxBatches: 10,
+      })
+    } finally {
+      query.mockRestore()
+    }
+  })()
+  expect(applied.report.action).toBe("applied")
+  expect(applied.report.deletedSessionIDs).toEqual([sessionID])
+  expect(applied.report.batches!.length).toBeGreaterThan(1)
+  expect(applied.report.batches!.every((batch) => Number(batch.changedRows) <= 256)).toBe(true)
+  expect(sequenceRevalidations.filter((item) => item.inTransaction).length).toBeGreaterThan(1)
+  expect(Object.values(ownedCounts(store.filename, sessionID)).every((count) => count === 0)).toBe(true)
+})
+
+test("online prune refuses a store without incremental auto-vacuum before deleting rows", async () => {
+  await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
+  const created = produce(store, { create: { payloadBytes: 512 * 1024 } })
+  const sessionID = created.created[0]!.id
+  const cutoffAt = Date.now() - 5
+  const cutoff = new Date(cutoffAt).toISOString()
+  backdateSession(store.filename, sessionID, cutoffAt - 1_000)
+  const before = ownedCounts(store.filename, sessionID)
+  const setup = new Database(store.filename)
+  setup.exec("PRAGMA auto_vacuum = NONE; VACUUM")
+  expect(setup.query("PRAGMA auto_vacuum").get()).toEqual({ auto_vacuum: 0 })
+  setup.close()
+
+  const inventory = parseReport(
+    await runCLI(store, ["--online", "--before", cutoff, "--session", sessionID, "--reserve-bytes", "1"]),
+  )
+  expect(inventory.action).toBe("inventory")
+  expect(inventory.reclamation.ready).toBe(false)
+  expect(inventory.reclamation.reasons).toContain("incremental-vacuum-unavailable:0")
+
+  const refused = parseReport(
+    await runCLI(
+      store,
+      ["--online", "--before", cutoff, "--session", sessionID, "--apply", "--reserve-bytes", "1"],
+      "nonzero",
+    ),
+  )
+  expect(refused.action).toBe("refused")
+  expect(refused.committed).toBe(false)
+  expect(refused.changedRows).toBe(0)
+  expect(refused.reclamation.reasons).toContain("incremental-vacuum-unavailable:0")
+  expect(ownedCounts(store.filename, sessionID)).toEqual(before)
+})
+
+test("online prune sends invalid bounds and missing apply reserves to stderr as CLI errors", async () => {
+  await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
+  const created = produce(store, { create: { payloadBytes: 512 * 1024 } })
+  const sessionID = created.created[0]!.id
+
+  const missingReserve = await runCLI(store, ["--online", "--session", sessionID, "--apply"], 2)
+  expect(missingReserve.stdout.trim()).toBe("")
+  expect(missingReserve.stderr).toContain("reserve-bytes-required")
+
+  const invalidBound = await runCLI(store, ["--online", "--session", sessionID, "--batch-rows", "257"], 2)
+  expect(invalidBound.stdout.trim()).toBe("")
+  expect(invalidBound.stderr).toContain("online-batch-rows-out-of-range")
+
+  const misplacedBound = parseReport(await runCLI(store, ["--session", sessionID, "--batch-rows", "256"], "nonzero"))
+  expect(misplacedBound.action).toBe("refused")
+  expect(misplacedBound.reclamation.reasons).toContain("online-options-require---online")
+})
+
+test("online prune checks the caller reserve before committing its first batch", async () => {
+  await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
+  const created = produce(store, { create: { payloadBytes: 512 * 1024 } })
+  const sessionID = created.created[0]!.id
+  const cutoffAt = Date.now() - 5
+  const cutoff = new Date(cutoffAt).toISOString()
+  backdateSession(store.filename, sessionID, cutoffAt - 1_000)
+  const before = ownedCounts(store.filename, sessionID)
+
+  const refused = parseReport(
+    await runCLI(
+      store,
+      ["--online", "--before", cutoff, "--session", sessionID, "--apply", "--reserve-bytes", "9007199254740000"],
+      "nonzero",
+    ),
+  )
+  expect(refused.action).toBe("refused")
+  expect(refused.committed).toBe(false)
+  expect(refused.changedRows).toBe(0)
+  expect(refused.refusalReasons).toContain("free-space-reserve-would-be-violated")
+  expect(ownedCounts(store.filename, sessionID)).toEqual(before)
+})
+
+test("online prune honors --database over OPENCODE_DB and never creates a missing target", async () => {
+  await using target = await producedStore([{ payloadBytes: 512 * 1024 }])
+  await using environmentDefault = await producedStore([{ payloadBytes: 512 * 1024 }])
+  const selected = produce(target, { create: { payloadBytes: 512 * 1024 } })
+  const defaultSession = produce(environmentDefault, { create: { payloadBytes: 512 * 1024 } })
+  const sessionID = selected.created[0]!.id
+  const defaultID = defaultSession.created[0]!.id
+  const cutoffAt = Date.now() - 5
+  const cutoff = new Date(cutoffAt).toISOString()
+  backdateSession(target.filename, sessionID, cutoffAt - 1_000)
+  const defaultBefore = ownedCounts(environmentDefault.filename, defaultID)
+
+  const inventory = parseReport(
+    await runCLI(
+      target,
+      ["--online", "--database", target.filename, "--before", cutoff, "--session", sessionID, "--reserve-bytes", "1"],
+      0,
+      { databaseDefault: environmentDefault.filename },
+    ),
+  )
+  expect(inventory.database).toBe(await realpath(target.filename))
+  expect(inventory.deletionScope.sessionIDs).toEqual([sessionID])
+  expect(ownedCounts(environmentDefault.filename, defaultID)).toEqual(defaultBefore)
+
+  const missing = path.join(target.directory, "missing-opencode.db")
+  const refused = parseReport(
+    await runCLI(
+      target,
+      ["--online", "--database", missing, "--session", sessionID, "--reserve-bytes", "1"],
+      "nonzero",
+      { databaseDefault: environmentDefault.filename },
+    ),
+  )
+  expect(refused.action).toBe("refused")
+  expect(refused.database).toBe(missing)
+  expect(refused.refusalReasons).toContain("database-file-unreadable")
+  expect(await Bun.file(missing).exists()).toBe(false)
+  expect(ownedCounts(environmentDefault.filename, defaultID)).toEqual(defaultBefore)
+})
+
+test("online inventory stays an inventory response when the selected database cannot be opened", async () => {
+  await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
+  const selected = produce(store, { create: { payloadBytes: 512 * 1024 } })
+  const sessionID = selected.created[0]!.id
+  const unreadable = path.join(store.directory, "unreadable-opencode.db")
+  await writeFile(unreadable, "not a SQLite database")
+
+  const inventory = parseReport(
+    await runCLI(store, ["--online", "--database", unreadable, "--session", sessionID, "--reserve-bytes", "1"], 0),
+  )
+  expect(inventory.action).toBe("inventory")
+  expect(inventory.reclamation.ready).toBe(false)
+  expect(inventory.committed).toBe(false)
+  expect(inventory.changedRows).toBe(0)
+})
+
+test("online prune deletes completed promoted V2 inputs but protects a still-pending input", async () => {
+  await using store = await producedStore([
+    { payloadBytes: 512 * 1024, completeStorage: true },
+    { payloadBytes: 512 * 1024, pendingV2: true },
+  ])
+  const completed = produce(store, { create: { payloadBytes: 512 * 1024, completeStorage: true } })
+  const pending = produce(store, { create: { payloadBytes: 512 * 1024, pendingV2: true } })
+  const completedID = completed.created[0]!.id
+  const pendingID = pending.created[0]!.id
+  const cutoffAt = Date.now() - 5
+  const cutoff = new Date(cutoffAt).toISOString()
+  backdateSession(store.filename, completedID, cutoffAt - 1_000)
+  backdateSession(store.filename, pendingID, cutoffAt - 1_000)
+  const pendingBefore = ownedCounts(store.filename, pendingID)
+
+  const inventory = parseReport(
+    await runCLI(store, [
+      "--online",
+      "--before",
+      cutoff,
+      "--session",
+      completedID,
+      "--session",
+      pendingID,
+      "--reserve-bytes",
+      "1",
+    ]),
+  )
+  expect(inventory.deletionScope.sessionIDs).toEqual([completedID])
+  expect(inventory.skippedSessions).toContainEqual({ sessionID: pendingID, reasons: ["v2-input-pending"] })
+
+  const applied = parseReport(
+    await runCLI(
+      store,
+      [
+        "--online",
+        "--before",
+        cutoff,
+        "--session",
+        completedID,
+        "--session",
+        pendingID,
+        "--apply",
+        "--reserve-bytes",
+        "1",
+      ],
+      "nonzero",
+    ),
+  )
+  expect(applied.action).toBe("failed")
+  expect(applied.committed).toBe(true)
+  expect(applied.deletedSessionIDs).toEqual([completedID])
+  expect(applied.skippedSessions).toContainEqual({ sessionID: pendingID, reasons: ["v2-input-pending"] })
+  expect(Object.values(ownedCounts(store.filename, completedID)).every((count) => count === 0)).toBe(true)
+  expect(ownedCounts(store.filename, pendingID)).toEqual(pendingBefore)
+})
+
+test("online prune does not authorize an unselected descendant", async () => {
+  await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
+  const parent = produce(store, { create: { payloadBytes: 512 * 1024 } })
+  const parentID = parent.created[0]!.id
+  const child = await produceLive(store, { create: { parentID, payloadBytes: 512 * 1024 } })
+  const childID = child.created[0]!.id
+  await rm(store.project, { recursive: true })
+  const cutoffAt = Date.now() - 5
+  const cutoff = new Date(cutoffAt).toISOString()
+  backdateSession(store.filename, parentID, cutoffAt - 1_000)
+  backdateSession(store.filename, childID, cutoffAt - 1_000)
+  const parentBefore = ownedCounts(store.filename, parentID)
+  const childBefore = ownedCounts(store.filename, childID)
+
+  const inventory = parseReport(
+    await runCLI(store, ["--online", "--before", cutoff, "--session", parentID, "--reserve-bytes", "1"]),
+  )
+  expect(inventory.deletionScope.sessionIDs).toEqual([])
+  expect(inventory.skippedSessions?.find((item) => item.sessionID === parentID)?.reasons).toContain(
+    `protected-descendant:${childID}`,
+  )
+  const refused = parseReport(
+    await runCLI(
+      store,
+      ["--online", "--before", cutoff, "--session", parentID, "--apply", "--reserve-bytes", "1"],
+      "nonzero",
+    ),
+  )
+  expect(refused.action).toBe("refused")
+  expect(refused.committed).toBe(false)
+  expect(ownedCounts(store.filename, parentID)).toEqual(parentBefore)
+  expect(ownedCounts(store.filename, childID)).toEqual(childBefore)
+})
+
+test("online inventory resumes the stable Part-ID proof after source rowids move", async () => {
+  await using store = await producedStore([{ payloadBytes: 512 * 1024 }, { payloadBytes: 512 * 1024 }])
+  const parent = produce(store, { create: { payloadBytes: 512 * 1024 } })
+  const other = produce(store, { create: { payloadBytes: 512 * 1024 } })
+  const parentID = parent.created[0]!.id
+  const otherID = other.created[0]!.id
+  await rm(store.project, { recursive: true })
+  const cutoffAt = Date.now() - 5
+  const cutoff = new Date(cutoffAt).toISOString()
+  backdateSession(store.filename, parentID, cutoffAt - 1_000)
+  backdateSession(store.filename, otherID, cutoffAt - 1_000)
+  const prepare = new Database(store.filename)
+  prepare.exec("DELETE FROM part")
+  const partIDs = ["part-backfill-a", "part-backfill-b", "part-backfill-c"] as const
+  const partInsert = prepare.query(
+    `INSERT INTO part (rowid, id, message_id, session_id, time_created, time_updated, data)
+     VALUES (?, ?, ?, ?, 0, 0, '{}')`,
+  )
+  partInsert.run(1, partIDs[0], parent.created[0]!.messageID, otherID)
+  partInsert.run(3, partIDs[1], parent.created[0]!.messageID, otherID)
+  partInsert.run(5, partIDs[2], parent.created[0]!.messageID, otherID)
+  const parentBefore = ownedCounts(store.filename, parentID)
+  const otherBefore = ownedCounts(store.filename, otherID)
+  prepare.query("DELETE FROM online_reclaim_cross_session_part WHERE part_id = ?").run(partIDs[2])
+  prepare
+    .query(
+      `DELETE FROM online_reclaim_cross_part_scope
+       WHERE session_id = ? AND part_id = ? AND role IN ('owned', 'child')`,
+    )
+    .run(otherID, partIDs[2])
+  prepare
+    .query(
+      `DELETE FROM online_reclaim_cross_part_scope
+       WHERE session_id = ? AND part_id = ? AND role = 'parent'`,
+    )
+    .run(parentID, partIDs[2])
+  prepare
+    .query(
+      `DELETE FROM online_reclaim_cross_part_message
+       WHERE message_id = ? AND child_session_id = ? AND part_id = ?`,
+    )
+    .run(parent.created[0]!.messageID, otherID, partIDs[2])
+  const rowidCursor = prepare
+    .query<{ rowid: number }, [string]>("SELECT rowid FROM part WHERE id = ?")
+    .get(partIDs[1])?.rowid
+  if (rowidCursor !== 3) throw new Error("Part ROWID cursor fixture did not start at 3")
+  prepare
+    .query(
+      `UPDATE online_reclaim_backfill
+       SET cursor = 3, high_water = 5, complete = 0
+       WHERE name IN ('cross-session-part-scope', 'cross-session-parts')`,
+    )
+    .run()
+  prepare
+    .query(
+      `UPDATE online_reclaim_stable_backfill
+       SET cursor = ?, cursor_secondary = '', cursor_started = 1,
+           high_water = ?, high_water_secondary = '', high_water_present = 1, complete = 0
+       WHERE name = 'cross-session-part-scope'`,
+    )
+    .run(partIDs[1], partIDs[2])
+  prepare.exec("UPDATE part SET rowid = rowid + 100")
+  prepare.query("UPDATE part SET rowid = 1 WHERE id = ?").run(partIDs[0])
+  prepare.query("UPDATE part SET rowid = 2 WHERE id = ?").run(partIDs[1])
+  prepare.query("UPDATE part SET rowid = 3 WHERE id = ?").run(partIDs[2])
+  expect(prepare.query<{ rowid: number }, [string]>("SELECT rowid FROM part WHERE id = ?").get(partIDs[2])?.rowid).toBe(
+    3,
+  )
+  prepare.close()
+
+  const pending = parseReport(
+    await runCLI(store, ["--online", "--before", cutoff, "--session", parentID, "--reserve-bytes", "1"]),
+  )
+  expect(pending.reclamation.ready).toBe(false)
+  expect(pending.reclamation.reasons).toContain("online-proof-backfill-incomplete:cross-session-part-scope")
+
+  const applied = parseReport(
+    await runCLI(
+      store,
+      ["--online", "--before", cutoff, "--session", parentID, "--apply", "--reserve-bytes", "1"],
+      "nonzero",
+    ),
+  )
+  expect(applied.proofPreparation?.complete).toBe(true)
+  const proof = new Database(store.filename, { readonly: true })
+  try {
+    expect(
+      proof
+        .query("SELECT role FROM online_reclaim_cross_part_scope WHERE session_id = ? AND part_id = ?")
+        .get(parentID, partIDs[2]),
+    ).toEqual({ role: "parent" })
+    expect(
+      proof
+        .query(
+          "SELECT part_id FROM online_reclaim_cross_part_message WHERE message_id = ? AND child_session_id = ? AND part_id = ?",
+        )
+        .get(parent.created[0]!.messageID, otherID, partIDs[2]),
+    ).toEqual({ part_id: partIDs[2] })
+  } finally {
+    proof.close()
+  }
+  expect(applied.action).toBe("refused")
+  expect(applied.committed).toBe(false)
+  expect(applied.changedRows).toBe(0)
+  expect(applied.refusalReasons).toContain(
+    `cross-session-cascade:part.message_id:${parent.created[0]!.messageID}:${parentID}->${otherID}`,
+  )
+
+  const inventory = parseReport(
+    await runCLI(store, ["--online", "--before", cutoff, "--session", parentID, "--reserve-bytes", "1"]),
+  )
+  expect(inventory.reclamation.ready).toBe(true)
+  expect(inventory.deletionScope.sessionIDs).toEqual([])
+  expect(inventory.excludedSessions.find((item) => item.sessionID === parentID)?.reasons).toContain(
+    `cross-session-cascade:part.message_id:${parent.created[0]!.messageID}:${parentID}->${otherID}`,
+  )
+  expect(applied.deletedSessionIDs).toEqual([])
+  expect(applied.partialSessionIDs).toEqual([])
+  expect(applied.changedRowsByTable?.message ?? 0).toBe(0)
+  expect(applied.refusalReasons).toContain(
+    `cross-session-cascade:part.message_id:${parent.created[0]!.messageID}:${parentID}->${otherID}`,
+  )
+  expect(ownedCounts(store.filename, parentID).message).toBe(parentBefore.message)
+  expect(ownedCounts(store.filename, otherID)).toEqual(otherBefore)
+})
+
+test.serial("online Message trigger works on migrated stores without fresh-only index", async () => {
+  await using store = await producedStore([{}, {}])
+  const parent = store.metadata[0]!.created[0]!
+  const childID = store.metadata[1]!.created[0]!.id
+  const before = new Database(store.filename)
+  OnlineReclaimProof.requiredTriggerNames.forEach((name) => before.exec(`DROP TRIGGER IF EXISTS "${name}"`))
+  before
+    .query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'online_reclaim_%'")
+    .all()
+    .forEach((table) => before.exec(`DROP TABLE "${table.name}"`))
+  before.exec("DROP INDEX part_message_id_session_idx")
+  before.close()
+
+  const coreDatabase = await import("@opencode-ai/core/database/database")
+  await Effect.runPromise(Effect.scoped(Layer.build(coreDatabase.Database.layerFromPath(store.filename))))
+  const migrated = new Database(store.filename)
+  try {
+    expect(
+      migrated.query("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'part_message_id_session_idx'").get(),
+    ).toBeNull()
+    expect(
+      migrated.query("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'part_message_id_id_idx'").get(),
+    ).toBeTruthy()
+
+    const partID = "pre-pr-message-cross-part"
+    migrated
+      .query(
+        `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+         VALUES (?, ?, ?, 0, 0, '{}')`,
+      )
+      .run(partID, parent.messageID, childID)
+    migrated.query("UPDATE message SET session_id = ?, admission_seq = 0 WHERE id = ?").run(childID, parent.messageID)
+
+    expect(
+      migrated
+        .query("SELECT role FROM online_reclaim_cross_part_scope WHERE session_id = ? AND part_id = ?")
+        .get(childID, partID),
+    ).toEqual({ role: "owned" })
+    expect(
+      migrated.query("SELECT part_id FROM online_reclaim_cross_session_part WHERE part_id = ?").get(partID),
+    ).toBeNull()
+    expect(
+      migrated.query("SELECT part_id FROM online_reclaim_cross_part_message WHERE part_id = ?").get(partID),
+    ).toBeNull()
+  } finally {
+    migrated.close()
+  }
+})
+
+test.serial(
+  "online Part proof-map cleanup stays indexed with unrelated history",
+  async () => {
+    const proofTables = [
+      "online_reclaim_cross_session_part",
+      "online_reclaim_cross_part_scope",
+      "online_reclaim_cross_part_message",
+    ] as const
+    for (const unrelatedRows of [600, 60_000]) {
+      await using store = await producedStore([{}, {}, {}])
+      const selected = store.metadata[0]!.created[0]!
+      const parent = store.metadata[1]!.created[0]!
+      const parentID = parent.id
+      const childID = store.metadata[2]!.created[0]!.id
+      const triggerPartID = `trigger-cross-part-${unrelatedRows}`
+      const triggerEvents = [
+        {
+          statement: "UPDATE message SET session_id = ?, admission_seq = 0 WHERE id = ?",
+          parameters: [childID, parent.messageID],
+        },
+        {
+          statement: "UPDATE part SET session_id = ? WHERE id = ?",
+          parameters: [parentID, parent.partID],
+        },
+        {
+          statement: "DELETE FROM part WHERE id = ?",
+          parameters: [triggerPartID],
+        },
+      ]
+      const db = new Database(store.filename)
+      try {
+        const scopeInsert = db.query(
+          `INSERT INTO online_reclaim_cross_part_scope (
+             session_id, part_id, message_id, parent_session_id, child_session_id, role
+           ) VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        const messageInsert = db.query(
+          `INSERT INTO online_reclaim_cross_part_message (message_id, child_session_id, part_id, parent_session_id)
+           VALUES (?, ?, ?, ?)`,
+        )
+        const legacyInsert = db.query(
+          `INSERT INTO online_reclaim_cross_session_part (part_id, message_id, parent_session_id, child_session_id)
+           VALUES (?, ?, ?, ?)`,
+        )
+        db.transaction(() =>
+          Array.from({ length: unrelatedRows }, (_, index) => index).forEach((index) => {
+            const suffix = String(index).padStart(5, "0")
+            const partID = `proof-part-${suffix}`
+            const messageID = `proof-message-${suffix}`
+            const parentSessionID = `proof-parent-${suffix}`
+            const childSessionID = `proof-child-${suffix}`
+            scopeInsert.run(childSessionID, partID, messageID, parentSessionID, childSessionID, "child")
+            scopeInsert.run(parentSessionID, partID, messageID, parentSessionID, childSessionID, "parent")
+            messageInsert.run(messageID, childSessionID, partID, parentSessionID)
+            legacyInsert.run(partID, messageID, parentSessionID, childSessionID)
+          }),
+        )()
+
+        db.query(
+          `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+           VALUES (?, ?, ?, 0, 0, '{}')`,
+        ).run(triggerPartID, parent.messageID, childID)
+        triggerEvents.forEach((event) => db.query(event.statement).run(...event.parameters))
+        expect(
+          db
+            .query("SELECT role FROM online_reclaim_cross_part_scope WHERE session_id = ? AND part_id = ?")
+            .get(parentID, parent.partID),
+        ).toEqual({ role: "child" })
+        expect(
+          db
+            .query("SELECT role FROM online_reclaim_cross_part_scope WHERE session_id = ? AND part_id = ?")
+            .get(childID, parent.partID),
+        ).toEqual({ role: "parent" })
+        expect(
+          db.query("SELECT part_id FROM online_reclaim_cross_part_scope WHERE part_id = ?").get(triggerPartID),
+        ).toBeNull()
+
+        db.exec(`
+          UPDATE online_reclaim_backfill SET cursor = 0, high_water = -1, complete = 0
+          WHERE name IN ('cross-session-part-scope', 'cross-session-parts');
+          UPDATE online_reclaim_stable_backfill
+          SET cursor = '', cursor_secondary = '', cursor_started = 0,
+              high_water = '', high_water_secondary = '', high_water_present = 0, complete = 0
+          WHERE name = 'cross-session-part-scope';
+        `)
+      } finally {
+        db.close()
+      }
+      await rm(store.project, { recursive: true })
+
+      const observedDeletes = new Array<string>()
+      const observedPartDeletes = new Array<string>()
+      const originalQuery = Database.prototype.query
+      const query = spyOn(Database.prototype, "query").mockImplementation(function <
+        ReturnType,
+        ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+      >(this: Database, statement: string) {
+        const normalized = statement.trimStart()
+        if (normalized.startsWith("DELETE FROM online_reclaim_cross_")) observedDeletes.push(statement)
+        if (normalized.startsWith("DELETE FROM part WHERE id =")) observedPartDeletes.push(statement)
+        return (originalQuery<ReturnType, ParamsType>).call(this, statement)
+      })
+      const result = await (async () => {
+        try {
+          return await invokeHandler(store, {
+            database: store.filename,
+            online: true,
+            session: [selected.id],
+            apply: true,
+            reserveBytes: 1,
+          })
+        } finally {
+          query.mockRestore()
+        }
+      })()
+      expect(result.report.proofPreparation?.complete).toBe(true)
+      expect(result.report.proofPreparation?.rows).toBeGreaterThan(0)
+      expect(result.report.committed).toBe(true)
+      expect(result.report.deletedSessionIDs).toContain(selected.id)
+      expect(observedPartDeletes.length).toBeGreaterThan(0)
+
+      const proof = new Database(store.filename, { readonly: true })
+      try {
+        const indexNames = new Set(
+          proof
+            .query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'index'")
+            .all()
+            .map((row) => row.name),
+        )
+        const scopeIndexes = OnlineReclaimIndexes.definitions.filter(
+          (index) => index.table === "online_reclaim_cross_part_scope",
+        )
+        expect(scopeIndexes).toHaveLength(2)
+        expect(scopeIndexes.every((index) => indexNames.has(index.name))).toBe(true)
+        const triggerNames = new Set(
+          proof
+            .query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+            .all()
+            .map((row) => row.name),
+        )
+        expect(OnlineReclaimProof.requiredTriggerNames.every((name) => triggerNames.has(name))).toBe(true)
+
+        const plans = observedDeletes.map((statement) => {
+          const table = proofTables.find((name) => statement.includes(name))
+          if (!table) throw new Error(`unrecognized proof cleanup statement:${statement}`)
+          const parameters = new Array<SQLQueryBindings>((statement.match(/\?/g) ?? []).length).fill("plan")
+          const detail = proof
+            .query<{ detail: string }, SQLQueryBindings[]>(`EXPLAIN QUERY PLAN ${statement}`)
+            .all(...parameters)
+            .map((row) => row.detail)
+            .join("\n")
+          return { table, detail }
+        })
+        for (const table of proofTables) {
+          const tablePlans = plans.filter((plan) => plan.table === table)
+          expect(tablePlans.length).toBeGreaterThan(0)
+          expect(tablePlans.every((plan) => plan.detail.includes(`SEARCH ${table}`))).toBe(true)
+          expect(tablePlans.some((plan) => plan.detail.includes(`SCAN ${table}`))).toBe(false)
+        }
+
+        const proofRootPages = new Set(
+          proof
+            .query<{ rootpage: number }, []>(
+              `SELECT rootpage FROM sqlite_master
+               WHERE rootpage > 0 AND (
+                 name IN ('online_reclaim_cross_session_part', 'online_reclaim_cross_part_scope', 'online_reclaim_cross_part_message')
+                 OR tbl_name IN ('online_reclaim_cross_session_part', 'online_reclaim_cross_part_scope', 'online_reclaim_cross_part_message')
+               )`,
+            )
+            .all()
+            .map((row) => row.rootpage),
+        )
+        const triggerPlans = [...triggerEvents, { statement: observedPartDeletes[0]!, parameters: ["plan"] }].map(
+          (event) => {
+            const bytecode = proof
+              .query<
+                { addr: number; opcode: string; p1: number; p2: number },
+                SQLQueryBindings[]
+              >(`EXPLAIN ${event.statement}`)
+              .all(...event.parameters)
+            expect(bytecode.some((row) => row.opcode === "Program")).toBe(true)
+            const cursorRootPages = new Map<number, number>()
+            const scans = new Array<number>()
+            let previousAddress = -1
+            bytecode.forEach((row) => {
+              if (row.addr <= previousAddress) cursorRootPages.clear()
+              previousAddress = row.addr
+              if (row.opcode === "OpenRead" || row.opcode === "OpenWrite") cursorRootPages.set(row.p1, row.p2)
+              if (row.opcode === "Rewind" && proofRootPages.has(cursorRootPages.get(row.p1) ?? -1)) scans.push(row.p1)
+            })
+            return scans
+          },
+        )
+        expect(triggerPlans).toEqual([[], [], [], []])
+      } finally {
+        proof.close()
+      }
+    }
+  },
+  { timeout: 300_000 },
+)
+
+test.serial("online prune preserves a late cross-session Part before deleting its Message", async () => {
+  await using store = await producedStore([{ payloadBytes: 512 * 1024 }, { payloadBytes: 128 }])
+  const selected = produce(store, { create: { payloadBytes: 512 * 1024 } })
+  const selectedID = selected.created[0]!.id
+  const messageID = selected.created[0]!.messageID
+  const otherID = (await produceLive(store, { create: { payloadBytes: 128 } })).created[0]!.id
+  const startFile = path.join(store.directory, "online-cross-part-start")
+  const committedFile = path.join(store.directory, "online-cross-part-committed")
+  const writer = startProducer(store, {
+    queueAfterSignal: {
+      sessionID: otherID,
+      startFile,
+      readyFile: path.join(store.directory, "online-cross-part-ready"),
+      registerBeforeSignal: true,
+      appendEvent: true,
+    },
+    crossPart: { sessionID: otherID, messageID, completedFile: committedFile },
+  })
+  const registeredPID = Number(await readMatchingLine(writer, "PRUNE_REGISTERED "))
+  expect(registeredPID).toBeGreaterThan(0)
+  const otherBefore = ownedCounts(store.filename, otherID)
+  const original = Database.prototype.exec
+  const originalQuery = Database.prototype.query
+  const queryOrder = new Array<string>()
+  let injected = false
+  let writerFinished = false
+  const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+    if (statement === "BEGIN IMMEDIATE" && !injected) {
+      injected = true
+      writeFileSync(startFile, "start\n")
+      const deadline = Date.now() + 20_000
+      const wait = new Int32Array(new SharedArrayBuffer(4))
+      while (!existsSync(committedFile)) {
+        if (Date.now() >= deadline) throw new Error("cross-Session Part producer did not publish its acknowledgment")
+        Atomics.wait(wait, 0, 0, 5)
+      }
+    }
+    return original.call(this, statement)
+  })
+  const query = spyOn(Database.prototype, "query").mockImplementation(function <
+    ReturnType,
+    ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+  >(this: Database, statement: string) {
+    if (statement.includes("FROM online_reclaim_cross_part_message") && !statement.startsWith("EXPLAIN"))
+      queryOrder.push("cross-reference-check")
+    if (statement.startsWith('DELETE FROM "message"')) queryOrder.push("message-delete")
+    return (originalQuery<ReturnType, ParamsType>).call(this, statement)
+  })
+  try {
+    const result = await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      session: [selectedID],
+      apply: true,
+      reserveBytes: 1,
+      batchRows: 64,
+    })
+    assertChildOutcome(await writer.finish(), 0)
+    writerFinished = true
+    expect(injected).toBe(true)
+    expect(queryOrder).toContain("cross-reference-check")
+    expect(queryOrder).not.toContain("message-delete")
+    expect(result.report.action).toBe("failed")
+    expect(result.report.committed).toBe(true)
+    expect(result.report.deletedSessionIDs).toEqual([])
+    expect(result.report.remainingSessionIDs).toEqual([selectedID])
+    expect(result.report.changedRowsByTable?.message ?? 0).toBe(0)
+    expect(result.report.skippedSessions?.find((item) => item.sessionID === selectedID)?.reasons).toContain(
+      `cross-session-cascade:part.message_id:${messageID}:${selectedID}->${otherID}`,
+    )
+    expect(ownedCounts(store.filename, selectedID).message).toBeGreaterThan(0)
+    expect(ownedCounts(store.filename, otherID).part).toBe(otherBefore.part + 1)
+  } finally {
+    exec.mockRestore()
+    query.mockRestore()
+    if (!existsSync(startFile)) writeFileSync(startFile, "release\n")
+    if (!writerFinished) {
+      assertChildOutcome(await writer.finish(), 0)
+    }
+  }
+})
+
+test.serial("online prune pages the historical writer census outside its delete lock", async () => {
+  await using store = await producedStore([{}])
+  const sessionID = store.metadata[0]!.created[0]!.id
+  const identity = EventWriter.self()
+  await rm(store.project, { recursive: true })
+  const db = new Database(store.filename)
+  db.query("DELETE FROM event_aggregate_writer WHERE aggregate_id = ?").run(sessionID)
+  const process = db.query(
+    `INSERT INTO event_writer_process (writer_id, pid, boot_id, start_ticks, time_registered)
+     VALUES (?, ?, ?, ?, ?)`,
+  )
+  const writer = db.query(
+    `INSERT INTO event_aggregate_writer (aggregate_id, writer_id, time_last_append)
+     VALUES (?, ?, ?)`,
+  )
+  const deadWriters = 600
+  db.transaction(() => {
+    Array.from({ length: deadWriters }, (_, index) => index).forEach((index) => {
+      const writerID = `writer-test-dead-${String(index).padStart(4, "0")}`
+      process.run(writerID, 8_000_000_000 + index, "expired-boot", "1", 0)
+      writer.run(sessionID, writerID, index)
+    })
+    process.run("writer-test-zz-live", identity.pid, identity.bootID, identity.startTicks, Date.now())
+    writer.run(sessionID, "writer-test-zz-live", deadWriters)
+  })()
+  db.close()
+
+  const expectedLivenessReason =
+    identity.bootID && identity.startTicks ? "session-written-by-live-process" : "writer-liveness-unreadable"
+  const writerQueries = new Array<{ statement: string; inTransaction: boolean }>()
+  const originalQuery = Database.prototype.query
+  const query = spyOn(Database.prototype, "query").mockImplementation(function <
+    ReturnType,
+    ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+  >(this: Database, statement: string) {
+    if (
+      statement.includes("FROM event_aggregate_writer writer") &&
+      statement.includes("LEFT JOIN event_writer_process")
+    )
+      writerQueries.push({ statement, inTransaction: this.inTransaction })
+    return (originalQuery<ReturnType, ParamsType>).call(this, statement)
+  })
+  try {
+    const inventory = await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      session: [sessionID],
+      reserveBytes: 1,
+    })
+    expect(inventory.report.action).toBe("inventory")
+    expect(inventory.report.excludedSessions.find((item) => item.sessionID === sessionID)?.reasons).toContain(
+      expectedLivenessReason,
+    )
+    expect(writerQueries).toHaveLength(5)
+    expect(writerQueries.every((item) => !item.inTransaction)).toBe(true)
+    expect(writerQueries.every((item) => item.statement.includes("LIMIT ?"))).toBe(true)
+    expect(writerQueries.slice(1).every((item) => item.statement.includes("writer.writer_id > ?"))).toBe(true)
+
+    const clearWriter = new Database(store.filename)
+    clearWriter
+      .query("DELETE FROM event_aggregate_writer WHERE aggregate_id = ? AND writer_id = ?")
+      .run(sessionID, "writer-test-zz-live")
+    clearWriter.query("DELETE FROM event_writer_process WHERE writer_id = ?").run("writer-test-zz-live")
+    const remaining = clearWriter
+      .query<{ rows: number }, [string]>("SELECT count(*) AS rows FROM event_aggregate_writer WHERE aggregate_id = ?")
+      .get(sessionID)?.rows
+    clearWriter.close()
+    expect(remaining).toBe(deadWriters)
+    writerQueries.length = 0
+
+    const applied = await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      session: [sessionID],
+      apply: true,
+      reserveBytes: 1,
+      batchRows: 1,
+      maxBatches: 1,
+    })
+    expect(applied.report.action).toBe("failed")
+    expect(applied.report.committed).toBe(true)
+    expect(writerQueries).toHaveLength(Math.ceil(deadWriters / 128))
+    expect(writerQueries.every((item) => !item.inTransaction)).toBe(true)
+    expect(writerQueries.every((item) => item.statement.includes("LIMIT ?"))).toBe(true)
+    expect(writerQueries.slice(1).every((item) => item.statement.includes("writer.writer_id > ?"))).toBe(true)
+  } finally {
+    query.mockRestore()
+  }
+})
+
+test.serial("online holder proof looks up the current process lifetime without scanning PID history", async () => {
+  if (process.platform !== "linux") return
+  await using store = await producedStore([{}])
+  const sessionID = store.metadata[0]!.created[0]!.id
+  const identity = EventWriter.self()
+  if (!identity.bootID || !identity.startTicks) throw new Error("Linux process identity is unavailable")
+  await rm(store.project, { recursive: true })
+
+  const db = new Database(store.filename)
+  const insert = db.query(
+    `INSERT INTO event_writer_process (writer_id, pid, boot_id, start_ticks, time_registered)
+     VALUES (?, ?, ?, ?, ?)`,
+  )
+  const historicalRegistrations = 600
+  db.transaction(() => {
+    Array.from({ length: historicalRegistrations }, (_, index) => index).forEach((index) => {
+      insert.run(`writer-pid-history-${String(index).padStart(4, "0")}`, identity.pid, `old-boot-${index}`, "1", index)
+    })
+    insert.run(EventWriter.id(), identity.pid, identity.bootID, identity.startTicks, Date.now())
+  })()
+  db.close()
+
+  const holderQueries = new Array<{ statement: string; inTransaction: boolean }>()
+  const unboundedPidQueries = new Array<string>()
+  const originalQuery = Database.prototype.query
+  const query = spyOn(Database.prototype, "query").mockImplementation(function <
+    ReturnType,
+    ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+  >(this: Database, statement: string) {
+    if (statement.includes("FROM online_reclaim_writer_lifetime"))
+      holderQueries.push({ statement, inTransaction: this.inTransaction })
+    if (statement.includes("FROM event_writer_process") && statement.includes("WHERE pid = ?"))
+      unboundedPidQueries.push(statement)
+    return (originalQuery<ReturnType, ParamsType>).call(this, statement)
+  })
+  try {
+    const applied = await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      session: [sessionID],
+      apply: true,
+      reserveBytes: 1,
+      batchRows: 1,
+      maxBatches: 1,
+    })
+    expect(applied.report.committed).toBe(true)
+    expect(holderQueries.length).toBeGreaterThan(0)
+    expect(holderQueries.some((item) => item.inTransaction)).toBe(true)
+    expect(holderQueries.every((item) => item.statement.includes("LIMIT 1"))).toBe(true)
+    expect(unboundedPidQueries).toEqual([])
+  } finally {
+    query.mockRestore()
+  }
+})
+
+test(
+  "online reclaim releases the write lock between steps so a registered writer commits on another Session",
+  async () => {
+    await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
+    const selected = produce(store, { create: { payloadBytes: 512 * 1024 } })
+    const selectedID = selected.created[0]!.id
+    const live = await produceLive(store, { create: {} })
+    const liveID = live.created[0]!.id
+    const cutoffAt = Date.now() - 5
+    const cutoff = new Date(cutoffAt).toISOString()
+    backdateSession(store.filename, selectedID, cutoffAt - 1_000)
+    const liveBefore = ownedCounts(store.filename, liveID)
+    const startFile = path.join(store.directory, "online-writer-start")
+    const readyFile = path.join(store.directory, "online-writer-ready")
+    const completedFile = path.join(store.directory, "online-writer-committed")
+    const closedFile = path.join(store.directory, "online-writer-closed")
+    await using writer = startProducer(store, {
+      queueAfterSignal: {
+        sessionID: liveID,
+        startFile,
+        readyFile,
+        completedFile,
+        closedFile,
+        appendEvent: true,
+        registerBeforeSignal: true,
+      },
+    })
+    expect(Number(await readMatchingLine(writer, "PRUNE_REGISTERED "))).toBeGreaterThan(0)
+
+    const original = Database.prototype.exec
+    let writerCompleted = false
+    let freelistWhenWriterCompleted = 0
+    let laterVacuumSteps = 0
+    const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+      const result = original.call(this, statement)
+      if (!statement.startsWith("PRAGMA incremental_vacuum(")) return result
+      if (writerCompleted) {
+        laterVacuumSteps += 1
+        return result
+      }
+      freelistWhenWriterCompleted =
+        this.query<{ freelist_count: number }, []>("PRAGMA freelist_count").get()?.freelist_count ?? 0
+      if (freelistWhenWriterCompleted <= 32) throw new Error("fixture did not leave reclaim pages after the first step")
+      writeFileSync(startFile, "start\n")
+      const deadline = Date.now() + 20_000
+      const wait = new Int32Array(new SharedArrayBuffer(4))
+      while (!existsSync(closedFile)) {
+        if (Date.now() >= deadline) throw new Error("production writer did not publish its commit acknowledgment")
+        Atomics.wait(wait, 0, 0, 5)
+      }
+      writerCompleted = true
+      return result
+    })
+    try {
+      const result = await invokeHandler(store, {
+        database: store.filename,
+        online: true,
+        before: cutoff,
+        session: [selectedID],
+        apply: true,
+        reserveBytes: 1,
+        batchRows: 4,
+        vacuumPages: 32,
+      })
+      expect(existsSync(completedFile)).toBe(true)
+      assertChildOutcome(await writer.finish(), 0)
+      writerCompleted = true
+      expect(writerCompleted).toBe(true)
+      expect(freelistWhenWriterCompleted).toBeGreaterThan(32)
+      expect(laterVacuumSteps).toBeGreaterThan(0)
+      expect(result.report.action).toBe("applied")
+      expect(result.report.deletedSessionIDs).toEqual([selectedID])
+      expect(result.report.reclamation.steps?.filter((step) => Number(step.vacuumPages) > 0).length).toBeGreaterThan(1)
+      expect(Object.values(ownedCounts(store.filename, selectedID)).every((count) => count === 0)).toBe(true)
+      expect(ownedCounts(store.filename, liveID)).toMatchObject({ session: 1 })
+      expect(ownedCounts(store.filename, liveID).queue).toBeGreaterThan(liveBefore.queue)
+      expect(ownedCounts(store.filename, liveID).event).toBeGreaterThan(liveBefore.event)
+    } finally {
+      exec.mockRestore()
+      if (!existsSync(startFile)) writeFileSync(startFile, "release\n")
+      if (!writerCompleted) assertChildOutcome(await writer.finish(), 0)
+    }
+  },
+  { timeout: 60_000 },
+)
+
+test.serial(
+  "online prune revalidates the event fence after the paged writer census",
+  async () => {
+    await using store = await producedStore([{}])
+    const sessionID = store.metadata[0]!.created[0]!.id
+    await rm(store.project, { recursive: true })
+    const before = ownedCounts(store.filename, sessionID)
+    const startFile = path.join(store.directory, "writer-fence-start")
+    const committedFile = path.join(store.directory, "writer-fence-committed")
+    const closedFile = path.join(store.directory, "writer-fence-closed")
+    await using writer = startProducer(store, {
+      eventAfterSignal: { sessionID, startFile, committedFile, closedFile },
+    })
+    await readMatchingLine(writer, "PRUNE_EVENT_WAITING")
+
+    const censusQueries = new Array<{ statement: string; inTransaction: boolean }>()
+    const originalExec = Database.prototype.exec
+    const originalQuery = Database.prototype.query
+    let signaled = false
+    let writerClosed = false
+    const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+      if (statement === "BEGIN IMMEDIATE" && !signaled) {
+        signaled = true
+        writeFileSync(startFile, "publish\n")
+        const deadline = Date.now() + 20_000
+        const wait = new Int32Array(new SharedArrayBuffer(4))
+        while (!existsSync(closedFile)) {
+          if (Date.now() >= deadline) throw new Error("late event writer did not publish its close acknowledgment")
+          Atomics.wait(wait, 0, 0, 5)
+        }
+      }
+      return originalExec.call(this, statement)
+    })
+    const query = spyOn(Database.prototype, "query").mockImplementation(function <
+      ReturnType,
+      ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+    >(this: Database, statement: string) {
+      if (
+        statement.includes("FROM event_aggregate_writer writer") &&
+        statement.includes("LEFT JOIN event_writer_process process")
+      )
+        censusQueries.push({ statement, inTransaction: this.inTransaction })
+      return (originalQuery<ReturnType, ParamsType>).call(this, statement)
+    })
+    try {
+      const refused = await invokeHandler(store, {
+        database: store.filename,
+        online: true,
+        session: [sessionID],
+        apply: true,
+        reserveBytes: 1,
+        batchRows: 1,
+      })
+      assertChildOutcome(await writer.finish(), 0)
+      writerClosed = true
+      expect(signaled).toBe(true)
+      expect(await Bun.file(committedFile).exists()).toBe(true)
+      expect(refused.report.action).toBe("refused")
+      expect(refused.report.committed).toBe(false)
+      expect(refused.report.changedRows).toBe(0)
+      expect(refused.report.refusalReasons).toContain("session-changed-after-inventory")
+      expect(ownedCounts(store.filename, sessionID).session).toBe(before.session)
+      expect(ownedCounts(store.filename, sessionID).message).toBe(before.message)
+      expect(ownedCounts(store.filename, sessionID).part).toBe(before.part)
+      expect(censusQueries.length).toBeGreaterThan(0)
+      expect(censusQueries.every((item) => !item.inTransaction)).toBe(true)
+      expect(censusQueries.every((item) => item.statement.includes("LIMIT ?"))).toBe(true)
+    } finally {
+      exec.mockRestore()
+      query.mockRestore()
+      if (!existsSync(startFile)) writeFileSync(startFile, "release\n")
+      if (!writerClosed) assertChildOutcome(await writer.finish(), 0)
+    }
+  },
+  { timeout: 60_000 },
+)
+
+test.serial(
+  "online prune completes multi-batch deletion while a registered reader pins PASSIVE checkpoints",
+  async () => {
+    const create = { payloadBytes: 512 * 1024, eventCount: 600 }
+    await using store = await producedStore([create], { timeout: 90_000 })
+    const sessionID = produce(store, { create }).created[0].id
+    const readyFile = path.join(store.directory, "online-reader-ready")
+    await using reader = startProducer(store, { readerAfterSignal: { readyFile } })
+    let readerReady = false
+    try {
+      await readMatchingLine(reader, "PRUNE_READER_READY ")
+      readerReady = true
+      expect(await Bun.file(readyFile).exists()).toBe(true)
+      const applied = await invokeHandler(store, {
+        database: store.filename,
+        online: true,
+        session: [sessionID],
+        apply: true,
+        reserveBytes: 1,
+        batchRows: 64,
+        maxBatches: 100,
+        vacuumPages: 32,
+      })
+      expect(applied.report.action).toBe("failed")
+      expect(applied.report.committed).toBe(true)
+      expect(applied.report.deletedSessionIDs).toEqual([sessionID])
+      expect(applied.report.partialSessionIDs).toEqual([])
+      expect(applied.report.remainingSessionIDs).toEqual([])
+      expect(applied.report.batches!.length).toBeGreaterThan(1)
+      expect(applied.report.reclamation.outstanding).toContain("wal-checkpoint-incomplete")
+      if (typeof applied.report.reclamation.remainingWalFrames === "number")
+        expect(applied.report.reclamation.remainingWalFrames).toBeGreaterThan(0)
+      else
+        expect(
+          applied.report.reclamation.steps?.some((step) => {
+            const checkpoint = step.checkpoint
+            return (
+              typeof checkpoint === "object" &&
+              checkpoint !== null &&
+              "error" in checkpoint &&
+              checkpoint.error === "database table is locked"
+            )
+          }),
+        ).toBe(true)
+      expect(ownedCounts(store.filename, sessionID).session).toBe(0)
+
+      const reclaimOnly = await invokeHandler(store, {
+        database: store.filename,
+        online: true,
+        reclaimOnly: true,
+        apply: true,
+        reserveBytes: 1,
+        vacuumPages: 32,
+      })
+      expect(reclaimOnly.report.action).toBe("failed")
+      expect(reclaimOnly.report.changedRows).toBe(0)
+      expect(reclaimOnly.report.deletedSessionIDs).toEqual([])
+      expect(reclaimOnly.report.reclamation.outstanding).toContain("wal-checkpoint-incomplete")
+      expect(reclaimOnly.report.reclamation.remainingWalFrames).toBeGreaterThan(0)
+    } finally {
+      if (readerReady) {
+        reader.child.stdin.write("release\n")
+        reader.child.stdin.end()
+      }
+      assertChildOutcome(await reader.finish(), 0)
+    }
+
+    const reclaimed = await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      reclaimOnly: true,
+      apply: true,
+      reserveBytes: 1,
+      vacuumPages: 32,
+    })
+    expect(reclaimed.report.action).toBe("applied")
+    expect(reclaimed.report.reclamation.remainingWalFrames).toBe(0)
+    expect(reclaimed.report.reclamation.outstanding).toEqual([])
+  },
+  { timeout: 120_000 },
+)
+
+test("online prune revalidates newly admitted work before the first delete transaction", async () => {
+  await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
+  const selected = produce(store, { create: { payloadBytes: 512 * 1024 } })
+  const sessionID = selected.created[0]!.id
+  const cutoffAt = Date.now() - 5
+  const cutoff = new Date(cutoffAt).toISOString()
+  backdateSession(store.filename, sessionID, cutoffAt - 1_000)
+  const before = ownedCounts(store.filename, sessionID)
+  const startFile = path.join(store.directory, "online-work-start")
+  const readyFile = path.join(store.directory, "online-work-ready")
+  const completedFile = path.join(store.directory, "online-work-committed")
+  await using producer = startProducer(store, {
+    queueAfterSignal: { sessionID, startFile, readyFile, completedFile, registerBeforeSignal: true },
+    hold: true,
+    holdSessionID: sessionID,
+  })
+  const registeredPID = Number(await readMatchingLine(producer, "PRUNE_REGISTERED "))
+  let producerReady = false
+  const registration = new Database(store.filename, { readonly: true })
+  expect(
+    registration
+      .query<
+        { pid: number; boot_id: string | null; start_ticks: string | null },
+        [number]
+      >("SELECT pid, boot_id, start_ticks FROM event_writer_process WHERE pid = ?")
+      .get(registeredPID),
+  ).toMatchObject({ pid: registeredPID, boot_id: expect.any(String), start_ticks: expect.any(String) })
+  registration.close()
+
+  const original = Database.prototype.exec
+  let injected = false
+  const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+    if (statement === "BEGIN IMMEDIATE" && !injected) {
+      injected = true
+      writeFileSync(startFile, "admit\n")
+      const deadline = Date.now() + 20_000
+      const wait = new Int32Array(new SharedArrayBuffer(4))
+      while (!existsSync(completedFile)) {
+        if (Date.now() >= deadline) throw new Error("selected-Session producer did not acknowledge its queued write")
+        Atomics.wait(wait, 0, 0, 5)
+      }
+    }
+    return original.call(this, statement)
+  })
+  let producerExited = false
+  let producerResult: ChildResult | undefined
+  try {
+    const refused = await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      before: cutoff,
+      session: [sessionID],
+      apply: true,
+      reserveBytes: 1,
+    })
+    expect(injected).toBe(true)
+    const holdReady = JSON.parse(await readMatchingLine(producer, "PRUNE_HOLD_READY "))
+    producerReady = true
+    expect(holdReady).toEqual({
+      ready: true,
+      heldSessionID: sessionID,
+    })
+    expect(refused.report.action).toBe("refused")
+    expect(refused.report.committed).toBe(false)
+    expect(refused.report.changedRows).toBe(0)
+    expect(refused.report.refusalReasons?.length).toBeGreaterThan(0)
+    expect(ownedCounts(store.filename, sessionID)).toMatchObject({
+      session: before.session,
+      message: before.message,
+      part: before.part,
+      queue: expect.any(Number),
+    })
+    expect(ownedCounts(store.filename, sessionID).queue).toBeGreaterThan(0)
+  } finally {
+    exec.mockRestore()
+    if (existsSync(store.directory)) {
+      if (!existsSync(startFile)) writeFileSync(startFile, "release\n")
+      if (!producerReady) {
+        producerReady = (await readMatchingLine(producer, "PRUNE_HOLD_READY ").catch(() => undefined)) !== undefined
+      }
+      if (producerReady) {
+        producer.child.stdin.write("release\n")
+        producer.child.stdin.end()
+        producerExited = await waitForExit(producer.child, 20_000)
+      }
+    }
+    producerResult = await producer.finish()
+  }
+  if (!producerResult) throw new Error("selected-Session producer cleanup returned no result")
+  expect(producerExited).toBe(true)
+  assertChildOutcome(producerResult, 0)
+})
+
+test.serial(
+  "online prune detects late in-lock rows with the monotonic fence",
+  async () => {
+    await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
+    const sessionID = store.metadata[0].created[0].id
+    const before = ownedCounts(store.filename, sessionID)
+    const original = Database.prototype.exec
+    let injected = false
+    const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+      const result = original.call(this, statement)
+      if (statement === "BEGIN IMMEDIATE" && !injected) {
+        injected = true
+        const insert = this.query(
+          "INSERT INTO todo (session_id, content, status, priority, position, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        Array.from({ length: 10_000 }, (_, index) => index + 1).forEach((position) => {
+          insert.run(sessionID, "bounded revalidation fixture", "pending", "high", position, 0, 0)
+        })
+      }
+      return result
+    })
+    try {
+      const refused = await invokeHandler(store, {
+        database: store.filename,
+        online: true,
+        session: [sessionID],
+        apply: true,
+        reserveBytes: 1,
+      })
+      const reasons = refused.report.skippedSessions?.find((item) => item.sessionID === sessionID)?.reasons ?? []
+      expect(injected).toBe(true)
+      expect(refused.report.action).toBe("refused")
+      expect(refused.report.changedRows).toBe(0)
+      expect(reasons).toContain("session-changed-after-inventory")
+      expect(reasons).not.toContain("session-validation-bound-reached")
+      expect(ownedCounts(store.filename, sessionID)).toEqual(before)
+    } finally {
+      exec.mockRestore()
+    }
+  },
+  { timeout: 60_000 },
+)
+
+test.serial("online prune detects a Todo rewrite at or behind a committed cursor", async () => {
+  await using store = await producedStore([{}])
+  const sessionID = store.metadata[0]!.created[0]!.id
+  await rm(store.project, { recursive: true })
+  const startFile = path.join(store.directory, "online-todo-rewrite-start")
+  const closedFile = path.join(store.directory, "online-todo-rewrite-closed")
+  const producer = startProducer(store, { todoAfterSignal: { sessionID, startFile, closedFile } })
+  await readMatchingLine(producer, "PRUNE_TODO_WAITING")
+  const before = new Database(store.filename, { readonly: true })
+  const sessionUpdatedBefore = before
+    .query<{ time_updated: number }, [string]>("SELECT time_updated FROM session WHERE id = ?")
+    .get(sessionID)!.time_updated
+  const eventSequenceBefore = before
+    .query<{ seq: number }, [string]>("SELECT seq FROM event_sequence WHERE aggregate_id = ?")
+    .get(sessionID)!.seq
+  before.close()
+  const originalExec = Database.prototype.exec
+  const originalQuery = Database.prototype.query
+  let todoDeleteIssued = false
+  let injected = false
+  let producerFinished = false
+  const query = spyOn(Database.prototype, "query").mockImplementation(function <
+    ReturnType,
+    ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+  >(this: Database, statement: string) {
+    if (statement.startsWith('DELETE FROM "todo"')) todoDeleteIssued = true
+    return (originalQuery<ReturnType, ParamsType>).call(this, statement)
+  })
+  const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+    const result = originalExec.call(this, statement)
+    if (statement === "COMMIT" && todoDeleteIssued && !injected) {
+      injected = true
+      writeFileSync(startFile, "rewrite\n")
+      const deadline = Date.now() + 20_000
+      const wait = new Int32Array(new SharedArrayBuffer(4))
+      while (!existsSync(closedFile)) {
+        if (Date.now() >= deadline) throw new Error("late Todo producer did not publish its close acknowledgment")
+        Atomics.wait(wait, 0, 0, 5)
+      }
+    }
+    return result
+  })
+  try {
+    const result = await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      session: [sessionID],
+      apply: true,
+      reserveBytes: 1,
+      batchRows: 2,
+      maxBatches: 64,
+    })
+    assertChildOutcome(await producer.finish(), 0)
+    producerFinished = true
+    const after = new Database(store.filename, { readonly: true })
+    const todo = after
+      .query<{ content: string; position: number }, [string]>("SELECT content, position FROM todo WHERE session_id = ?")
+      .get(sessionID)
+    const sessionUpdatedAfter = after
+      .query<{ time_updated: number }, [string]>("SELECT time_updated FROM session WHERE id = ?")
+      .get(sessionID)?.time_updated
+    const eventSequenceAfter = after
+      .query<{ seq: number }, [string]>("SELECT seq FROM event_sequence WHERE aggregate_id = ?")
+      .get(sessionID)?.seq
+    after.close()
+    expect(result.report.skippedSessions?.find((item) => item.sessionID === sessionID)?.reasons).toContain(
+      "session-changed-after-inventory",
+    )
+    expect(todo).toEqual({ content: "Todo rewritten after the deletion cursor", position: 0 })
+    expect(sessionUpdatedAfter).toBe(sessionUpdatedBefore)
+    expect(eventSequenceAfter).toBe(eventSequenceBefore)
+    expect(injected).toBe(true)
+    expect(todoDeleteIssued).toBe(true)
+    expect(result.report.action).toBe("failed")
+    expect(result.report.committed).toBe(true)
+    expect(result.report.deletedSessionIDs).toEqual([])
+    expect(result.report.remainingSessionIDs).toContain(sessionID)
+  } finally {
+    exec.mockRestore()
+    query.mockRestore()
+    if (!existsSync(startFile)) writeFileSync(startFile, "release\n")
+    if (!producerFinished) assertChildOutcome(await producer.finish(), 0)
+  }
+})
+
+test.serial(
+  "online prune detects a new unselected descendant with an indexed tree probe",
+  async () => {
+    await using store = await producedStore([{}])
+    const parentID = produce(store, { create: {} }).created[0].id
+    const childID = (await produceLive(store, { create: { parentID } })).created[0].id
+    await rm(store.project, { recursive: true, force: true })
+    const original = Database.prototype.exec
+    let injected = false
+    const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+      const result = original.call(this, statement)
+      if (statement === "BEGIN IMMEDIATE" && !injected) {
+        injected = true
+        const projectID = this.query<{ project_id: string }, [string]>(
+          "SELECT project_id FROM session WHERE id = ?",
+        ).get(parentID)!.project_id
+        const insert = this.query(
+          "INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        Array.from({ length: 10_000 }, (_, index) => index).forEach((index) => {
+          const id = `ses-late-descendant-${index}`
+          insert.run(id, projectID, parentID, id, store.project, "late validation descendant", "test", 0, 0)
+        })
+      }
+      return result
+    })
+    try {
+      const applied = await invokeHandler(store, {
+        database: store.filename,
+        online: true,
+        session: [parentID, childID],
+        apply: true,
+        reserveBytes: 1,
+      })
+      const reasons = applied.report.skippedSessions?.find((item) => item.sessionID === parentID)?.reasons ?? []
+      expect(injected).toBe(true)
+      expect(reasons.some((reason) => reason.startsWith("protected-descendant:"))).toBe(true)
+      expect(reasons).not.toContain("session-tree-changed")
+      expect(applied.report.remainingSessionIDs).toContain(parentID)
+      expect(ownedCounts(store.filename, parentID).session).toBe(1)
+    } finally {
+      exec.mockRestore()
+    }
+  },
+  { timeout: 60_000 },
+)
+
+test("online prune preserves committed partial progress when reclamation measurement throws", async () => {
+  await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
+  const selected = produce(store, { create: { payloadBytes: 512 * 1024 } })
+  const sessionID = selected.created[0]!.id
+  const cutoffAt = Date.now() - 5
+  const cutoff = new Date(cutoffAt).toISOString()
+  backdateSession(store.filename, sessionID, cutoffAt - 1_000)
+  const before = ownedCounts(store.filename, sessionID)
+
+  const originalExec = Database.prototype.exec
+  const originalQuery = Database.prototype.query
+  let deletionCommitted = false
+  const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+    const result = originalExec.call(this, statement)
+    if (statement === "COMMIT") deletionCommitted = true
+    return result
+  })
+  const query = spyOn(Database.prototype, "query").mockImplementation(function <
+    ReturnType,
+    ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+  >(this: Database, statement: string) {
+    if (deletionCommitted && statement === "PRAGMA page_size") throw new Error("fixture-post-commit-page-measurement")
+    return (originalQuery<ReturnType, ParamsType>).call(this, statement)
+  })
+  try {
+    const result = await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      before: cutoff,
+      session: [sessionID],
+      apply: true,
+      reserveBytes: 1,
+      batchRows: 4,
+    })
+    expect(result.report.action).toBe("failed")
+    expect(result.report.committed).toBe(true)
+    expect(result.report.changedRows).toBeGreaterThan(0)
+    expect(result.report.deletedSessionIDs).toEqual([])
+    expect(result.report.partialSessionIDs).toEqual([sessionID])
+    expect(result.report.remainingSessionIDs).toEqual([sessionID])
+    expect(result.report.refusalReasons).toContain("fixture-post-commit-page-measurement")
+    expect(ownedCounts(store.filename, sessionID).session).toBe(1)
+    expect(ownedCounts(store.filename, sessionID)).not.toEqual(before)
+  } finally {
+    query.mockRestore()
+    exec.mockRestore()
+  }
+})
+
+test.serial("online prune reports committed delete and reclaim before a connection close failure", async () => {
+  await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
+  const sessionID = store.metadata[0]!.created[0]!.id
+  await rm(store.project, { recursive: true })
+  const before = ownedCounts(store.filename, sessionID)
+  const originalExec = Database.prototype.exec
+  const originalClose = Database.prototype.close
+  let vacuumCommitted = false
+  let injected = false
+  const exec = spyOn(Database.prototype, "exec").mockImplementation(function (this: Database, statement: string) {
+    const result = originalExec.call(this, statement)
+    if (statement.startsWith("PRAGMA incremental_vacuum(")) vacuumCommitted = true
+    return result
+  })
+  const close = spyOn(Database.prototype, "close").mockImplementation(function (this: Database) {
+    if (vacuumCommitted && !injected) {
+      injected = true
+      throw new Error("fixture-post-commit-reopen-close")
+    }
+    return originalClose.call(this)
+  })
+  try {
+    const result = await invokeHandler(store, {
+      database: store.filename,
+      online: true,
+      session: [sessionID],
+      apply: true,
+      reserveBytes: 1,
+      batchRows: 1,
+    })
+    const after = ownedCounts(store.filename, sessionID)
+    const removedRows =
+      Object.values(before).reduce((sum, count) => sum + count, 0) -
+      Object.values(after).reduce((sum, count) => sum + count, 0)
+    const reportedRows = Object.values(result.report.changedRowsByTable ?? {}).reduce((sum, count) => sum + count, 0)
+    expect(injected).toBe(true)
+    expect(result.report.action).toBe("failed")
+    expect(result.report.committed).toBe(true)
+    expect(result.report.changedRows).toBe(removedRows)
+    expect(reportedRows).toBe(removedRows)
+    expect(result.report.refusalReasons).toContain("fixture-post-commit-reopen-close")
+    expect(result.report.reclamation.steps?.some((step) => Number(step.vacuumPages) > 0)).toBe(true)
+    expect(result.report.partialSessionIDs).toContain(sessionID)
+    expect(after.session).toBe(1)
+  } finally {
+    close.mockRestore()
+    exec.mockRestore()
+  }
+})
+
 test("a post-commit checkpoint failure reports committed deletions", async () => {
   await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
   const old = produce(store, { create: { payloadBytes: 512 * 1024 } })
@@ -893,6 +3506,70 @@ test("recent activity on an old-created Session protects it while an equally old
   expect(result.report.excludedSessions.find((item) => item.sessionID === touchedID)?.reasons).toContain(
     "activity-at-or-after-cutoff",
   )
+})
+
+test.serial("online inventory finds maximum Message activity through its Session index", async () => {
+  await using store = await producedStore([{}])
+  const sessionID = store.metadata[0]!.created[0]!.id
+  await produceLive(store, { bulkMessages: { sessionID, count: 100 } })
+  await rm(store.project, { recursive: true })
+  const cutoffAt = Date.now() - 5
+  backdateSession(store.filename, sessionID, cutoffAt - 1_000)
+  const db = new Database(store.filename)
+  db.query("UPDATE message SET time_updated = ? WHERE id = ?").run(cutoffAt + 1, "msg-large-history-000000")
+  db.close()
+
+  const originalQuery = Database.prototype.query
+  const activityStatements = new Array<string>()
+  const query = spyOn(Database.prototype, "query").mockImplementation(function <
+    ReturnType,
+    ParamsType extends SQLQueryBindings | SQLQueryBindings[],
+  >(this: Database, statement: string) {
+    if (
+      !statement.startsWith("EXPLAIN") &&
+      statement.startsWith('SELECT max("time_updated") AS activity FROM "message"')
+    )
+      activityStatements.push(statement)
+    return (originalQuery<ReturnType, ParamsType>).call(this, statement)
+  })
+  const result = await (async () => {
+    try {
+      return await invokeHandler(store, {
+        database: store.filename,
+        online: true,
+        before: new Date(cutoffAt).toISOString(),
+        session: [sessionID],
+        reserveBytes: 1,
+      })
+    } finally {
+      query.mockRestore()
+    }
+  })()
+  const activityStatement = activityStatements[0]
+  if (!activityStatement) throw new Error("inventory did not execute the Message update-time aggregate")
+  const plan = new Database(store.filename, { readonly: true })
+  const details = plan
+    .query<{ opcode: string }, [string]>(`EXPLAIN ${activityStatement}`)
+    .all(sessionID)
+    .map((row) => row.opcode)
+  const queryPlan = plan
+    .query<{ detail: string }, [string]>(`EXPLAIN QUERY PLAN ${activityStatement}`)
+    .all(sessionID)
+    .map((row) => row.detail)
+    .join("\n")
+  plan.close()
+  expect(activityStatement).toContain("HAVING count(*) > 0")
+  expect(details).toContain("AggStep")
+  expect(queryPlan).toContain("SEARCH message USING")
+  expect(queryPlan).toContain("message_session_time_updated_id_idx")
+  expect(queryPlan).not.toContain("SCAN message")
+  expect(queryPlan).not.toContain("USE TEMP B-TREE")
+  expect(result.report.action).toBe("inventory")
+  expect(result.report.reclamation.ready).toBe(true)
+  expect(result.report.excludedSessions.find((item) => item.sessionID === sessionID)?.reasons).toContain(
+    "activity-at-or-after-cutoff",
+  )
+  expect(result.report.deletionScope.sessionIDs).toEqual([])
 })
 
 test("an eligible parent never deletes a protected child, and explicit selection deletes only its member", async () => {
@@ -2205,7 +4882,7 @@ async function produceLive(store: Store, operation: Record<string, unknown>, tim
 async function runCLI(
   store: Store,
   args: string[],
-  expectedStatus: number | "nonzero" = 0,
+  expectedStatus: number | "nonzero" | "either" = 0,
   options: { entrypoint?: string; timeout?: number; command?: string; databaseDefault?: string } = {},
 ) {
   const result = await runChild(
@@ -2286,9 +4963,13 @@ async function runChild(
   }
 }
 
-function assertChildOutcome(result: ChildResult, expectedStatus: number | "nonzero") {
+function assertChildOutcome(result: ChildResult, expectedStatus: number | "nonzero" | "either") {
   const statusMatches =
-    expectedStatus === "nonzero" ? result.status !== null && result.status !== 0 : result.status === expectedStatus
+    expectedStatus === "either"
+      ? result.status === 0 || result.status === 1
+      : expectedStatus === "nonzero"
+        ? result.status !== null && result.status !== 0
+        : result.status === expectedStatus
   if (statusMatches && result.signal === null && result.error === undefined) return
   throw new ChildFailure(result, expectedStatus)
 }
@@ -2318,7 +4999,7 @@ function describeChild(result: ChildResult) {
 class ChildFailure extends Error {
   constructor(
     readonly result: ChildResult,
-    expectedStatus: number | "nonzero" | undefined,
+    expectedStatus: number | "nonzero" | "either" | undefined,
     reason?: string,
   ) {
     super([reason ?? `child did not complete with expected status ${expectedStatus}`, describeChild(result)].join("\n"))
@@ -2492,10 +5173,19 @@ async function readMatchingLine(producer: RunningChild, prefix: string) {
 async function invokeHandler(
   store: Store,
   args: {
+    database?: string
     before?: string
     directory?: string
     session?: string[]
     apply?: boolean
+    online?: boolean
+    reclaimOnly?: boolean
+    reserveBytes?: number
+    batchRows?: number
+    batchBytes?: number
+    maxBatches?: number
+    vacuumPages?: number
+    maxVacuumPages?: number
     firstmateRanIt?: boolean
     measurementStatus?: "measured" | "partial" | "unavailable" | "failed"
     usageLedgerStatus?: "available" | "unavailable" | "failed"

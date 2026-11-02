@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer, primaryKey } from "drizzle-orm/sqlite-core"
+import { sqliteTable, text, integer, index, primaryKey } from "drizzle-orm/sqlite-core"
 
 // Fork-owned cross-process writer record (swxtchio/swx-firstmate#2052). Every OS process that
 // opens the database through the production Database layer registers its kernel identity here,
@@ -23,5 +23,8 @@ export const EventAggregateWriterTable = sqliteTable(
     writer_id: text().notNull(),
     time_last_append: integer().notNull(),
   },
-  (table) => [primaryKey({ columns: [table.aggregate_id, table.writer_id] })],
+  (table) => [
+    primaryKey({ columns: [table.aggregate_id, table.writer_id] }),
+    index("event_aggregate_writer_activity_idx").on(table.aggregate_id, table.time_last_append),
+  ],
 )

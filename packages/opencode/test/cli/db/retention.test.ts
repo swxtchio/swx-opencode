@@ -783,6 +783,14 @@ test(
     const proof = evidence([sessionID], finalSequence(first, [sessionID]), store.filename)
     const initial = inventory(access(first), proof, store.now)
     expect(initial.trees[0]?.eligible).toBe(true)
+    expect(initial.trees[0]?.reasons).not.toContain("unclassified-session-owned-table:online_reclaim_cross_part_scope")
+    expect(initial.trees[0]?.reasons).not.toContain(`event-payload-ownership-proof-unavailable:${sessionID}`)
+    const proofScopeBefore = first
+      .query<{ part_id: string; role: string }, [string]>(
+        "SELECT part_id, role FROM online_reclaim_cross_part_scope WHERE session_id = ? ORDER BY part_id",
+      )
+      .all(sessionID)
+    expect(proofScopeBefore.length).toBeGreaterThan(0)
 
     const firstBatch = apply(access(first), {
       tree: initial.trees[0]!,
@@ -810,6 +818,13 @@ test(
       })
       expect(result.state).toBe("complete")
       expect(result.changedRows).toBeGreaterThan(firstBatch.changedRows)
+      expect(
+        resumed
+          .query<{ part_id: string; role: string }, [string]>(
+            "SELECT part_id, role FROM online_reclaim_cross_part_scope WHERE session_id = ? ORDER BY part_id",
+          )
+          .all(sessionID),
+      ).toEqual(proofScopeBefore)
       expect(
         resumed
           .query<{ state: string }, [string]>("SELECT state FROM event_retention WHERE aggregate_id = ?")

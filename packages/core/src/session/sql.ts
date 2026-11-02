@@ -13,7 +13,6 @@ import type { MessageID, PartID, SessionV1 } from "../v1/session"
 import { WorkspaceV2 } from "../workspace"
 import { Timestamps } from "../database/schema.sql"
 import type { SystemContext } from "../system-context/index"
-import { AgentV2 } from "../agent"
 import type { Revert } from "@opencode-ai/schema/revert"
 
 type SessionMessageData = Omit<(typeof SessionMessage.Message)["Encoded"], "type" | "id">
@@ -86,6 +85,15 @@ export const MessageTable = sqliteTable(
     // History includes legacy seq 0 rows, so its unfiltered paging cannot use the partial unique index.
     index("message_session_admission_order_idx").on(table.session_id, table.admission_seq),
     index("message_session_time_created_id_idx").on(table.session_id, table.time_created, table.id),
+    index("message_session_time_updated_id_idx").on(table.session_id, table.time_updated, table.id),
+    index("message_session_invalid_json_idx")
+      .on(table.session_id)
+      .where(sql`json_valid(${table.data}) = 0`),
+    index("message_session_incomplete_assistant_idx")
+      .on(table.session_id)
+      .where(
+        sql`CASE WHEN json_valid(${table.data}) THEN json_extract(${table.data}, '$.role') = 'assistant' AND COALESCE(json_type(${table.data}, '$.time.completed'), 'null') NOT IN ('integer', 'real') ELSE 0 END`,
+      ),
   ],
 )
 
@@ -103,7 +111,18 @@ export const PartTable = sqliteTable(
   },
   (table) => [
     index("part_message_id_id_idx").on(table.message_id, table.id),
+    index("part_message_id_session_idx").on(table.message_id, table.session_id),
     index("part_session_idx").on(table.session_id),
+    index("part_session_time_created_id_idx").on(table.session_id, table.time_created, table.id),
+    index("part_session_time_updated_id_idx").on(table.session_id, table.time_updated, table.id),
+    index("part_session_invalid_json_idx")
+      .on(table.session_id)
+      .where(sql`json_valid(${table.data}) = 0`),
+    index("part_session_pending_running_idx")
+      .on(table.session_id)
+      .where(
+        sql`CASE WHEN json_valid(${table.data}) THEN json_extract(${table.data}, '$.state.status') IN ('pending', 'running') ELSE 0 END`,
+      ),
   ],
 )
 
@@ -123,6 +142,8 @@ export const TodoTable = sqliteTable(
   (table) => [
     primaryKey({ columns: [table.session_id, table.position] }),
     index("todo_session_idx").on(table.session_id),
+    index("todo_session_time_created_position_idx").on(table.session_id, table.time_created, table.position),
+    index("todo_session_time_updated_position_idx").on(table.session_id, table.time_updated, table.position),
   ],
 )
 
@@ -143,7 +164,16 @@ export const SessionMessageTable = sqliteTable(
     uniqueIndex("session_message_session_seq_idx").on(table.session_id, table.seq),
     index("session_message_session_type_seq_idx").on(table.session_id, table.type, table.seq),
     index("session_message_session_time_created_id_idx").on(table.session_id, table.time_created, table.id),
+    index("session_message_session_time_updated_id_idx").on(table.session_id, table.time_updated, table.id),
     index("session_message_time_created_idx").on(table.time_created),
+    index("session_message_session_invalid_json_idx")
+      .on(table.session_id)
+      .where(sql`json_valid(${table.data}) = 0`),
+    index("session_message_session_incomplete_assistant_idx")
+      .on(table.session_id)
+      .where(
+        sql`CASE WHEN json_valid(${table.data}) THEN ${table.type} = 'assistant' AND COALESCE(json_type(${table.data}, '$.time.completed'), 'null') NOT IN ('integer', 'real') ELSE 0 END`,
+      ),
   ],
 )
 
@@ -172,6 +202,10 @@ export const SessionInputTable = sqliteTable(
     ),
     uniqueIndex("session_input_session_admitted_seq_idx").on(table.session_id, table.admitted_seq),
     uniqueIndex("session_input_session_promoted_seq_idx").on(table.session_id, table.promoted_seq),
+    index("session_input_session_time_created_idx").on(table.session_id, table.time_created),
+    index("session_input_session_invalid_delivery_idx")
+      .on(table.session_id)
+      .where(sql`${table.delivery} NOT IN ('steer', 'queue')`),
   ],
 )
 

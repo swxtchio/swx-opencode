@@ -24,6 +24,76 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`online_reclaim_backfill\` (
+          \`name\` text PRIMARY KEY,
+          \`cursor\` integer NOT NULL,
+          \`high_water\` integer NOT NULL,
+          \`complete\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`online_reclaim_cross_part_message\` (
+          \`message_id\` text NOT NULL,
+          \`child_session_id\` text NOT NULL,
+          \`part_id\` text NOT NULL,
+          \`parent_session_id\` text NOT NULL,
+          CONSTRAINT \`online_reclaim_cross_part_message_pk\` PRIMARY KEY(\`message_id\`, \`child_session_id\`, \`part_id\`)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`online_reclaim_cross_part_scope\` (
+          \`session_id\` text NOT NULL,
+          \`part_id\` text NOT NULL,
+          \`message_id\` text NOT NULL,
+          \`parent_session_id\` text NOT NULL,
+          \`child_session_id\` text NOT NULL,
+          \`role\` text NOT NULL,
+          CONSTRAINT \`online_reclaim_cross_part_scope_pk\` PRIMARY KEY(\`session_id\`, \`part_id\`)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`online_reclaim_cross_session_part\` (
+          \`part_id\` text PRIMARY KEY,
+          \`message_id\` text NOT NULL,
+          \`parent_session_id\` text NOT NULL,
+          \`child_session_id\` text NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`online_reclaim_queue_alias_owner\` (
+          \`item_id\` text NOT NULL,
+          \`alias_id\` text NOT NULL,
+          \`owner_session_id\` text NOT NULL,
+          CONSTRAINT \`online_reclaim_queue_alias_owner_pk\` PRIMARY KEY(\`item_id\`, \`alias_id\`)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`online_reclaim_queue_alias_scope\` (
+          \`alias_rowid\` integer PRIMARY KEY,
+          \`owner_session_id\` text NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`online_reclaim_stable_backfill\` (
+          \`name\` text PRIMARY KEY,
+          \`cursor\` text NOT NULL,
+          \`cursor_secondary\` text NOT NULL,
+          \`cursor_started\` integer NOT NULL,
+          \`high_water\` text NOT NULL,
+          \`high_water_secondary\` text NOT NULL,
+          \`high_water_present\` integer NOT NULL,
+          \`complete\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`online_reclaim_writer_lifetime\` (
+          \`pid\` integer NOT NULL,
+          \`boot_id\` text NOT NULL,
+          \`start_ticks\` text NOT NULL,
+          CONSTRAINT \`online_reclaim_writer_lifetime_pk\` PRIMARY KEY(\`pid\`, \`boot_id\`, \`start_ticks\`)
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`event_aggregate_writer\` (
           \`aggregate_id\` text NOT NULL,
           \`writer_id\` text NOT NULL,
@@ -340,7 +410,37 @@ export default {
           CONSTRAINT \`fk_session_share_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
       `)
+      yield* tx.run(
+        `CREATE INDEX \`online_reclaim_cross_part_scope_owner_idx\` ON \`online_reclaim_cross_part_scope\` (\`session_id\`,\`part_id\`) WHERE "online_reclaim_cross_part_scope"."role" IN ('owned', 'child');`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`online_reclaim_cross_part_scope_cross_idx\` ON \`online_reclaim_cross_part_scope\` (\`session_id\`,\`part_id\`) WHERE "online_reclaim_cross_part_scope"."role" IN ('parent', 'child');`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`online_reclaim_cross_part_parent_idx\` ON \`online_reclaim_cross_session_part\` (\`parent_session_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`online_reclaim_cross_part_child_idx\` ON \`online_reclaim_cross_session_part\` (\`child_session_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`online_reclaim_queue_alias_owner_session_idx\` ON \`online_reclaim_queue_alias_owner\` (\`owner_session_id\`,\`item_id\`,\`alias_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`online_reclaim_queue_alias_session_rowid_idx\` ON \`online_reclaim_queue_alias_scope\` (\`owner_session_id\`,\`alias_rowid\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`event_aggregate_writer_activity_idx\` ON \`event_aggregate_writer\` (\`aggregate_id\`,\`time_last_append\`);`,
+      )
       yield* tx.run(`CREATE INDEX \`session_ask_session_idx\` ON \`session_ask\` (\`session_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`session_ask_session_unsettled_idx\` ON \`session_ask\` (\`session_id\`) WHERE "session_ask"."time_settled" IS NULL;`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_ask_session_time_created_idx\` ON \`session_ask\` (\`session_id\`,\`time_created\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_ask_session_time_settled_idx\` ON \`session_ask\` (\`session_id\`,\`time_settled\`) WHERE "session_ask"."time_settled" IS NOT NULL;`,
+      )
       yield* tx.run(
         `CREATE INDEX \`session_ask_directory_settled_idx\` ON \`session_ask\` (\`directory\`,\`time_settled\`);`,
       )
@@ -357,10 +457,43 @@ export default {
         `CREATE INDEX \`session_prompt_queue_session_delivery_seq_idx\` ON \`session_prompt_queue\` (\`session_id\`,\`delivery\`,\`seq\`);`,
       )
       yield* tx.run(
+        `CREATE INDEX \`session_prompt_queue_session_open_idx\` ON \`session_prompt_queue\` (\`session_id\`) WHERE ("session_prompt_queue"."time_promoted" IS NULL AND "session_prompt_queue"."time_withdrawn" IS NULL) OR "session_prompt_queue"."time_preparing" IS NOT NULL;`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_prompt_queue_session_conflicted_idx\` ON \`session_prompt_queue\` (\`session_id\`) WHERE "session_prompt_queue"."time_promoted" IS NOT NULL AND "session_prompt_queue"."time_withdrawn" IS NOT NULL;`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_prompt_queue_session_time_created_idx\` ON \`session_prompt_queue\` (\`session_id\`,\`time_created\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_prompt_queue_session_time_promoted_idx\` ON \`session_prompt_queue\` (\`session_id\`,\`time_promoted\`) WHERE "session_prompt_queue"."time_promoted" IS NOT NULL;`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_prompt_queue_session_time_withdrawn_idx\` ON \`session_prompt_queue\` (\`session_id\`,\`time_withdrawn\`) WHERE "session_prompt_queue"."time_withdrawn" IS NOT NULL;`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_prompt_queue_session_time_preparing_idx\` ON \`session_prompt_queue\` (\`session_id\`,\`time_preparing\`) WHERE "session_prompt_queue"."time_preparing" IS NOT NULL;`,
+      )
+      yield* tx.run(
         `CREATE INDEX \`session_prompt_receipt_session_item_idx\` ON \`session_prompt_receipt\` (\`session_id\`,\`item_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_prompt_receipt_session_pending_idx\` ON \`session_prompt_receipt\` (\`session_id\`) WHERE "session_prompt_receipt"."state" = 'pending';`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_prompt_receipt_session_invalid_idx\` ON \`session_prompt_receipt\` (\`session_id\`) WHERE "session_prompt_receipt"."state" NOT IN ('pending', 'withdrawn', 'delivered', 'merged', 'superseded', 'deleted');`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_prompt_receipt_session_time_created_idx\` ON \`session_prompt_receipt\` (\`session_id\`,\`time_created\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_prompt_receipt_session_time_updated_idx\` ON \`session_prompt_receipt\` (\`session_id\`,\`time_updated\`);`,
       )
       yield* tx.run(`CREATE UNIQUE INDEX \`event_aggregate_seq_idx\` ON \`event\` (\`aggregate_id\`,\`seq\`);`)
       yield* tx.run(`CREATE INDEX \`event_aggregate_type_seq_idx\` ON \`event\` (\`aggregate_id\`,\`type\`,\`seq\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`event_aggregate_unknown_type_idx\` ON \`event\` (\`aggregate_id\`) WHERE "event"."type" NOT IN ('session.created.1', 'session.updated.1', 'session.deleted.1', 'message.updated.1', 'message.removed.1', 'message.part.updated.1', 'message.part.removed.1', 'session.next.agent.switched.1', 'session.next.model.switched.1', 'session.next.titled.1', 'session.next.moved.1', 'session.next.prompted.1', 'session.next.prompt.admitted.1', 'session.next.context.updated.1', 'session.next.synthetic.1', 'session.next.shell.started.1', 'session.next.shell.ended.1', 'session.next.step.started.1', 'session.next.step.ended.2', 'session.next.step.failed.2', 'session.next.text.started.1', 'session.next.text.ended.1', 'session.next.tool.input.started.1', 'session.next.tool.input.ended.1', 'session.next.tool.called.1', 'session.next.tool.progress.1', 'session.next.tool.success.1', 'session.next.tool.failed.1', 'session.next.reasoning.started.1', 'session.next.reasoning.ended.1', 'session.next.retried.1', 'session.next.compaction.started.1', 'session.next.compaction.ended.1', 'session.next.revert.staged.1', 'session.next.revert.cleared.1', 'session.next.revert.committed.1');`,
+      )
       yield* tx.run(
         `CREATE UNIQUE INDEX \`permission_project_action_resource_idx\` ON \`permission\` (\`project_id\`,\`action\`,\`resource\`);`,
       )
@@ -373,8 +506,30 @@ export default {
       yield* tx.run(
         `CREATE INDEX \`message_session_time_created_id_idx\` ON \`message\` (\`session_id\`,\`time_created\`,\`id\`);`,
       )
+      yield* tx.run(
+        `CREATE INDEX \`message_session_time_updated_id_idx\` ON \`message\` (\`session_id\`,\`time_updated\`,\`id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`message_session_invalid_json_idx\` ON \`message\` (\`session_id\`) WHERE json_valid("message"."data") = 0;`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`message_session_incomplete_assistant_idx\` ON \`message\` (\`session_id\`) WHERE CASE WHEN json_valid("message"."data") THEN json_extract("message"."data", '$.role') = 'assistant' AND COALESCE(json_type("message"."data", '$.time.completed'), 'null') NOT IN ('integer', 'real') ELSE 0 END;`,
+      )
       yield* tx.run(`CREATE INDEX \`part_message_id_id_idx\` ON \`part\` (\`message_id\`,\`id\`);`)
+      yield* tx.run(`CREATE INDEX \`part_message_id_session_idx\` ON \`part\` (\`message_id\`,\`session_id\`);`)
       yield* tx.run(`CREATE INDEX \`part_session_idx\` ON \`part\` (\`session_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`part_session_time_created_id_idx\` ON \`part\` (\`session_id\`,\`time_created\`,\`id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`part_session_time_updated_id_idx\` ON \`part\` (\`session_id\`,\`time_updated\`,\`id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`part_session_invalid_json_idx\` ON \`part\` (\`session_id\`) WHERE json_valid("part"."data") = 0;`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`part_session_pending_running_idx\` ON \`part\` (\`session_id\`) WHERE CASE WHEN json_valid("part"."data") THEN json_extract("part"."data", '$.state.status') IN ('pending', 'running') ELSE 0 END;`,
+      )
       yield* tx.run(
         `CREATE INDEX \`session_input_session_pending_delivery_seq_idx\` ON \`session_input\` (\`session_id\`,\`promoted_seq\`,\`delivery\`,\`admitted_seq\`);`,
       )
@@ -385,6 +540,12 @@ export default {
         `CREATE UNIQUE INDEX \`session_input_session_promoted_seq_idx\` ON \`session_input\` (\`session_id\`,\`promoted_seq\`);`,
       )
       yield* tx.run(
+        `CREATE INDEX \`session_input_session_time_created_idx\` ON \`session_input\` (\`session_id\`,\`time_created\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_input_session_invalid_delivery_idx\` ON \`session_input\` (\`session_id\`) WHERE "session_input"."delivery" NOT IN ('steer', 'queue');`,
+      )
+      yield* tx.run(
         `CREATE UNIQUE INDEX \`session_message_session_seq_idx\` ON \`session_message\` (\`session_id\`,\`seq\`);`,
       )
       yield* tx.run(
@@ -393,11 +554,26 @@ export default {
       yield* tx.run(
         `CREATE INDEX \`session_message_session_time_created_id_idx\` ON \`session_message\` (\`session_id\`,\`time_created\`,\`id\`);`,
       )
+      yield* tx.run(
+        `CREATE INDEX \`session_message_session_time_updated_id_idx\` ON \`session_message\` (\`session_id\`,\`time_updated\`,\`id\`);`,
+      )
       yield* tx.run(`CREATE INDEX \`session_message_time_created_idx\` ON \`session_message\` (\`time_created\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`session_message_session_invalid_json_idx\` ON \`session_message\` (\`session_id\`) WHERE json_valid("session_message"."data") = 0;`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_message_session_incomplete_assistant_idx\` ON \`session_message\` (\`session_id\`) WHERE CASE WHEN json_valid("session_message"."data") THEN "session_message"."type" = 'assistant' AND COALESCE(json_type("session_message"."data", '$.time.completed'), 'null') NOT IN ('integer', 'real') ELSE 0 END;`,
+      )
       yield* tx.run(`CREATE INDEX \`session_project_idx\` ON \`session\` (\`project_id\`);`)
       yield* tx.run(`CREATE INDEX \`session_workspace_idx\` ON \`session\` (\`workspace_id\`);`)
       yield* tx.run(`CREATE INDEX \`session_parent_idx\` ON \`session\` (\`parent_id\`);`)
       yield* tx.run(`CREATE INDEX \`todo_session_idx\` ON \`todo\` (\`session_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`todo_session_time_created_position_idx\` ON \`todo\` (\`session_id\`,\`time_created\`,\`position\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`todo_session_time_updated_position_idx\` ON \`todo\` (\`session_id\`,\`time_updated\`,\`position\`);`,
+      )
     })
   },
 } satisfies Omit<DatabaseMigration.Migration, "id">

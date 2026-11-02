@@ -6,6 +6,7 @@ import type { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { migrations } from "./migration.gen"
 import schema from "./schema.gen"
 import { DatabaseMessageAdmission } from "./message-admission"
+import { OnlineReclaimProof } from "./online-reclaim-proof"
 
 type Database = EffectDrizzleSqlite.EffectSQLiteDatabase
 type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0]
@@ -25,7 +26,13 @@ export function apply(db: Database) {
       if (tables.some((table) => table.name === "session")) {
         // Existing stores can have pending migrations, so apply them in the production WAL mode.
         yield* db.run("PRAGMA journal_mode = WAL")
-        return yield* applyOnly(db, migrations)
+        yield* applyOnly(db, migrations)
+        yield* OnlineReclaimProof.install(db, false).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("online reclaim proof installation deferred; online prune will fail closed", cause),
+          ),
+        )
+        return
       }
       if (tables.length > 0) return yield* Effect.die("Database is not empty and has no session table")
       yield* db.run("PRAGMA auto_vacuum = INCREMENTAL")
@@ -42,6 +49,11 @@ export function apply(db: Database) {
             ),
           )
         }),
+      )
+      yield* OnlineReclaimProof.install(db, true).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("online reclaim proof installation deferred; online prune will fail closed", cause),
+        ),
       )
     }),
   )
