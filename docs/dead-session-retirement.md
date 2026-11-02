@@ -1,6 +1,6 @@
 # Commanded Session reclamation
 
-`opencode db prune` inventories the targeted local database by default. `--online` selects bounded live-store reclamation for explicit Session IDs; without it, prune keeps the offline path. `opencode db retire` remains the directory-targeted offline teardown entry point. Consult `opencode db prune --help`, `packages/opencode/src/cli/cmd/db-prune.ts`, the [published producer contract](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6537686549), its [limit clarification](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6537694254), the [round-two correction](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6541481027), and the [online reclamation plan](online-session-reclamation-plan.md) for the current interface.
+`opencode db prune` inventories the targeted local database by default. `--online` selects bounded live-store reclamation for explicit Session IDs; without it, prune keeps the offline path. `opencode db retire` remains the directory-targeted offline teardown entry point. Consult `opencode db prune --help`, `packages/opencode/src/cli/cmd/db-prune.ts`, [issue #371](https://github.com/swxtchio/swx-opencode/issues/371), the [published producer contract](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6537686549), its [limit clarification](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6537694254), the [round-two correction](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6541481027), and the [online reclamation plan](online-session-reclamation-plan.md) for the current interface.
 
 The current proof-preparation and preflight contract is further clarified by the [round-five correction](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6553050249) and [round-six correction](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6555341679).
 
@@ -9,13 +9,21 @@ The current proof-preparation and preflight contract is further clarified by the
 Authority: [swxtchio/swx-opencode#237's 2026-10-22 elevation](https://github.com/swxtchio/swx-opencode/issues/237#issuecomment-6330400385) and the agreed procedure in `/home/byates/fm-llmrouter/data/peer-mail/reply-disk-full-2026-10-22.md`, “The safe prune/vacuum path.” This is an explicitly commanded, per-home offline operation. Completing usage capture, normal worktree removal, age, or a merge does not schedule a bulk prune.
 
 1. Identify the exact local database using `opencode db path` in the owning home's environment. Use its absolute canonical regular-file path with `--database`; this option overrides the environment's default database and never creates a missing store.
-2. Preserve the existing Firstmate usage capture through its owner. The cleanup accepts best-effort unavailable or failed measurement reporting without turning those states into zero usage or requiring a certified receipt.
+2. Before an apply that can delete Session history, have the caller positively confirm durable usage capture for every Session in the deletion scope. Best-effort measurement may remain unavailable or failed without being turned into zero usage; measurement and ledger reports do not confirm capture. See the capture contract below.
 3. Coordinate that home's offline window: stop **all** its OpenCode serves and other users of this database, including readers. Keep them stopped until the cleanup process has exited. Stopping only the torn-down task's server is insufficient when the database is shared by other crews or the supervisor.
 4. Run in the same filesystem/mount view as the session owners, with the relevant filesystems mounted; absence in another namespace or on an unmounted volume is not evidence of worktree removal. Confirm that the worktree directories being retired are removed and will not be recreated during the operation. Read-only inventory is separate from apply; apply checks disappearance again under its write lock and immediately before deletion. Existing, empty, invalid, inaccessible and unresolved/dangling-symlink paths remain protected. A protected descendant also protects its parent.
 5. Plan temporary space before apply. The agreed path estimates **roughly twice the database size** as free temporary space; this is a planning approximation, not a guaranteed capacity formula. Check both the database and SQLite temporary-file filesystem, with headroom for the WAL, journal, other activity and filesystem allocation. Re-check the named procedure for the fleet's capacity decision.
 6. Review the inventory, explicitly apply the chosen scope, inspect the returned deletion and compaction outcome, then restart the home after the command exits. Do not retry by removing the database-holder or integrity safeguards.
 
 The consumer checks use the existing Linux process/lock inspection boundary. An uninspectable holder environment or database directory that admits other users refuses apply. SQLite exclusive locking stays on the cleanup connection through the committed deletion, truncate checkpoint, full `VACUUM`, final truncate checkpoint and result measurement. An arriving conflicting consumer cannot successfully read or write during compaction. The operation affects only the named local store; it does not delete remote or cached copies.
+
+## Durable usage capture before deletion
+
+Read-only inventory and the valid online `--reclaim-only --apply` form do not delete Session history and do not need capture confirmation. Every other apply that would delete Session history, including `db retire --apply`, requires `--usage-capture-status confirmed` and `--usage-capture-session <id>` for every ID in the command's computed `deletionScope.sessionIDs`. Repeat the session option for each captured ID; a larger captured set is accepted when it covers the whole deletion scope.
+
+The caller's `confirmed` status is an explicit assertion that durable usage data for those Sessions has been captured. OpenCode does not inspect Firstmate's ledger or infer capture from a completed run or measurement. An absent, unavailable, failed, partial, unknown, or unrecognized status refuses the apply. A confirmed status with incomplete ID coverage also refuses. The JSON result includes `action: "refused"`, a `usage-capture-status-<state>` or `usage-capture-scope-incomplete:<session-ids>` reason in `refusalReasons`, and `changedRows: 0`; the command exits nonzero. With a confirmed status, an invalid captured-ID list reports `usage-capture-scope-invalid`.
+
+`--firstmate-ran-it`, `--measurement-status`, and `--usage-ledger-status` remain reporting fields only. The `usageMeasurement` object preserves the caller's reported run, measurement, and ledger values without treating them as capture confirmation or inventing usage values. Check the actual flag descriptions with `opencode db prune --help`.
 
 ## Online Session reclamation
 
@@ -60,10 +68,11 @@ opencode db prune --online --database "$DB" --session "$SESSION_ID" \
   --reserve-bytes "$RESERVE_BYTES"
 
 opencode db prune --online --database "$DB" --session "$SESSION_ID" \
-  --apply --reserve-bytes "$RESERVE_BYTES"
+  --apply --reserve-bytes "$RESERVE_BYTES" \
+  --usage-capture-status confirmed --usage-capture-session "$SESSION_ID"
 ```
 
-Replace every example value before running it. Inventory is read-only. Review `deletionScope.sessionIDs`, `selectedSessions`, `skippedSessions`, and `reclamation.ready`/`reclamation.reasons` before applying. If inventory reports an incomplete proof, an explicit apply advances that same proof path in bounded batches; if more pages remain, retry the same command after reviewing `proofPreparation`. There is no per-Session validation-row cap; `--batch-rows` and `--batch-bytes` bound each delete transaction, and byte accounting includes every TEXT/BLOB column of each owned row, including the final Session row. Existing or uncertain directories, unselected descendants, cross-Session cascades, pending work, live writers, unknown storage ownership, an unregistered holder, or an unsupported auto-vacuum mode do not authorize deletion. Historical cross-Session Part references are reported during inventory through the stable-Part-ID scope proof; apply also rechecks actual Part references through the indexed Message proof inside each write batch. A reference arriving after inventory can leave committed partial progress with its Message and Part preserved. A registered process may remain connected when it does not own a selected Session; `db retire` does not enter online mode.
+Replace every example value before running it. The example's capture list assumes the inventory contains only `SESSION_ID`; repeat `--usage-capture-session` for every ID in `deletionScope.sessionIDs`. Inventory is read-only. Review `deletionScope.sessionIDs`, `selectedSessions`, `skippedSessions`, and `reclamation.ready`/`reclamation.reasons` before applying. If inventory reports an incomplete proof, an explicit apply advances that same proof path in bounded batches; if more pages remain, retry after reviewing `proofPreparation` and include the full capture scope on every deletion attempt. There is no per-Session validation-row cap; `--batch-rows` and `--batch-bytes` bound each delete transaction, and byte accounting includes every TEXT/BLOB column of each owned row, including the final Session row. Existing or uncertain directories, unselected descendants, cross-Session cascades, pending work, live writers, unknown storage ownership, an unregistered holder, or an unsupported auto-vacuum mode do not authorize deletion. Historical cross-Session Part references are reported during inventory through the stable-Part-ID scope proof; apply also rechecks actual Part references through the indexed Message proof inside each write batch. A reference arriving after inventory can leave committed partial progress with its Message and Part preserved. A registered process may remain connected when it does not own a selected Session; `db retire` does not enter online mode.
 
 The producer contract is one JSON object on stdout per valid call; diagnostics go to stderr. A reader-pinned or table-locked passive checkpoint is recorded in `reclamation.outstanding` and does not stop further Session deletion; once deletion finishes, outstanding WAL or freelist work makes the apply incomplete. A refused or failed apply exits 1; invalid CLI usage exits 2 and writes no JSON.
 
@@ -83,22 +92,27 @@ SQLite page/freelist progress and filesystem allocation are separate measurement
 Run these from a surviving operator directory, substituting the actual database filename:
 
 ```sh
+SESSION_ID="ses_example" # copy from the reviewed inventory
 opencode db prune --database "/absolute/home/data/opencode/opencode.db"
-opencode db prune --database "/absolute/home/data/opencode/opencode.db" --apply
+opencode db prune --database "/absolute/home/data/opencode/opencode.db" \
+  --session "$SESSION_ID" --apply \
+  --usage-capture-status confirmed --usage-capture-session "$SESSION_ID"
 ```
 
-To narrow the scope, repeat `--session <id>` or supply `--directory "/absolute/removed-worktree"`. A directory target includes sessions recorded at that path or below it, with each recorded directory checked independently. Equivalent trailing separators, parent segments and resolvable symlink-prefix spellings use the same filesystem identity; keep the canonical path before teardown if removing a symlink would erase its mapping. `--before <UTC-or-offset-timestamp>` is an optional activity filter within the missing-directory set. It cannot authorize deletion of an old session whose directory still exists. Inventory may show a missing-directory session in `excludedSessions` when a consumer, pending work, relationship or storage-ownership safeguard protects it; inspect its `directoryState` and `reasons`, not just its creation date.
+To narrow the scope, repeat `--session <id>` or supply `--directory "/absolute/removed-worktree"`. A directory target includes sessions recorded at that path or below it, with each recorded directory checked independently. For multiple Sessions, repeat `--usage-capture-session` for every ID in the reviewed deletion scope; a directory selection alone does not establish capture coverage. Equivalent trailing separators, parent segments and resolvable symlink-prefix spellings use the same filesystem identity; keep the canonical path before teardown if removing a symlink would erase its mapping. `--before <UTC-or-offset-timestamp>` is an optional activity filter within the missing-directory set. It cannot authorize deletion of an old session whose directory still exists. Inventory may show a missing-directory session in `excludedSessions` when a consumer, pending work, relationship or storage-ownership safeguard protects it; inspect its `directoryState` and `reasons`, not just its creation date.
 
 ## Teardown handoff
 
 The external caller must retain the database filename and the worktree's absolute recorded directory before removing the worktree. After the caller's usage operation and directory removal, invoke the installed OpenCode binary from a surviving directory during the home's coordinated offline window:
 
 ```sh
+SESSION_ID="ses_example" # copy from the reviewed inventory
 opencode db retire --database "/absolute/home/data/opencode/opencode.db" \
   --directory "/absolute/removed-worktree"
 
 opencode db retire --database "/absolute/home/data/opencode/opencode.db" \
-  --directory "/absolute/removed-worktree" --apply
+  --directory "/absolute/removed-worktree" --session "$SESSION_ID" --apply \
+  --usage-capture-status confirmed --usage-capture-session "$SESSION_ID"
 ```
 
 The first invocation is inventory; only the second requests deletion. Do not execute from the deleted worktree, and do not ask a running HTTP server to perform this offline operation. Firstmate's integration point is after its recorded-server stop, usage finalization and successful worktree removal in `bin/fm-teardown.sh`. Its owner must coordinate the remaining database users before invoking this interface. This OpenCode change does not edit Firstmate's teardown implementation.

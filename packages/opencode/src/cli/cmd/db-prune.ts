@@ -13,6 +13,7 @@ type SqliteAccess = import("bun:sqlite").Database
 
 type MeasurementStatus = "measured" | "partial" | "unavailable" | "failed"
 type LedgerStatus = "available" | "unavailable" | "failed"
+type UsageCaptureStatus = "confirmed" | "partial" | "unavailable" | "failed" | "unknown"
 
 type PruneArgs = {
   before?: string
@@ -31,6 +32,8 @@ type PruneArgs = {
   firstmateRanIt?: boolean
   measurementStatus?: MeasurementStatus
   usageLedgerStatus?: LedgerStatus
+  usageCaptureStatus?: string
+  usageCaptureSession?: string[]
 }
 
 const onlineBounds = {
@@ -264,19 +267,29 @@ const pruneOptions = (yargs: Argv) =>
     .option("firstmate-ran-it", {
       type: "boolean",
       default: false,
-      describe: "report Firstmate's actual-run confirmation; this does not gate pruning",
+      describe: "report Firstmate's actual-run confirmation; this does not confirm durable usage capture",
     })
     .option("measurement-status", {
       type: "string",
       choices: ["measured", "partial", "unavailable", "failed"],
       default: "unavailable",
-      describe: "report the best-effort Firstmate measurement state without requiring completeness",
+      describe: "report Firstmate's measurement state; this does not confirm durable usage capture",
     })
     .option("usage-ledger-status", {
       type: "string",
       choices: ["available", "unavailable", "failed"],
       default: "unavailable",
-      describe: "report Firstmate's durable usage-ledger state without using it as a deletion gate",
+      describe: "report usage-ledger availability; this does not confirm durable usage capture",
+    })
+    .option("usage-capture-status", {
+      type: "string",
+      default: "unknown",
+      describe: "caller confirmation state for durable usage capture; only confirmed permits Session deletion",
+    })
+    .option("usage-capture-session", {
+      type: "array",
+      string: true,
+      describe: "Session ID durably captured by the caller; repeat for every Session in the deletion scope",
     })
 
 export const PruneCommand = cmd<{}, PruneArgs>({
@@ -453,7 +466,7 @@ export const PruneCommand = cmd<{}, PruneArgs>({
         return
       }
 
-      const result = await applyPrune(db, resolved.filename, cutoff, requested, inventory, args.directory)
+      const result = await applyPrune(db, resolved.filename, cutoff, requested, inventory, args, args.directory)
       console.log(JSON.stringify({ ...result, usageMeasurement: usage }, null, 2))
       if (result.action !== "applied" && result.action !== "noop") process.exitCode = 1
     } catch (error) {
@@ -1179,6 +1192,19 @@ async function applyOnlinePrune(
         ...preparedInventory,
         action: "refused",
         refusalReasons: ["no-eligible-sessions", ...preparedInventory.excludedSessions.flatMap((item) => item.reasons)],
+      }
+    }
+    const captureReasons = usageCaptureReasons(args, preparedInventory.deletionScope.sessionIDs)
+    if (captureReasons.length > 0) {
+      return {
+        ...preparedInventory,
+        action: "refused",
+        refusalReasons: captureReasons,
+        reclamation: {
+          ...preparedInventory.reclamation,
+          ready: false,
+          reasons: [...preparedInventory.reclamation.reasons, ...captureReasons],
+        },
       }
     }
     // Proof preparation and inventory are read-only now; close this connection before acquiring the writer lock.
@@ -3625,6 +3651,7 @@ async function applyPrune(
   cutoff: number | undefined,
   requested: readonly string[] | undefined,
   inventory: Awaited<ReturnType<typeof inventorySnapshot>>,
+  args: PruneArgs,
   directory?: string,
 ) {
   if (directory !== undefined) {
@@ -3662,6 +3689,9 @@ async function applyPrune(
       changedRows: 0,
     }
   }
+  const captureReasons = usageCaptureReasons(args, inventory.deletionScope.sessionIDs)
+  if (captureReasons.length > 0)
+    return { ...inventory, action: "refused", refusalReasons: captureReasons, changedRows: 0 }
 
   let changedRows = 0
   const deletedByTable: Record<string, number> = {}
@@ -4307,8 +4337,26 @@ function measurementReport(args: PruneArgs) {
     firstmateRun: args.firstmateRanIt ? "confirmed" : "not-confirmed",
     measurementStatus: args.measurementStatus ?? "unavailable",
     durableLedgerStatus: args.usageLedgerStatus ?? "unavailable",
-    source: "reported by the caller; measurement and ledger state do not gate pruning",
+    source: "reported by the caller; run, measurement, and ledger fields do not confirm durable usage capture",
   }
+}
+
+function usageCaptureReasons(args: PruneArgs, sessionIDs: readonly string[]) {
+  const status: UsageCaptureStatus =
+    args.usageCaptureStatus === "confirmed" ||
+    args.usageCaptureStatus === "partial" ||
+    args.usageCaptureStatus === "unavailable" ||
+    args.usageCaptureStatus === "failed"
+      ? args.usageCaptureStatus
+      : "unknown"
+  if (status !== "confirmed") return [`usage-capture-status-${status}`]
+  const captured = args.usageCaptureSession === undefined ? [] : normalizeSessionIDs(args.usageCaptureSession)
+  if (captured === null) return ["usage-capture-scope-invalid"]
+  // A positive status is useful only when its caller-confirmed IDs cover the computed deletion scope.
+  const capturedSet = new Set(captured)
+  const incomplete = sessionIDs.filter((sessionID) => !capturedSet.has(sessionID))
+  if (incomplete.length > 0) return [`usage-capture-scope-incomplete:${incomplete.join(",")}`]
+  return []
 }
 
 function parseCutoff(input: string | undefined) {
