@@ -924,6 +924,59 @@ describe("cross-spawn spawner", () => {
       20_000,
     )
 
+    fx.live(
+      "scope release ignores a failed signal to an exited leader with a pending close",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+
+        const file = path.join(process.cwd(), `.cross-spawn-close-probe-${process.pid}.json`)
+        const detachedGroup: RecordedProcessGroup = { pgid: undefined, members: [] }
+        yield* Effect.addFinalizer(() => cleanupRecordedProcessGroup(detachedGroup))
+        yield* Effect.addFinalizer(() => Effect.promise(() => fs.rm(file, { force: true })).pipe(Effect.asVoid))
+
+        const childSource = 'process.on("SIGTERM", () => {}); setInterval(() => {}, 10_000)'
+        const parentSource = [
+          `const child = require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(childSource)}], { detached: true, stdio: "inherit" })`,
+          "child.unref()",
+          `require("node:fs").writeFileSync(${JSON.stringify(file)}, String(child.pid))`,
+          "setTimeout(() => process.exit(0), 500)",
+        ].join(";\n")
+        const exit = yield* Effect.exit(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const handle = yield* js(parentSource, { forceKillAfter: "3 seconds" })
+              const leader = processIdentity(Number(handle.pid))
+              if (!leader?.bootID || !leader.startTicks) throw new Error("spawned leader has no recorded start identity")
+              const childPID = yield* Effect.promise(async () => {
+                const deadline = Date.now() + 5_000
+                while (Date.now() < deadline) {
+                  if (await Bun.file(file).exists()) return Number(await Bun.file(file).text())
+                  await new Promise((resolve) => setTimeout(resolve, 20))
+                }
+                throw new Error("detached descendant did not publish its PID")
+              })
+              detachedGroup.pgid = childPID
+              const detached = processIdentity(childPID)
+              if (!detached?.bootID || !detached.startTicks)
+                throw new Error("detached descendant has no recorded start identity")
+              detachedGroup.members.push(detached)
+              recordProcess(childPID, detached)
+              expect({ leader: sameProcess(leader), detached: sameProcess(detached) }).toEqual({
+                leader: true,
+                detached: true,
+              })
+              expect(yield* Effect.promise(() => processExited(leader))).toBe(true)
+              expect(yield* handle.isRunning).toBe(true)
+            }),
+          ),
+        )
+
+        expect(Exit.isSuccess(exit)).toBe(true)
+        expect(detachedGroup.members.every(sameProcess)).toBe(true)
+      }),
+      15_000,
+    )
+
     fx.effect(
       "isRunning reflects process state",
       Effect.gen(function* () {

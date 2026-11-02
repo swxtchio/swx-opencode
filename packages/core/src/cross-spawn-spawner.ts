@@ -489,6 +489,7 @@ export const make = Effect.gen(function* () {
               }
               const send = (s: NodeJS.Signals) =>
                 Effect.catch(killGroup(command, proc, s), () => killOne(command, proc, s))
+              const sendIgnoringErrors = (s: NodeJS.Signals) => Effect.catch(send(s), () => Effect.void)
               const sig = cleanupRequest.value?.killSignal ?? command.options.killSignal ?? "SIGTERM"
               const forceKillAfter = cleanupRequest.value?.forceKillAfter ?? command.options.forceKillAfter
               // "close" waits for every pipe to end, and a pipe nobody reads cannot be relied on
@@ -498,10 +499,14 @@ export const make = Effect.gen(function* () {
               // child's own exit instead of to a reader that is gone.
               const detach = Effect.sync(() => proc.stdio.forEach((stream) => stream?.destroy()))
               if (Predicate.isUndefined(forceKillAfter)) {
-                const leader = send(sig).pipe(Effect.andThen(detach), Effect.andThen(Deferred.await(signal)), Effect.asVoid)
+                const leader = sendIgnoringErrors(sig).pipe(
+                  Effect.andThen(detach),
+                  Effect.andThen(Deferred.await(signal)),
+                  Effect.asVoid,
+                )
                 return yield* Effect.ignore(leader)
               }
-              const attempt = send(sig).pipe(
+              const attempt = sendIgnoringErrors(sig).pipe(
                 Effect.andThen(detach),
                 Effect.andThen(waitForGroup(proc.pid!)),
                 Effect.andThen(Deferred.await(signal)),
@@ -510,13 +515,13 @@ export const make = Effect.gen(function* () {
               const escalated = Effect.timeoutOrElse(attempt, {
                 duration: forceKillAfter,
                 orElse: () =>
-                  send("SIGKILL").pipe(
+                  sendIgnoringErrors("SIGKILL").pipe(
                     Effect.andThen(waitForGroupAfterKill(command, proc)),
                     Effect.andThen(Deferred.await(signal)),
                     Effect.asVoid,
                   ),
               })
-              return yield* escalated.pipe(Effect.orDie)
+              return yield* escalated
             }),
           )
 
