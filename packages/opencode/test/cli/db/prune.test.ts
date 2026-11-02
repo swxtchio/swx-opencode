@@ -29,7 +29,10 @@ import { MessageID, SessionID } from "@/session/schema"
 
 const packageRoot = path.resolve(import.meta.dir, "../../..")
 const worktreeRoot = path.resolve(packageRoot, "../..")
-const scratchRoot = path.join(worktreeRoot, ".scratch", "opencode-commanded-prune-tests")
+const scratchRoot = path.join(
+  process.env.GOTMPDIR ?? path.join(worktreeRoot, ".scratch"),
+  "opencode-commanded-prune-tests",
+)
 const producer = path.join(packageRoot, "test/fixture/prune-producer.ts")
 const entrypoint = path.join(packageRoot, "src/index.ts")
 const producedTemplates = new Map<string, Promise<Template>>()
@@ -746,7 +749,7 @@ test("CLI apply deletes only the selected whole old Session and reclaims allocat
     firstmateRun: "confirmed",
     measurementStatus: "partial",
     durableLedgerStatus: "available",
-    source: expect.stringContaining("do not gate pruning"),
+    source: expect.stringContaining("do not confirm durable usage capture"),
   })
   expect(report.reclamation.allocatedBytesBefore?.totalBytes).toBeGreaterThan(
     report.reclamation.allocatedBytesAfter?.totalBytes ?? Number.POSITIVE_INFINITY,
@@ -856,6 +859,19 @@ test("online prune bounds one large Session, retries partial progress, and never
   expect(ownedCounts(store.filename, selectedID)).not.toEqual(beforeSelected)
   expect(ownedCounts(store.filename, unselectedID)).toEqual(beforeUnselected)
 
+  const beforeUnconfirmedRetry = ownedCounts(store.filename, selectedID)
+  const unconfirmedRetry = parseReport(
+    await runRawCLI(
+      store,
+      ["--online", "--before", cutoff, "--session", selectedID, "--apply", "--reserve-bytes", "1"],
+      1,
+    ),
+  )
+  expect(unconfirmedRetry.action).toBe("refused")
+  expect(unconfirmedRetry.changedRows).toBe(0)
+  expect(unconfirmedRetry.refusalReasons).toContain("usage-capture-status-unknown")
+  expect(ownedCounts(store.filename, selectedID)).toEqual(beforeUnconfirmedRetry)
+
   const transientReclamationReasons = new Set(["wal-checkpoint-incomplete"])
   const beforeReclaimOnly = ownedCounts(store.filename, selectedID)
   const reclaimedOnly = (
@@ -913,7 +929,7 @@ test("online prune bounds one large Session, retries partial progress, and never
   expect(missingRetry.changedRows).toBe(0)
   expect(missingRetry.deletedSessionIDs).toEqual([])
   expect(missingRetry.refusalReasons).toContain("session-not-found")
-})
+}, 120_000)
 
 test.serial(
   "online prune deletes an event history beyond the former validation cap in keyset batches",
@@ -3436,30 +3452,35 @@ test("a post-commit checkpoint failure reports committed deletions", async () =>
   }
 })
 
-test("a confirmed Firstmate run with unavailable coverage does not gate apply or invent zero usage", async () => {
+test("run, measurement, and ledger reports do not confirm durable usage capture", async () => {
   await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
   const old = produce(store, { create: { payloadBytes: 512 * 1024 } })
   const cutoffAt = Date.now() - 5
   backdateSession(store.filename, old.created[0]!.id, cutoffAt - 1_000)
   const cutoff = new Date(cutoffAt).toISOString()
   const sessionID = old.created[0]!.id
-  const result = await invokeHandler(store, {
+  const before = ownedCounts(store.filename, sessionID)
+  const result = await invokeRawHandler(store, {
     before: cutoff,
     session: [sessionID],
     apply: true,
     firstmateRanIt: true,
-    measurementStatus: "unavailable",
-    usageLedgerStatus: "unavailable",
+    measurementStatus: "measured",
+    usageLedgerStatus: "available",
+    usageCaptureSession: [sessionID],
   })
-  expect(result.report.action).toBe("applied")
+  expect(result.report.action).toBe("refused")
+  expect(result.exitCode).toBe(1)
+  expect(result.report.changedRows).toBe(0)
+  expect(result.report.refusalReasons).toContain("usage-capture-status-unknown")
   expect(result.report.usageMeasurement).toEqual({
     firstmateRun: "confirmed",
-    measurementStatus: "unavailable",
-    durableLedgerStatus: "unavailable",
-    source: "reported by the caller; measurement and ledger state do not gate pruning",
+    measurementStatus: "measured",
+    durableLedgerStatus: "available",
+    source: "reported by the caller; run, measurement, and ledger fields do not confirm durable usage capture",
   })
-  const failedMeasurement = await invokeHandler(store, {
-    before: cutoff,
+  expect(ownedCounts(store.filename, sessionID)).toEqual(before)
+  const failedMeasurement = await invokeRawHandler(store, {
     firstmateRanIt: true,
     measurementStatus: "failed",
     usageLedgerStatus: "failed",
@@ -3468,8 +3489,206 @@ test("a confirmed Firstmate run with unavailable coverage does not gate apply or
     firstmateRun: "confirmed",
     measurementStatus: "failed",
     durableLedgerStatus: "failed",
-    source: "reported by the caller; measurement and ledger state do not gate pruning",
+    source: "reported by the caller; run, measurement, and ledger fields do not confirm durable usage capture",
   })
+})
+
+const captureRefusalCases = [
+  { name: "absent", status: undefined, reason: "unknown" },
+  { name: "unavailable", status: "unavailable", reason: "unavailable" },
+  { name: "failed", status: "failed", reason: "failed" },
+  { name: "partial", status: "partial", reason: "partial" },
+  { name: "unknown", status: "unknown", reason: "unknown" },
+  { name: "unrecognized", status: "captured", reason: "unknown" },
+] as const
+
+for (const mode of ["offline", "online"] as const) {
+  for (const captureCase of captureRefusalCases) {
+    test(`${mode} apply preserves every Session history row when capture is ${captureCase.name}`, async () => {
+      await using store = await producedStore([{}, {}])
+      const selectedID = store.metadata[0]!.created[0]!.id
+      const unrelatedID = store.metadata[1]!.created[0]!.id
+      const cutoffAt = Date.now() - 5
+      backdateSession(store.filename, selectedID, cutoffAt - 1_000)
+      const cutoff = new Date(cutoffAt).toISOString()
+      const selectedBefore = ownedCounts(store.filename, selectedID)
+      const unrelatedBefore = ownedCounts(store.filename, unrelatedID)
+      const modeArgs = mode === "online" ? ["--online", "--before", cutoff, "--reserve-bytes", "1"] : []
+      const statusArgs =
+        captureCase.status === undefined ? [] : ["--usage-capture-status", captureCase.status]
+      const result = await runRawCLI(
+        store,
+        [
+          ...modeArgs,
+          "--session",
+          selectedID,
+          "--apply",
+          ...statusArgs,
+          "--usage-capture-session",
+          selectedID,
+        ],
+        1,
+      )
+      const report = parseReport(result)
+      expect(report.action).toBe("refused")
+      expect(report.changedRows).toBe(0)
+      expect(report.refusalReasons).toContain(`usage-capture-status-${captureCase.reason}`)
+      expect(ownedCounts(store.filename, selectedID)).toEqual(selectedBefore)
+      expect(ownedCounts(store.filename, unrelatedID)).toEqual(unrelatedBefore)
+    })
+  }
+
+  test(`${mode} apply refuses confirmed capture that covers only part of a multi-Session scope`, async () => {
+    await using store = await producedStore([{}, {}, {}])
+    const selectedIDs = store.metadata
+      .slice(0, 2)
+      .map((item) => item.created[0]!.id)
+      .toSorted()
+    const unrelatedID = store.metadata[2]!.created[0]!.id
+    const cutoffAt = Date.now() - 5
+    selectedIDs.forEach((sessionID) => backdateSession(store.filename, sessionID, cutoffAt - 1_000))
+    const cutoff = new Date(cutoffAt).toISOString()
+    const before = new Map(
+      [...selectedIDs, unrelatedID].map((sessionID) => [sessionID, ownedCounts(store.filename, sessionID)]),
+    )
+    const modeArgs = mode === "online" ? ["--online", "--before", cutoff, "--reserve-bytes", "1"] : []
+    const result = await runRawCLI(
+      store,
+      [
+        ...modeArgs,
+        ...selectedIDs.flatMap((sessionID) => ["--session", sessionID]),
+        "--apply",
+        "--usage-capture-status",
+        "confirmed",
+        "--usage-capture-session",
+        selectedIDs[0]!,
+      ],
+      1,
+    )
+    const report = parseReport(result)
+    expect(report.action).toBe("refused")
+    expect(report.changedRows).toBe(0)
+    expect(report.refusalReasons).toContain(`usage-capture-scope-incomplete:${selectedIDs[1]}`)
+    selectedIDs
+      .concat(unrelatedID)
+      .forEach((sessionID) => expect(ownedCounts(store.filename, sessionID)).toEqual(before.get(sessionID)!))
+  })
+
+  test(`${mode} apply deletes a fully confirmed capture scope and preserves unrelated history`, async () => {
+    await using store = await producedStore([{}, {}, {}])
+    const selectedIDs = store.metadata
+      .slice(0, 2)
+      .map((item) => item.created[0]!.id)
+      .toSorted()
+    const unrelatedID = store.metadata[2]!.created[0]!.id
+    const cutoffAt = Date.now() - 5
+    selectedIDs.forEach((sessionID) => backdateSession(store.filename, sessionID, cutoffAt - 1_000))
+    const cutoff = new Date(cutoffAt).toISOString()
+    const unrelatedBefore = ownedCounts(store.filename, unrelatedID)
+    const modeArgs = mode === "online" ? ["--online", "--before", cutoff, "--reserve-bytes", "1"] : []
+    const result = await runRawCLI(
+      store,
+      [
+        ...modeArgs,
+        ...selectedIDs.flatMap((sessionID) => ["--session", sessionID]),
+        "--apply",
+        "--usage-capture-status",
+        "confirmed",
+        ...selectedIDs.flatMap((sessionID) => ["--usage-capture-session", sessionID]),
+      ],
+      "either",
+    )
+    const report = parseReport(result)
+    expect(report.action === "applied" || report.action === "failed").toBe(true)
+    expect(report.deletedSessionIDs).toEqual(selectedIDs)
+    selectedIDs.forEach((sessionID) =>
+      expect(Object.values(ownedCounts(store.filename, sessionID)).every((count) => count === 0)).toBe(true),
+    )
+    expect(ownedCounts(store.filename, unrelatedID)).toEqual(unrelatedBefore)
+  })
+}
+
+test("offline apply refuses an invalid captured Session ID without changing rows", async () => {
+  await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
+  const sessionID = store.metadata[0]!.created[0]!.id
+  const before = ownedCounts(store.filename, sessionID)
+  const result = parseReport(
+    await runRawCLI(
+      store,
+      [
+        "--session",
+        sessionID,
+        "--apply",
+        "--usage-capture-status",
+        "confirmed",
+        "--usage-capture-session",
+        " ",
+      ],
+      1,
+    ),
+  )
+  expect(result.action).toBe("refused")
+  expect(result.changedRows).toBe(0)
+  expect(result.refusalReasons).toContain("usage-capture-scope-invalid")
+  expect(ownedCounts(store.filename, sessionID)).toEqual(before)
+})
+
+test("db retire requires complete caller capture confirmation and leaves inventory ungated", async () => {
+  await using store = await createStore()
+  const created = await produceLive(store, { create: {} })
+  const sessionID = created.created[0]!.id
+  const before = ownedCounts(store.filename, sessionID)
+  await rm(store.project, { recursive: true })
+  const inventory = parseReport(await runRawCLI(store, ["--directory", store.project], 0, { command: "retire" }))
+  expect(inventory.action).toBe("inventory")
+  expect(ownedCounts(store.filename, sessionID)).toEqual(before)
+
+  const refused = parseReport(
+    await runRawCLI(store, ["--directory", store.project, "--apply"], 1, { command: "retire" }),
+  )
+  expect(refused.action).toBe("refused")
+  expect(refused.changedRows).toBe(0)
+  expect(refused.refusalReasons).toContain("usage-capture-status-unknown")
+  expect(ownedCounts(store.filename, sessionID)).toEqual(before)
+
+  const applied = parseReport(
+    await runRawCLI(
+      store,
+      [
+        "--directory",
+        store.project,
+        "--apply",
+        "--usage-capture-status",
+        "confirmed",
+        "--usage-capture-session",
+        sessionID,
+      ],
+      0,
+      { command: "retire" },
+    ),
+  )
+  expect(applied.action).toBe("applied")
+  expect(applied.deletedSessionIDs).toEqual([sessionID])
+  expect(Object.values(ownedCounts(store.filename, sessionID)).every((count) => count === 0)).toBe(true)
+})
+
+test("online reclaim-only remains available without capture confirmation and deletes no Session history", async () => {
+  await using store = await producedStore([{ payloadBytes: 512 * 1024 }])
+  const sessionID = store.metadata[0]!.created[0]!.id
+  const before = ownedCounts(store.filename, sessionID)
+  const result = parseReport(
+    await runRawCLI(store, ["--online", "--apply", "--reclaim-only", "--reserve-bytes", "1"], "either"),
+  )
+  const transientReclamationReasons = new Set(["wal-checkpoint-incomplete"])
+  const transientFailure =
+    result.action === "failed" &&
+    result.refusalReasons?.length === 1 &&
+    transientReclamationReasons.has(result.refusalReasons[0] ?? "")
+  expect(result.action === "applied" || transientFailure).toBe(true)
+  expect(result.changedRows).toBe(0)
+  expect(result.deletedSessionIDs).toEqual([])
+  expect(result.rawTranscriptWarning).toContain("does not delete Session history")
+  expect(ownedCounts(store.filename, sessionID)).toEqual(before)
 })
 
 test("recent activity on an old-created Session protects it while an equally old control is deleted", async () => {
@@ -4876,10 +5095,39 @@ async function produceLive(store: Store, operation: Record<string, unknown>, tim
     },
   )
   assertChildOutcome(result, 0)
-  return parseRequiredJSON<ProducerResult>(result, "prune producer", result.stdout.trim().split("\n").at(-1) ?? "")
+  const produced = parseRequiredJSON<ProducerResult>(
+    result,
+    "prune producer",
+    result.stdout.trim().split("\n").at(-1) ?? "",
+  )
+  if (produced.created.length > 0) {
+    // Spread Store views share this array, so the trusted CLI wrappers see every live-produced Session ID.
+    store.metadata.push(produced)
+  }
+  return produced
 }
 
+// These wrappers model existing preservation tests' trusted caller; capture-gate regressions use the raw helpers.
 async function runCLI(
+  store: Store,
+  args: string[],
+  expectedStatus: number | "nonzero" | "either" = 0,
+  options: { entrypoint?: string; timeout?: number; command?: string; databaseDefault?: string } = {},
+) {
+  const captureArgs =
+    args.includes("--apply") && !args.includes("--reclaim-only")
+      ? [
+          "--usage-capture-status",
+          "confirmed",
+          ...Array.from(new Set(store.metadata.flatMap((item) => item.created.map((session) => session.id)))).flatMap(
+            (sessionID) => ["--usage-capture-session", sessionID],
+          ),
+        ]
+      : []
+  return runRawCLI(store, [...args, ...captureArgs], expectedStatus, options)
+}
+
+async function runRawCLI(
   store: Store,
   args: string[],
   expectedStatus: number | "nonzero" | "either" = 0,
@@ -5189,6 +5437,39 @@ async function invokeHandler(
     firstmateRanIt?: boolean
     measurementStatus?: "measured" | "partial" | "unavailable" | "failed"
     usageLedgerStatus?: "available" | "unavailable" | "failed"
+    usageCaptureStatus?: string
+    usageCaptureSession?: string[]
+  },
+) {
+  if (!args.apply || args.reclaimOnly) return invokeRawHandler(store, args)
+  return invokeRawHandler(store, {
+    usageCaptureStatus: "confirmed",
+    usageCaptureSession: [...new Set(store.metadata.flatMap((item) => item.created.map((session) => session.id)))],
+    ...args,
+  })
+}
+
+async function invokeRawHandler(
+  store: Store,
+  args: {
+    database?: string
+    before?: string
+    directory?: string
+    session?: string[]
+    apply?: boolean
+    online?: boolean
+    reclaimOnly?: boolean
+    reserveBytes?: number
+    batchRows?: number
+    batchBytes?: number
+    maxBatches?: number
+    vacuumPages?: number
+    maxVacuumPages?: number
+    firstmateRanIt?: boolean
+    measurementStatus?: "measured" | "partial" | "unavailable" | "failed"
+    usageLedgerStatus?: "available" | "unavailable" | "failed"
+    usageCaptureStatus?: string
+    usageCaptureSession?: string[]
   },
 ) {
   const previousDatabase = Flag.OPENCODE_DB
