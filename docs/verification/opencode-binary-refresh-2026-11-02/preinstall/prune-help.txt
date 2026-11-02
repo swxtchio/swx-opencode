@@ -1,0 +1,23 @@
+opencode db prune
+
+inventory old local Sessions; --apply deletes whole Sessions and reclaims allocated database bytes
+
+Options:
+  -h, --help                 show help                                                     [boolean]
+  -v, --version              show version number                                           [boolean]
+      --print-logs           print logs to stderr                                          [boolean]
+      --log-level            log level          [string] [choices: "DEBUG", "INFO", "WARN", "ERROR"]
+      --pure                 run without external plugins                                  [boolean]
+      --before               explicit UTC or offset timestamp cutoff; only older, inactive Sessions
+                             are considered                                      [string] [required]
+      --session              limit inventory and apply to these Session IDs; may be repeated [array]
+      --apply                delete the selected whole Sessions and reclaim allocated database bytes
+                                                                          [boolean] [default: false]
+      --firstmate-ran-it     report Firstmate's actual-run confirmation; this does not gate pruning
+                                                                          [boolean] [default: false]
+      --measurement-status   report the best-effort Firstmate measurement state without requiring
+                             completeness
+         [string] [choices: "measured", "partial", "unavailable", "failed"] [default: "unavailable"]
+      --usage-ledger-status  report Firstmate's durable usage-ledger state without using it as a
+                             deletion gate
+                   [string] [choices: "available", "unavailable", "failed"] [default: "unavailable"]

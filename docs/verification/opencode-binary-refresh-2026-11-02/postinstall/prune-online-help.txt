@@ -1,0 +1,44 @@
+opencode db prune
+
+inventory missing-directory local Sessions; --apply deletes them offline unless --online is selected
+
+Options:
+  -h, --help                 show help                                                     [boolean]
+  -v, --version              show version number                                           [boolean]
+      --print-logs           print logs to stderr                                          [boolean]
+      --log-level            log level          [string] [choices: "DEBUG", "INFO", "WARN", "ERROR"]
+      --pure                 run without external plugins                                  [boolean]
+      --before               optional UTC or offset cutoff narrowing missing-directory Sessions by
+                             activity                                                       [string]
+      --database             target database file; online mode requires this or OPENCODE_DB; never
+                             creates a database                                             [string]
+      --directory            limit offline retirement to this absolute recorded directory, after it
+                             has been removed                                               [string]
+      --session              limit inventory and apply to these Session IDs; repeat for each (online
+                             maximum: 256)                                                   [array]
+      --apply                delete the selected whole Sessions and reclaim allocated database bytes
+                                                                          [boolean] [default: false]
+      --firstmate-ran-it     report Firstmate's actual-run confirmation; this does not gate pruning
+                                                                          [boolean] [default: false]
+      --measurement-status   report the best-effort Firstmate measurement state without requiring
+                             completeness
+         [string] [choices: "measured", "partial", "unavailable", "failed"] [default: "unavailable"]
+      --usage-ledger-status  report Firstmate's durable usage-ledger state without using it as a
+                             deletion gate
+                   [string] [choices: "available", "unavailable", "failed"] [default: "unavailable"]
+      --online               use indexed WAL-safe Session deletion and incremental reclamation
+                                                                          [boolean] [default: false]
+      --reclaim-only         continue online incremental reclamation without Sessions; requires
+                             --online --apply and no --session            [boolean] [default: false]
+      --reserve-bytes        minimum free bytes to preserve before every online mutation; positive
+                             and required with --apply                                      [number]
+      --batch-rows           maximum owned rows changed by one online delete transaction (1–256)
+                                                                             [number] [default: 256]
+      --batch-bytes          maximum encoded TEXT/BLOB bytes changed by one transaction
+                             (1–67,108,864)                             [number] [default: 16777216]
+      --max-batches          maximum online delete transactions in one invocation (1–256)
+                                                                             [number] [default: 256]
+      --vacuum-pages         maximum pages in one incremental-vacuum step (1–128)
+                                                                             [number] [default: 128]
+      --max-vacuum-pages     maximum incremental-vacuum pages in one invocation (1–1,048,576)
+                                                                         [number] [default: 1048576]

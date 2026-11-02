@@ -1,0 +1,1 @@
+scratch_removed=yes path=/tmp/fm-opencode-binary-refresh-pr383-765d66be6b

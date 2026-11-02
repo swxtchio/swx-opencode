@@ -1,0 +1,21 @@
+Evidence timestamp UTC: 2026-11-02T14:41:25Z
+Repository: swxtchio/swx-opencode
+Default branch (gh-axi repo view): swxtch
+Live swxtch head (gh-axi branch API): 765d66be6b21e66cb79cbe025c521bdda22ee097
+Install host: vm001
+Install host architecture: aarch64
+Install user: byates
+Build host: vm14-001
+Build host architecture: aarch64
+Build user: byates
+Build host Bun: 1.4.2
+Build host Node: v22.23.4
+
+Included source commits:
+4e34ff6f1bacde154debbbe9b1264eab81f34e25 feat(opencode): reclaim dead-worktree session storage (#343)
+e3f113fe269a113a46d9218e80014bc1da564e80 fix(core): reap shell process groups on cancellation (#380)
+765d66be6b21e66cb79cbe025c521bdda22ee097 feat(opencode): online Session reclamation (#369)
+
+Build source identity rules inspected: local-release.sh derives `release` from packages/opencode/package.json and git rev-parse --short=8 HEAD; build.ts --single filters targets to process.platform/process.arch; packages/opencode/src/cli/cmd/db-prune.ts declares optional --before and --online.
+
+The pre-install process snapshot matched 21 processes by the installed executable path; the post-install comparison is recorded in [process-continuity.txt](process-continuity.txt).
