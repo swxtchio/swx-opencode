@@ -1,0 +1,25 @@
+# Installation evidence
+
+Evidence collected on `vm001` on 2026-11-02 UTC. The selected target was the `local-release.sh` default because `OPENCODE_LOCAL_BIN` was unset.
+
+```text
+started_utc=2026-11-02T14:48:02Z
+pre_install_version=1.18.32-swxtch.394afd08
+pre_install_db_path=/home/byates/fm-llmrouter/data/opencode/opencode.db
+pre_install_binary_sha256=53f682f3891776a1ea5b9b126470fa374cac23656691afb89d0aeadbcdf30065
+candidate_version=1.18.32-swxtch.765d66be
+candidate_db_path=/home/byates/fm-llmrouter/data/opencode/opencode.db
+candidate_binary_sha256=f2ee621cfe0b752c3cd18c4c8e9e0c80b3359d9ded26ffdcaf43da797d420748
+companion_sha256=0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42
+backup_path=/home/byates/.local/opencode-swxtch/bin/opencode.1.18.32-swxtch.394afd08
+backup_sha256=53f682f3891776a1ea5b9b126470fa374cac23656691afb89d0aeadbcdf30065
+backup_version=1.18.32-swxtch.394afd08
+backup_db_path=/home/byates/fm-llmrouter/data/opencode/opencode.db
+atomic_replace=completed via same-directory rename at /home/byates/.local/opencode-swxtch/bin/opencode
+installed_version=1.18.32-swxtch.765d66be
+installed_db_path=/home/byates/fm-llmrouter/data/opencode/opencode.db
+installed_binary_sha256=f2ee621cfe0b752c3cd18c4c8e9e0c80b3359d9ded26ffdcaf43da797d420748
+finished_utc=2026-11-02T14:48:09Z
+```
+
+The backup executable was run after installation and still reported the previous version and database path. The complete `--version`, prune-help, database-path, and `file -L` output/status files are in [preinstall](preinstall/) and [postinstall](postinstall/).

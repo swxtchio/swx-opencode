@@ -1,0 +1,14 @@
+# Artifact transport evidence
+
+Evidence captured on 2026-11-02 UTC while transferring from `vm14-001` to `vm001`. The remote stage and local candidate were both under task-authorized scratch or install roots; the remote scratch and local candidate directory have since been removed.
+
+Remote `sha256sum` output from `/tmp/fm-opencode-binary-refresh-pr383-765d66be6b/stage`:
+
+```text
+f2ee621cfe0b752c3cd18c4c8e9e0c80b3359d9ded26ffdcaf43da797d420748  /tmp/fm-opencode-binary-refresh-pr383-765d66be6b/stage/opencode
+0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42  /tmp/fm-opencode-binary-refresh-pr383-765d66be6b/stage/libfff_c-0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42.so
+```
+
+Local candidate SHA-256 values from `/home/byates/.local/opencode-swxtch/bin/.refresh-candidate-pr383-765d66be6b` matched those remote values exactly. The candidate reported `1.18.32-swxtch.765d66be`, selected database `/home/byates/fm-llmrouter/data/opencode/opencode.db`, and mode `755`; `file -L` identified both files as ARM aarch64 ELF artifacts.
+
+After the atomic executable replacement, the installed binary and its adjacent FFF companion had the same SHA-256 values shown above. The companion's filename includes its content hash and matched the already-installed library byte for byte.

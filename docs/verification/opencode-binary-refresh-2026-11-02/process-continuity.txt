@@ -1,0 +1,10 @@
+Evidence collected on 2026-11-02 UTC. The read-only `/proc` scan matched the installed executable path before replacement and the installed path or its `(deleted)` inode after replacement; identity equality uses PID plus `/proc/<pid>/stat` start time.
+
+preinstall_process_count=21
+postinstall_process_count=20
+preinstall_identities_retained=no
+preinstall_identities_retained_count=18
+new_process_identities=2
+missing_identity_count=3
+
+The comparison does not identify why the three missing process identities ended. No process signal or session-management command was issued during this operation.
