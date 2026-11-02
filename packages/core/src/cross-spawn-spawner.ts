@@ -2,6 +2,7 @@ import type * as Arr from "effect/Array"
 import { NodeFileSystem, NodeSink, NodeStream } from "@effect/platform-node"
 import * as NodePath from "@effect/platform-node/NodePath"
 import * as Deferred from "effect/Deferred"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as FileSystem from "effect/FileSystem"
@@ -317,6 +318,120 @@ export const make = Effect.gen(function* () {
     })
   }
 
+  const groupAlive = (pid: number) => {
+    if (globalThis.process.platform === "win32") return false
+    try {
+      globalThis.process.kill(-pid, 0)
+      return true
+    } catch (err) {
+      return !(err instanceof globalThis.Error && "code" in err && err.code === "ESRCH")
+    }
+  }
+
+  // A command leader may close on TERM while a resistant descendant keeps its process group alive.
+  const waitForGroup = Effect.fnUntraced(function* (pid: number, timeout?: Duration.Input) {
+    const deadline = Predicate.isUndefined(timeout) ? undefined : Date.now() + Duration.toMillis(timeout)
+    return yield* Effect.callback<boolean>((resume) => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const check = () => {
+        if (!groupAlive(pid)) return resume(Effect.succeed(true))
+        if (deadline !== undefined && Date.now() >= deadline) return resume(Effect.succeed(false))
+        timer = globalThis.setTimeout(check, 20)
+      }
+      check()
+      return Effect.sync(() => {
+        if (timer) globalThis.clearTimeout(timer)
+      })
+    })
+  })
+
+  const groupMembers = (command: ChildProcess.StandardCommand, pgid: number) =>
+    Effect.callback<ReadonlyArray<number>, PlatformError.PlatformError>((resume) => {
+      const child = NodeChildProcess.execFile(
+        "ps",
+        ["-e", "-o", "pid=,pgid="],
+        { windowsHide: process.platform === "win32" },
+        (err, stdout) => {
+          if (err) return resume(Effect.fail(toPlatformError("kill", toError(err), command)))
+          return resume(
+            Effect.succeed(
+              stdout
+                .split("\n")
+                .flatMap((line) => {
+                  const [pid, group] = line.trim().split(/\s+/).map(Number)
+                  return pid && group === pgid ? [pid] : []
+                }),
+            ),
+          )
+        },
+      )
+      return Effect.sync(() => child.kill())
+    })
+
+  const reportGroupSurvivors = Effect.fnUntraced(function* (
+    command: ChildProcess.StandardCommand,
+    proc: NodeChildProcess.ChildProcess,
+    signal: ExitSignal,
+  ) {
+    const members =
+      process.platform !== "win32" && command.options.detached !== false
+        ? yield* groupMembers(command, proc.pid!).pipe(Effect.catch(() => Effect.succeed([])))
+        : []
+    const done = yield* Deferred.isDone(signal)
+    const survivors = members.includes(proc.pid!) || done ? members : [...members, proc.pid!]
+    return yield* Effect.die(
+      new Error(
+        `SIGKILL did not settle process ${proc.pid}; surviving members: ${survivors.length ? survivors.join(", ") : "unavailable"}`,
+      ),
+    )
+  })
+
+  const waitForCleanupAfterKill = Effect.fnUntraced(function* (
+    command: ChildProcess.StandardCommand,
+    proc: NodeChildProcess.ChildProcess,
+    signal: ExitSignal,
+  ) {
+    if (process.platform !== "win32" && command.options.detached !== false) {
+      if (!(yield* waitForGroup(proc.pid!, Duration.seconds(5))))
+        return yield* reportGroupSurvivors(command, proc, signal)
+    }
+    const closed = yield* Effect.timeoutOrElse(Deferred.await(signal).pipe(Effect.as(true)), {
+      duration: Duration.seconds(5),
+      orElse: () => Effect.succeed(false),
+    })
+    if (!closed) return yield* reportGroupSurvivors(command, proc, signal)
+  })
+
+  const cleanupGroup = (
+    command: ChildProcess.StandardCommand,
+    proc: NodeChildProcess.ChildProcess,
+    exitSignal: ExitSignal,
+    killSignal: NodeJS.Signals,
+    forceKillAfter: Duration.Input,
+    afterSignal = Effect.void,
+  ) => {
+    const send = (next: NodeJS.Signals) => {
+      if (process.platform === "win32") return killGroup(command, proc, next)
+      if (command.options.detached === false) return killOne(command, proc, next)
+      if (!groupAlive(proc.pid!)) return Effect.void
+      return Effect.catch(killGroup(command, proc, next), () => killOne(command, proc, next))
+    }
+    const sendIgnoringErrors = (next: NodeJS.Signals) => Effect.catch(send(next), () => Effect.void)
+    const wait = Effect.gen(function* () {
+      if (process.platform !== "win32" && command.options.detached !== false) yield* waitForGroup(proc.pid!)
+      yield* Deferred.await(exitSignal)
+    }).pipe(Effect.asVoid)
+    const attempt = sendIgnoringErrors(killSignal).pipe(Effect.andThen(afterSignal), Effect.andThen(wait))
+    return Effect.timeoutOrElse(attempt, {
+      duration: forceKillAfter,
+      orElse: () =>
+        sendIgnoringErrors("SIGKILL").pipe(
+          Effect.andThen(waitForCleanupAfterKill(command, proc, exitSignal)),
+          Effect.asVoid,
+        ),
+    })
+  }
+
   const killOne = (
     command: ChildProcess.StandardCommand,
     proc: NodeChildProcess.ChildProcess,
@@ -375,6 +490,9 @@ export const make = Effect.gen(function* () {
           const serr = stdio(command.options, "stderr")
           const extra = fds(command.options)
           const dir = yield* cwd(command.options)
+          const cleanupRequest: {
+            value: { killSignal: NodeJS.Signals; forceKillAfter: Duration.Input } | undefined
+          } = { value: undefined }
 
           const [proc, signal] = yield* Effect.acquireRelease(
             spawn(command, {
@@ -389,32 +507,56 @@ export const make = Effect.gen(function* () {
               const done = yield* Deferred.isDone(signal)
               const kill = timeout(proc, command, command.options)
               if (done) {
-                const [code] = yield* Deferred.await(signal)
+                const [code, exitSignal] = yield* Deferred.await(signal)
                 if (process.platform === "win32") return yield* Effect.void
-                if (code !== 0 && Predicate.isNotNull(code)) return yield* Effect.ignore(kill(killGroup))
+                const requested = cleanupRequest.value
+                if (requested)
+                  return yield* cleanupGroup(command, proc, signal, requested.killSignal, requested.forceKillAfter)
+                if (Predicate.isNull(code) && Predicate.isNotNull(exitSignal)) {
+                  const forceKillAfter = command.options.forceKillAfter
+                  if (Predicate.isUndefined(forceKillAfter))
+                    return yield* Effect.ignore(killGroup(command, proc, command.options.killSignal ?? "SIGTERM"))
+                  return yield* cleanupGroup(
+                    command,
+                    proc,
+                    signal,
+                    command.options.killSignal ?? "SIGTERM",
+                    forceKillAfter,
+                  )
+                }
+                if (code !== 0 && Predicate.isNotNull(code)) {
+                  const forceKillAfter = command.options.forceKillAfter
+                  if (Predicate.isUndefined(forceKillAfter)) return yield* Effect.ignore(kill(killGroup))
+                  return yield* cleanupGroup(
+                    command,
+                    proc,
+                    signal,
+                    command.options.killSignal ?? "SIGTERM",
+                    forceKillAfter,
+                  )
+                }
                 return yield* Effect.void
               }
               const send = (s: NodeJS.Signals) =>
                 Effect.catch(killGroup(command, proc, s), () => killOne(command, proc, s))
-              const sig = command.options.killSignal ?? "SIGTERM"
+              const sendIgnoringErrors = (s: NodeJS.Signals) => Effect.catch(send(s), () => Effect.void)
+              const sig = cleanupRequest.value?.killSignal ?? command.options.killSignal ?? "SIGTERM"
+              const forceKillAfter = cleanupRequest.value?.forceKillAfter ?? command.options.forceKillAfter
               // "close" waits for every pipe to end, and a pipe nobody reads cannot be relied on
               // to end. Once this scope closes nothing will read them, yet a consumer interrupted
               // before its cleanup ran (Stream.merge's sides, when interrupted before they start)
               // can leave its listener attached. Releasing the pipes keeps this wait tied to the
               // child's own exit instead of to a reader that is gone.
               const detach = Effect.sync(() => proc.stdio.forEach((stream) => stream?.destroy()))
-              const attempt = send(sig).pipe(
-                Effect.andThen(detach),
-                Effect.andThen(Deferred.await(signal)),
-                Effect.asVoid,
-              )
-              const escalated = command.options.forceKillAfter
-                ? Effect.timeoutOrElse(attempt, {
-                    duration: command.options.forceKillAfter,
-                    orElse: () => send("SIGKILL").pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid),
-                  })
-                : attempt
-              return yield* Effect.ignore(escalated)
+              if (Predicate.isUndefined(forceKillAfter)) {
+                const leader = sendIgnoringErrors(sig).pipe(
+                  Effect.andThen(detach),
+                  Effect.andThen(Deferred.await(signal)),
+                  Effect.asVoid,
+                )
+                return yield* Effect.ignore(leader)
+              }
+              return yield* cleanupGroup(command, proc, signal, sig, forceKillAfter, detach)
             }),
           )
 
@@ -442,14 +584,14 @@ export const make = Effect.gen(function* () {
             }),
             kill: (opts?: ChildProcess.KillOptions) => {
               const sig = opts?.killSignal ?? "SIGTERM"
-              const send = (s: NodeJS.Signals) =>
-                Effect.catch(killGroup(command, proc, s), () => killOne(command, proc, s))
-              const attempt = send(sig).pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid)
-              if (!opts?.forceKillAfter) return attempt
-              return Effect.timeoutOrElse(attempt, {
-                duration: opts.forceKillAfter,
-                orElse: () => send("SIGKILL").pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid),
-              })
+              const forceKillAfter = opts?.forceKillAfter
+              if (Predicate.isUndefined(forceKillAfter)) {
+                const send = (next: NodeJS.Signals) =>
+                  Effect.catch(killGroup(command, proc, next), () => killOne(command, proc, next))
+                return send(sig).pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid)
+              }
+              cleanupRequest.value = { killSignal: sig, forceKillAfter }
+              return cleanupGroup(command, proc, signal, sig, forceKillAfter)
             },
             unref: Effect.sync(() => {
               if (ref) {

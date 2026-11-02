@@ -90,6 +90,10 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#380** Keep ShellTool cancellation and spawner scope release waiting for the owned process group after TERM, then
+  escalate when the configured grace expires even if the leader already exited (swxtchio/swx-opencode#379). The shell
+  fixtures retain their interrupted-tail and TERM-handler output assertions while checking group lifetime before
+  emergency cleanup. _Upstreamable._
 - **#350** Run each V2 turn only after its Location's background plugin boot has ended (`PluginInternal.ready`).
   The jail's adapter prompts a new session at once, so its first turn raced the boot that fills the catalog,
   agents and tools: it found no model, could not find the named `swxtch-egress` model, or ran on a bundled one,
