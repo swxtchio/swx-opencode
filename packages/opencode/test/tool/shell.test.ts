@@ -15,6 +15,7 @@ import { adjust, layer, make } from "effect/testing/TestClock"
 import type { TestClock } from "effect/testing/TestClock"
 import { ChildProcessSpawner } from "effect/unstable/process"
 import type * as Scope from "effect/Scope"
+import fs from "node:fs/promises"
 import { readFileSync, readdirSync } from "node:fs"
 import os from "os"
 import path from "path"
@@ -111,6 +112,31 @@ Shell.acceptable.reset()
 const quote = (text: string) => `"${text}"`
 const squote = (text: string) => `'${text}'`
 const projectRoot = path.join(__dirname, "../..")
+
+const writeAtomically = (filename: string, contents: string) =>
+  Effect.promise(async () => {
+    const temporary = `${filename}.tmp`
+    await Bun.write(temporary, contents)
+    await fs.rename(temporary, filename)
+  })
+
+const atomicWriteSource = (filename: string, contents: string) =>
+  `(()=>{const fs=require("node:fs");const temporary=${JSON.stringify(filename)}+".tmp";fs.writeFileSync(temporary,${contents});fs.renameSync(temporary,${JSON.stringify(filename)})})()`
+
+const positivePID = (value: number) => Number.isSafeInteger(value) && value > 0
+
+const readPositivePID = async (filename: string, timeout = 5_000) => {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    try {
+      const pid = Number((await Bun.file(filename).text()).trim())
+      if (positivePID(pid)) return pid
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  throw new Error("fixture PID was not atomically published as a positive integer")
+}
+
 const bin = quote(process.execPath.replaceAll("\\", "/"))
 const bash = (() => {
   const shell = Shell.acceptable()
@@ -175,12 +201,11 @@ const stagedOutput = Effect.fn("ShellToolTest.stagedOutput")(function* (director
     "  await ready",
     "}",
   ].join("\n")
-  yield* Effect.promise(() => Bun.write(scriptPath, script))
+  yield* writeAtomically(scriptPath, script)
   return {
     command: `${PS.has(sh()) ? "& " : ""}${bin} ${evalarg(scriptPath)}`,
     stages,
-    release: (index: number) =>
-      Effect.promise(() => Bun.write(path.join(directory, `release-${index}`), "")).pipe(Effect.asVoid),
+    release: (index: number) => writeAtomically(path.join(directory, `release-${index}`), "").pipe(Effect.asVoid),
   } satisfies StagedOutput
 })
 
@@ -305,8 +330,8 @@ const observeShellOutput = (group: ShellProcessGroup) => {
 }
 
 const recordDescendant = Effect.fnUntraced(function* (group: ShellProcessGroup, pidFile: string) {
-  const pid = Number(yield* Effect.promise(() => Bun.file(pidFile).text()))
-  if (!Number.isSafeInteger(pid) || pid <= 0 || !processGroupMembers(group.pgid).includes(pid)) return false
+  const pid = yield* Effect.promise(() => readPositivePID(pidFile))
+  if (!processGroupMembers(group.pgid).includes(pid)) return false
   const identity = startIdentity(pid)
   if (!identity || identity !== startIdentity(pid)) return false
   group.members.set(pid, identity)
@@ -360,7 +385,10 @@ afterEach(async () => {
     remaining = survivors.flatMap((survivor) => processGroupMembers(survivor.group.pgid))
     shellProcessGroups.clear()
   }
-  expect({ survivors: survivors.map((survivor) => ({ pgid: survivor.group.pgid, pids: survivor.pids })), remaining }).toEqual({
+  expect({
+    survivors: survivors.map((survivor) => ({ pgid: survivor.group.pgid, pids: survivor.pids })),
+    remaining,
+  }).toEqual({
     survivors: [],
     remaining: [],
   })
@@ -398,8 +426,10 @@ const tappedShell = Effect.fn("ShellToolTest.tappedShell")(function* (
             ...handle,
             kill: (options) => {
               killCalls.started++
-              const complete = Effect.sync(() => void (killCalls.completed++))
-                .pipe(Effect.andThen(Queue.offer(killCompletions, undefined)), Effect.asVoid)
+              const complete = Effect.sync(() => void killCalls.completed++).pipe(
+                Effect.andThen(Queue.offer(killCompletions, undefined)),
+                Effect.asVoid,
+              )
               return (clock && liveKill ? clock.withLive(handle.kill(options)) : handle.kill(options)).pipe(
                 Effect.ensuring(complete),
               )
@@ -435,7 +465,9 @@ const tappedShell = Effect.fn("ShellToolTest.tappedShell")(function* (
     killCalls,
     killCompletions,
     execute: (params: Tool.InferParameters<typeof ShellTool>, context: Tool.Context) =>
-      clock ? tool.execute(params, context).pipe(Effect.provideService(Clock.Clock, clock)) : tool.execute(params, context),
+      clock
+        ? tool.execute(params, context).pipe(Effect.provideService(Clock.Clock, clock))
+        : tool.execute(params, context),
   }
 })
 
@@ -627,7 +659,7 @@ describe("tool.shell permissions", () => {
           { label: "bash", shell: bash },
           Effect.gen(function* () {
             const outerTmp = yield* tmpdirScoped()
-            yield* Effect.promise(() => Bun.write(path.join(outerTmp, "outside.txt"), "x"))
+            yield* writeAtomically(path.join(outerTmp, "outside.txt"), "x")
             yield* runIn(
               projectRoot,
               Effect.gen(function* () {
@@ -1156,7 +1188,7 @@ describe("tool.shell permissions", () => {
   each("asks for external_directory permission when file arg is outside project", () =>
     Effect.gen(function* () {
       const outerTmp = yield* tmpdirScoped()
-      yield* Effect.promise(() => Bun.write(path.join(outerTmp, "outside.txt"), "x"))
+      yield* writeAtomically(path.join(outerTmp, "outside.txt"), "x")
       const tmp = yield* tmpdirScoped()
       yield* runIn(
         tmp,
@@ -1190,7 +1222,7 @@ describe("tool.shell permissions", () => {
   each("does not ask for external_directory permission when rm inside project", () =>
     Effect.gen(function* () {
       const tmp = yield* tmpdirScoped()
-      yield* Effect.promise(() => Bun.write(path.join(tmp, "tmpfile"), "x"))
+      yield* writeAtomically(path.join(tmp, "tmpfile"), "x")
       yield* runIn(
         tmp,
         Effect.gen(function* () {
@@ -1504,9 +1536,7 @@ const sigtermResistant = Effect.fn("ShellToolTest.sigtermResistant")(function* (
             ...handle,
             all: handle.all.pipe(
               Stream.flatMap((chunk) =>
-                Stream.make(chunk).pipe(
-                  Stream.concat(Stream.fromEffectDrain(Deferred.succeed(consumed, undefined))),
-                ),
+                Stream.make(chunk).pipe(Stream.concat(Stream.fromEffectDrain(Deferred.succeed(consumed, undefined)))),
               ),
             ),
           })
@@ -1517,8 +1547,8 @@ const sigtermResistant = Effect.fn("ShellToolTest.sigtermResistant")(function* (
   const tool = yield* Tool.init(
     yield* ShellTool.pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, signalling)),
   )
-  const program = `process.on("SIGTERM", () => {}); require("fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); console.log("ready"); setInterval(() => {}, 1000)`
-  const pid = Effect.promise(() => Bun.file(pidFile).text()).pipe(Effect.map(Number))
+  const program = `process.on("SIGTERM", () => {}); ${atomicWriteSource(pidFile, "String(process.pid)")}; console.log("ready"); setInterval(() => {}, 1000)`
+  const pid = Effect.promise(() => readPositivePID(pidFile))
   return {
     tool,
     consumed,

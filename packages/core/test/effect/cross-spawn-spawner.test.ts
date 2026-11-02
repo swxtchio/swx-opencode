@@ -83,8 +83,90 @@ async function groupGone(pgid: number, timeout = 5_000) {
 function processIdentity(pid: number) {
   const identity = EventWriter.readIdentity(pid)
   if (identity?.bootID && identity.startTicks) return identity
-  const started = Bun.spawnSync(["ps", "-p", String(pid), "-o", "lstart="]).stdout.toString().trim()
+  const started = Bun.spawnSync(["ps", "-p", String(pid), "-o", "lstart="])
+    .stdout.toString()
+    .trim()
   return started ? { pid, bootID: "ps", startTicks: started } : undefined
+}
+
+const writeAtomically = (filename: string, contents: string) =>
+  Effect.promise(async () => {
+    const temporary = `${filename}.tmp`
+    await Bun.write(temporary, contents)
+    await fs.rename(temporary, filename)
+  })
+
+const positivePID = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value > 0
+
+const ownerProbe = (value: unknown): { pgid: number; child: number } | undefined => {
+  if (typeof value !== "object" || value === null) return
+  const result = value as Record<string, unknown>
+  if (!positivePID(result.pgid) || !positivePID(result.child)) return
+  return { pgid: result.pgid, child: result.child }
+}
+
+const processIdentityRecord = (value: unknown): value is EventWriter.ProcessIdentity => {
+  if (typeof value !== "object" || value === null) return false
+  const result = value as Record<string, unknown>
+  return (
+    positivePID(result.pid) &&
+    typeof result.bootID === "string" &&
+    result.bootID.length > 0 &&
+    typeof result.startTicks === "string" &&
+    result.startTicks.length > 0
+  )
+}
+
+const identityProbe = (value: unknown): { pgid: number; members: EventWriter.ProcessIdentity[] } | undefined => {
+  if (typeof value !== "object" || value === null) return
+  const result = value as Record<string, unknown>
+  if (!positivePID(result.pgid) || !Array.isArray(result.members) || !result.members.every(processIdentityRecord))
+    return
+  return { pgid: result.pgid, members: result.members }
+}
+
+const readOwnerProbe = async (filename: string, timeout = 10_000) => {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    try {
+      const result = ownerProbe(await Bun.file(filename).json())
+      if (result) return result
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  throw new Error("fixture owner record was not atomically published with valid PIDs")
+}
+
+const readIdentityRecord = async (filename: string) => {
+  try {
+    return identityProbe(await Bun.file(filename).json())
+  } catch {
+    return undefined
+  }
+}
+
+const readPositivePID = async (filename: string, timeout = 5_000) => {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    try {
+      const value = Number((await Bun.file(filename).text()).trim())
+      if (positivePID(value)) return value
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  throw new Error("fixture PID was not atomically published as a positive integer")
+}
+
+const readReadySignal = async (filename: string, timeout = 5_000) => {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    try {
+      if ((await Bun.file(filename).text()).trim() === "ready") return
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  throw new Error("fixture ready signal was not atomically published")
 }
 
 function sameProcess(identity: EventWriter.ProcessIdentity) {
@@ -177,8 +259,7 @@ afterEach(async () => {
   let remaining: number[] = []
   try {
     for (const group of groups) {
-      if (!(await groupGone(group.pgid, 250)))
-        survivors.push({ group, pids: ownedProcessMembers(group) })
+      if (!(await groupGone(group.pgid, 250))) survivors.push({ group, pids: ownedProcessMembers(group) })
     }
   } finally {
     for (const survivor of survivors) {
@@ -196,7 +277,10 @@ afterEach(async () => {
     remaining = survivors.flatMap((survivor) => processGroupMembers(survivor.group.pgid))
     ownedProcessGroups.clear()
   }
-  expect({ survivors: survivors.map((survivor) => ({ pgid: survivor.group.pgid, pids: survivor.pids })), remaining }).toEqual({
+  expect({
+    survivors: survivors.map((survivor) => ({ pgid: survivor.group.pgid, pids: survivor.pids })),
+    remaining,
+  }).toEqual({
     survivors: [],
     remaining: [],
   })
@@ -206,18 +290,25 @@ const resistantDescendant =
   'process.on("SIGTERM", () => {}); process.stdout.write("ready"); setInterval(() => {}, 10_000)'
 const silentResistantDescendant = 'process.on("SIGTERM", () => {}); setInterval(() => {}, 10_000)'
 
+const atomicWriteSource = (filename: string, contents: string, releaseFile?: string, afterPublish = "") => {
+  if (!releaseFile)
+    return `(()=>{const fs=require("node:fs");const temporary=${JSON.stringify(filename)}+".tmp";fs.writeFileSync(temporary,${contents});fs.renameSync(temporary,${JSON.stringify(filename)})})()`
+  return `(()=>{const fs=require("node:fs");const filename=${JSON.stringify(filename)};const temporary=filename+".tmp";const value=${contents};fs.writeFileSync(temporary,value.slice(0,Math.max(1,Math.floor(value.length/2))));const publish=setInterval(()=>{if(!fs.existsSync(${JSON.stringify(releaseFile)}))return;clearInterval(publish);fs.writeFileSync(temporary,value);fs.renameSync(temporary,filename);${afterPublish}},10)})()`
+}
+
 const processTreeSource = (
   child: string,
   onTerm?: string,
   ownershipFile?: string,
   publishChildStarted = true,
   readyFile?: string,
+  ownerReleaseFile?: string,
 ) => {
   const childReady = readyFile
     ? [
         'child.stdout.once("data", () => {',
-        'process.stdout.write(`child-ready:${child.pid}\\n`)',
-        `require("node:fs").writeFileSync(${JSON.stringify(readyFile)}, "ready")`,
+        "process.stdout.write(`child-ready:${child.pid}\\n`)",
+        atomicWriteSource(readyFile, '"ready"'),
         "})",
       ].join("; ")
     : 'child.stdout.once("data", () => process.stdout.write(`child-ready:${child.pid}\\n`))'
@@ -225,9 +316,16 @@ const processTreeSource = (
     ...(onTerm ? [onTerm] : []),
     `const child = require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(child)}], { stdio: ["ignore", "pipe", "ignore"] })`,
     ...(ownershipFile
-      ? [`require("node:fs").writeFileSync(${JSON.stringify(ownershipFile)}, JSON.stringify({ pgid: process.pid, child: child.pid }))`]
+      ? [
+          atomicWriteSource(
+            ownershipFile,
+            "JSON.stringify({ pgid: process.pid, child: child.pid })",
+            ownerReleaseFile,
+            publishChildStarted ? "process.stdout.write(`child-started:${child.pid}\\n`)" : "",
+          ),
+        ]
       : []),
-    ...(publishChildStarted ? ['process.stdout.write(`child-started:${child.pid}\\n`)'] : []),
+    ...(publishChildStarted && !ownerReleaseFile ? ["process.stdout.write(`child-started:${child.pid}\\n`)"] : []),
     childReady,
     "setInterval(() => {}, 10_000)",
   ].join(";\n")
@@ -239,6 +337,7 @@ const termExitingParent = (
   ownershipFile?: string,
   publishChildStarted = true,
   readyFile?: string,
+  ownerReleaseFile?: string,
 ) =>
   processTreeSource(
     child,
@@ -246,6 +345,7 @@ const termExitingParent = (
     ownershipFile,
     publishChildStarted,
     readyFile,
+    ownerReleaseFile,
   )
 
 const timeoutProbeMode = process.env.SWX_CORE_SPAWNER_PROBE_MODE ?? ""
@@ -302,7 +402,8 @@ const processTreeReady = (
         orElse: () => Effect.fail(new Error("child readiness marker was not produced after a recorded child")),
       }),
     )
-    if (readyPID !== childPID) return yield* Effect.fail(new Error("child readiness PID did not match its recorded identity"))
+    if (readyPID !== childPID)
+      return yield* Effect.fail(new Error("child readiness PID did not match its recorded identity"))
     return identity
   })
 
@@ -776,14 +877,14 @@ describe("cross-spawn spawner", () => {
         const descendant = yield* processTreeReady(
           handle,
           pgid,
-          (identity) => Effect.promise(() => Bun.write(timeoutProbeFile, JSON.stringify({ pgid, members: [leader, identity] }))).pipe(Effect.asVoid),
+          (identity) =>
+            writeAtomically(timeoutProbeFile, JSON.stringify({ pgid, members: [leader, identity] })).pipe(
+              Effect.asVoid,
+            ),
           timeoutProbeMode === "readiness" ? "1 second" : "5 seconds",
         )
         if (!sameProcess(leader) || !sameProcess(descendant)) throw new Error("timeout worker fixture was not live")
-        if (timeoutProbeMode === "timeout") {
-          yield* Effect.promise(() => Bun.write(timeoutProbeReadyFile, "ready"))
-          yield* Effect.never
-        }
+        if (timeoutProbeMode === "timeout") yield* Effect.never
       }),
       timeoutProbeMode === "timeout" ? 5_000 : 15_000,
     )
@@ -799,9 +900,12 @@ describe("cross-spawn spawner", () => {
           const identityFile = path.join(process.cwd(), `${stem}-identity.json`)
           const readyFile = path.join(process.cwd(), `${stem}-ready`)
           const files = [ownerFile, identityFile, readyFile]
-          yield* Effect.promise(() => Promise.all(files.map((file) => fs.rm(file, { force: true }))))
+          const artifacts = [...files, ...files.map((file) => `${file}.tmp`)]
+          yield* Effect.promise(() => Promise.all(artifacts.map((file) => fs.rm(file, { force: true }))))
           yield* Effect.addFinalizer(() =>
-            Effect.promise(() => Promise.all(files.map((file) => fs.rm(file, { force: true })))).pipe(Effect.asVoid),
+            Effect.promise(() => Promise.all(artifacts.map((file) => fs.rm(file, { force: true })))).pipe(
+              Effect.asVoid,
+            ),
           )
 
           const worker = Bun.spawn(
@@ -840,19 +944,7 @@ describe("cross-spawn spawner", () => {
             }),
           )
           const output = Promise.all([new Response(worker.stdout).text(), new Response(worker.stderr).text()])
-          const owner = yield* Effect.promise(async () => {
-            const deadline = Date.now() + 10_000
-            while (Date.now() < deadline) {
-              if (await Bun.file(ownerFile).exists()) {
-                const value = (await Bun.file(ownerFile).json()) as { pgid: number; child: number }
-                const leader = processIdentity(value.pgid)
-                const descendant = processIdentity(value.child)
-                if (leader?.bootID && leader.startTicks && descendant?.bootID && descendant.startTicks) return value
-              }
-              await new Promise((resolve) => setTimeout(resolve, 20))
-            }
-          })
-          if (!owner) throw new Error("process-tree worker did not publish producer PIDs")
+          const owner = yield* Effect.promise(() => readOwnerProbe(ownerFile))
           const leader = processIdentity(owner.pgid)
           const descendant = processIdentity(owner.child)
           if (!leader?.bootID || !leader.startTicks || !descendant?.bootID || !descendant.startTicks)
@@ -866,16 +958,7 @@ describe("cross-spawn spawner", () => {
             descendant: true,
           })
 
-          if (mode !== "readiness") {
-            yield* Effect.promise(async () => {
-              const deadline = Date.now() + 5_000
-              while (Date.now() < deadline) {
-                if (await Bun.file(readyFile).exists()) return
-                await new Promise((resolve) => setTimeout(resolve, 20))
-              }
-              throw new Error("process-tree worker did not publish its child-ready signal")
-            })
-          }
+          if (mode !== "readiness") yield* Effect.promise(() => readReadySignal(readyFile))
 
           const exitCode = yield* Effect.promise(() => worker.exited).pipe(Effect.timeout("15 seconds"))
           const outputText = (yield* Effect.promise(() => output)).join("\n")
@@ -890,7 +973,10 @@ describe("cross-spawn spawner", () => {
           expect(groupAlive(owner.pgid)).toBe(false)
           expect(ownership.members.every((member) => !sameProcess(member))).toBe(true)
 
-          expect(yield* Effect.promise(() => Bun.file(identityFile).exists())).toBe(mode !== "child-started")
+          const identityRecord = yield* Effect.promise(() => readIdentityRecord(identityFile))
+          expect(identityRecord !== undefined).toBe(mode !== "child-started")
+          if (identityRecord)
+            expect(identityRecord.members.map((member) => member.pid)).toEqual([owner.pgid, owner.child])
         })
 
         yield* run("timeout")
@@ -898,6 +984,65 @@ describe("cross-spawn spawner", () => {
         yield* run("child-started")
       }),
       30_000,
+    )
+
+    fx.live(
+      "fixture ownership stays private until its partial record is atomically published",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+
+        const directory = yield* Effect.promise(() => fs.mkdtemp(path.join(os.tmpdir(), "opencode-owner-publication-")))
+        const ownerFile = path.join(directory, "owner.json")
+        const releaseFile = path.join(directory, "release")
+        yield* Effect.addFinalizer(() =>
+          Effect.promise(() => fs.rm(directory, { recursive: true, force: true })).pipe(Effect.asVoid),
+        )
+
+        const handle = yield* js(termExitingParent(resistantDescendant, 0, ownerFile, true, undefined, releaseFile))
+        const pgid = Number(handle.pid)
+        const group: RecordedProcessGroup = { pgid, members: [] }
+        const leader = processIdentity(pgid)
+        if (!leader?.bootID || !leader.startTicks) throw new Error("fixture leader has no recorded start identity")
+        group.members.push(leader)
+        recordProcess(pgid, leader)
+        yield* Effect.addFinalizer(() => cleanupRecordedProcessGroup(group))
+
+        const readiness = yield* processTreeReady(handle, pgid).pipe(Effect.forkChild)
+        const ownerRead = yield* Effect.promise(() => readOwnerProbe(ownerFile)).pipe(Effect.forkChild)
+        const partial = yield* Effect.promise(async () => {
+          const deadline = Date.now() + 3_000
+          while (Date.now() < deadline) {
+            for (const filename of [ownerFile, `${ownerFile}.tmp`]) {
+              try {
+                const value = await Bun.file(filename).text()
+                if (value) return { filename, value }
+              } catch {}
+            }
+            await new Promise((resolve) => setTimeout(resolve, 20))
+          }
+          throw new Error("fixture did not hold a partial owner record")
+        })
+        expect(partial.filename).toBe(`${ownerFile}.tmp`)
+        expect(() => JSON.parse(partial.value)).toThrow()
+        expect(yield* Effect.promise(() => Bun.file(ownerFile).exists())).toBe(false)
+        expect(Option.isNone(yield* Fiber.await(ownerRead).pipe(Effect.timeoutOption("100 millis")))).toBe(true)
+
+        yield* writeAtomically(releaseFile, "release")
+        const owner = yield* Fiber.join(ownerRead).pipe(Effect.timeout("3 seconds"))
+        const descendant = processIdentity(owner.child)
+        if (!descendant?.bootID || !descendant.startTicks)
+          throw new Error("fixture descendant has no recorded start identity")
+        group.members.push(descendant)
+        recordProcess(pgid, descendant)
+        expect(owner.pgid).toBe(pgid)
+        expect((yield* Fiber.join(readiness).pipe(Effect.timeout("3 seconds"))).pid).toBe(owner.child)
+
+        const completion = yield* handle.kill({ forceKillAfter: "100 millis" }).pipe(Effect.timeoutOption("2 seconds"))
+        expect(Option.isSome(completion)).toBe(true)
+        expect(yield* Effect.promise(() => groupGone(pgid))).toBe(true)
+        expect(group.members.every((member) => !sameProcess(member))).toBe(true)
+      }),
+      12_000,
     )
 
     fx.live(
@@ -923,7 +1068,8 @@ describe("cross-spawn spawner", () => {
         )
 
         const descendant = yield* processTreeReady(handle, pgid)
-        if (!descendant?.bootID || !descendant.startTicks) throw new Error("spawned descendant has no recorded start identity")
+        if (!descendant?.bootID || !descendant.startTicks)
+          throw new Error("spawned descendant has no recorded start identity")
         owned.push(descendant)
         recordProcess(pgid, descendant)
         expect({ leader: sameProcess(leader), descendant: sameProcess(descendant) }).toEqual({
@@ -1086,15 +1232,18 @@ describe("cross-spawn spawner", () => {
         if (process.platform === "win32") return
 
         const file = path.join(process.cwd(), `.cross-spawn-close-probe-${process.pid}.json`)
+        const artifacts = [file, `${file}.tmp`]
         const detachedGroup: RecordedProcessGroup = { pgid: undefined, members: [] }
         yield* Effect.addFinalizer(() => cleanupRecordedProcessGroup(detachedGroup))
-        yield* Effect.addFinalizer(() => Effect.promise(() => fs.rm(file, { force: true })).pipe(Effect.asVoid))
+        yield* Effect.addFinalizer(() =>
+          Effect.promise(() => Promise.all(artifacts.map((item) => fs.rm(item, { force: true })))).pipe(Effect.asVoid),
+        )
 
         const childSource = 'process.on("SIGTERM", () => {}); setInterval(() => {}, 10_000)'
         const parentSource = [
           `const child = require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(childSource)}], { detached: true, stdio: "inherit" })`,
           "child.unref()",
-          `require("node:fs").writeFileSync(${JSON.stringify(file)}, String(child.pid))`,
+          atomicWriteSource(file, "String(child.pid)"),
           "setTimeout(() => process.exit(0), 500)",
         ].join(";\n")
         const exit = yield* Effect.exit(
@@ -1102,15 +1251,9 @@ describe("cross-spawn spawner", () => {
             Effect.gen(function* () {
               const handle = yield* js(parentSource, { forceKillAfter: "3 seconds" })
               const leader = processIdentity(Number(handle.pid))
-              if (!leader?.bootID || !leader.startTicks) throw new Error("spawned leader has no recorded start identity")
-              const childPID = yield* Effect.promise(async () => {
-                const deadline = Date.now() + 5_000
-                while (Date.now() < deadline) {
-                  if (await Bun.file(file).exists()) return Number(await Bun.file(file).text())
-                  await new Promise((resolve) => setTimeout(resolve, 20))
-                }
-                throw new Error("detached descendant did not publish its PID")
-              })
+              if (!leader?.bootID || !leader.startTicks)
+                throw new Error("spawned leader has no recorded start identity")
+              const childPID = yield* Effect.promise(() => readPositivePID(file))
               detachedGroup.pgid = childPID
               const detached = processIdentity(childPID)
               if (!detached?.bootID || !detached.startTicks)
@@ -1265,7 +1408,7 @@ describe("cross-spawn spawner", () => {
         const file = path.join(dir, "echo cmd.cmd")
 
         yield* Effect.promise(() => fs.mkdir(dir, { recursive: true }))
-        yield* Effect.promise(() => fs.writeFile(file, "@echo off\r\nif %~1==--stdio exit /b 0\r\nexit /b 7\r\n"))
+        yield* writeAtomically(file, "@echo off\r\nif %~1==--stdio exit /b 0\r\nexit /b 7\r\n")
 
         const code = yield* ChildProcessSpawner.ChildProcessSpawner.use((svc) =>
           svc.exitCode(
