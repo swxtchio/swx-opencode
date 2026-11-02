@@ -368,30 +368,67 @@ export const make = Effect.gen(function* () {
       return Effect.sync(() => child.kill())
     })
 
-  const waitForGroupAfterKill = Effect.fnUntraced(function* (
+  const reportGroupSurvivors = Effect.fnUntraced(function* (
     command: ChildProcess.StandardCommand,
     proc: NodeChildProcess.ChildProcess,
+    signal: ExitSignal,
   ) {
-    if (yield* waitForGroup(proc.pid!, Duration.seconds(5))) return
-    const members = yield* groupMembers(command, proc.pid!).pipe(Effect.catch(() => Effect.succeed([])))
+    const members =
+      process.platform !== "win32" && command.options.detached !== false
+        ? yield* groupMembers(command, proc.pid!).pipe(Effect.catch(() => Effect.succeed([])))
+        : []
+    const done = yield* Deferred.isDone(signal)
+    const survivors = members.includes(proc.pid!) || done ? members : [...members, proc.pid!]
     return yield* Effect.die(
       new Error(
-        `SIGKILL did not terminate process group ${proc.pid}; surviving members: ${members.length ? members.join(", ") : "unavailable"}`,
+        `SIGKILL did not settle process ${proc.pid}; surviving members: ${survivors.length ? survivors.join(", ") : "unavailable"}`,
       ),
     )
+  })
+
+  const waitForCleanupAfterKill = Effect.fnUntraced(function* (
+    command: ChildProcess.StandardCommand,
+    proc: NodeChildProcess.ChildProcess,
+    signal: ExitSignal,
+  ) {
+    if (process.platform !== "win32" && command.options.detached !== false) {
+      if (!(yield* waitForGroup(proc.pid!, Duration.seconds(5))))
+        return yield* reportGroupSurvivors(command, proc, signal)
+    }
+    const closed = yield* Effect.timeoutOrElse(Deferred.await(signal).pipe(Effect.as(true)), {
+      duration: Duration.seconds(5),
+      orElse: () => Effect.succeed(false),
+    })
+    if (!closed) return yield* reportGroupSurvivors(command, proc, signal)
   })
 
   const cleanupGroup = (
     command: ChildProcess.StandardCommand,
     proc: NodeChildProcess.ChildProcess,
-    signal: NodeJS.Signals,
+    exitSignal: ExitSignal,
+    killSignal: NodeJS.Signals,
     forceKillAfter: Duration.Input,
+    afterSignal = Effect.void,
   ) => {
-    const send = (next: NodeJS.Signals) => Effect.catch(killGroup(command, proc, next), () => Effect.void)
-    const attempt = send(signal).pipe(Effect.andThen(waitForGroup(proc.pid!)))
+    const send = (next: NodeJS.Signals) => {
+      if (process.platform === "win32") return killGroup(command, proc, next)
+      if (command.options.detached === false) return killOne(command, proc, next)
+      if (!groupAlive(proc.pid!)) return Effect.void
+      return Effect.catch(killGroup(command, proc, next), () => killOne(command, proc, next))
+    }
+    const sendIgnoringErrors = (next: NodeJS.Signals) => Effect.catch(send(next), () => Effect.void)
+    const wait = Effect.gen(function* () {
+      if (process.platform !== "win32" && command.options.detached !== false) yield* waitForGroup(proc.pid!)
+      yield* Deferred.await(exitSignal)
+    }).pipe(Effect.asVoid)
+    const attempt = sendIgnoringErrors(killSignal).pipe(Effect.andThen(afterSignal), Effect.andThen(wait))
     return Effect.timeoutOrElse(attempt, {
       duration: forceKillAfter,
-      orElse: () => send("SIGKILL").pipe(Effect.andThen(waitForGroupAfterKill(command, proc)), Effect.asVoid),
+      orElse: () =>
+        sendIgnoringErrors("SIGKILL").pipe(
+          Effect.andThen(waitForCleanupAfterKill(command, proc, exitSignal)),
+          Effect.asVoid,
+        ),
     })
   }
 
@@ -473,17 +510,30 @@ export const make = Effect.gen(function* () {
                 const [code, exitSignal] = yield* Deferred.await(signal)
                 if (process.platform === "win32") return yield* Effect.void
                 const requested = cleanupRequest.value
-                if (requested) return yield* cleanupGroup(command, proc, requested.killSignal, requested.forceKillAfter)
+                if (requested)
+                  return yield* cleanupGroup(command, proc, signal, requested.killSignal, requested.forceKillAfter)
                 if (Predicate.isNull(code) && Predicate.isNotNull(exitSignal)) {
                   const forceKillAfter = command.options.forceKillAfter
                   if (Predicate.isUndefined(forceKillAfter))
                     return yield* Effect.ignore(killGroup(command, proc, command.options.killSignal ?? "SIGTERM"))
-                  return yield* cleanupGroup(command, proc, command.options.killSignal ?? "SIGTERM", forceKillAfter)
+                  return yield* cleanupGroup(
+                    command,
+                    proc,
+                    signal,
+                    command.options.killSignal ?? "SIGTERM",
+                    forceKillAfter,
+                  )
                 }
                 if (code !== 0 && Predicate.isNotNull(code)) {
                   const forceKillAfter = command.options.forceKillAfter
                   if (Predicate.isUndefined(forceKillAfter)) return yield* Effect.ignore(kill(killGroup))
-                  return yield* cleanupGroup(command, proc, command.options.killSignal ?? "SIGTERM", forceKillAfter)
+                  return yield* cleanupGroup(
+                    command,
+                    proc,
+                    signal,
+                    command.options.killSignal ?? "SIGTERM",
+                    forceKillAfter,
+                  )
                 }
                 return yield* Effect.void
               }
@@ -506,22 +556,7 @@ export const make = Effect.gen(function* () {
                 )
                 return yield* Effect.ignore(leader)
               }
-              const attempt = sendIgnoringErrors(sig).pipe(
-                Effect.andThen(detach),
-                Effect.andThen(waitForGroup(proc.pid!)),
-                Effect.andThen(Deferred.await(signal)),
-                Effect.asVoid,
-              )
-              const escalated = Effect.timeoutOrElse(attempt, {
-                duration: forceKillAfter,
-                orElse: () =>
-                  sendIgnoringErrors("SIGKILL").pipe(
-                    Effect.andThen(waitForGroupAfterKill(command, proc)),
-                    Effect.andThen(Deferred.await(signal)),
-                    Effect.asVoid,
-                  ),
-              })
-              return yield* escalated
+              return yield* cleanupGroup(command, proc, signal, sig, forceKillAfter, detach)
             }),
           )
 
@@ -556,10 +591,7 @@ export const make = Effect.gen(function* () {
                 return send(sig).pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid)
               }
               cleanupRequest.value = { killSignal: sig, forceKillAfter }
-              return cleanupGroup(command, proc, sig, forceKillAfter).pipe(
-                Effect.andThen(Deferred.await(signal)),
-                Effect.asVoid,
-              )
+              return cleanupGroup(command, proc, signal, sig, forceKillAfter)
             },
             unref: Effect.sync(() => {
               if (ref) {

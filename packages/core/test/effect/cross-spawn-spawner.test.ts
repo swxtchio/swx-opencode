@@ -613,6 +613,32 @@ describe("cross-spawn spawner", () => {
     )
 
     fx.live(
+      "forceKillAfter signals detached-false leaders directly",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+
+        const handle = yield* js('process.on("SIGTERM", () => process.exit(0)); setInterval(() => {}, 10_000)', {
+          detached: false,
+        })
+        const leader = processIdentity(Number(handle.pid))
+        if (!leader?.bootID || !leader.startTicks) throw new Error("spawned leader has no recorded start identity")
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            if (!sameProcess(leader)) return
+            try {
+              process.kill(leader.pid, "SIGKILL")
+            } catch {}
+          }),
+        )
+
+        const completion = yield* handle.kill({ forceKillAfter: 100 }).pipe(Effect.timeoutOption("1 second"))
+        expect(Option.isSome(completion)).toBe(true)
+        expect(sameProcess(leader)).toBe(false)
+      }),
+      5_000,
+    )
+
+    fx.live(
       "reports group members when SIGKILL does not remove them within the final bound",
       Effect.gen(function* () {
         if (process.platform === "win32") return
