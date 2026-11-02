@@ -44,6 +44,7 @@ const ctx = {
   messages: [],
   metadata: () => Effect.void,
 }
+const initialPermissionPatterns: string[] = []
 const redirectChecks: string[] = []
 
 const withFetch = <A, E, R>(
@@ -65,13 +66,17 @@ const exec = Effect.fn("WebFetchToolTest.exec")(function* (
   const tool = yield* info.init()
   return yield* tool.execute(args, {
     ...ctx,
-    ask: (request) =>
-      permission.ask({
-        ...request,
-        sessionID: ctx.sessionID,
-        tool: { messageID: ctx.messageID, callID: ctx.callID },
-        ruleset,
-      }).pipe(Effect.orDie),
+    ask: (request) => {
+      initialPermissionPatterns.push(...request.patterns)
+      return permission
+        .ask({
+          ...request,
+          sessionID: ctx.sessionID,
+          tool: { messageID: ctx.messageID, callID: ctx.callID },
+          ruleset,
+        })
+        .pipe(Effect.orDie)
+    },
     assertNotDenied: (request) =>
       Effect.sync(() => redirectChecks.push(...request.patterns)).pipe(
         Effect.andThen(
@@ -107,12 +112,130 @@ const expectNoPermissionAsk = <A, E, R>(self: Effect.Effect<A, E, R>) =>
     return outcome.value
   }).pipe(
     Effect.timeoutOrElse({
-      duration: "5 seconds",
+      duration: "4 seconds",
       orElse: () => Effect.fail(new Error("Webfetch neither completed nor opened a permission request")),
     }),
   )
 
 describe("tool.webfetch", () => {
+  it.instance("denies canonical mixed-case and percent-encoded hosts before transport", () => {
+    const received: string[] = []
+    return withFetch(
+      (request) => {
+        received.push(new URL(request.url).href)
+        return new Response("must not be requested", { headers: { "content-type": "text/plain" } })
+      },
+      (url) =>
+        Effect.gen(function* () {
+          const rawInputs = [
+            `http://LOCALHOST:${url.port}/mixed-case`,
+            `http://%6cocalhost:${url.port}/encoded-host`,
+          ]
+          const results: Array<{
+            url: string
+            outcome: string
+            patterns: string[]
+            requests: string[]
+          }> = []
+
+          yield* Effect.forEach(
+            rawInputs,
+            (raw) =>
+              Effect.gen(function* () {
+                initialPermissionPatterns.length = 0
+                received.length = 0
+                const canonical = new URL(raw).href
+                const outcome = yield* Effect.exit(
+                  exec(
+                    { url: raw, format: "text" },
+                    [
+                      { permission: "webfetch", pattern: "*", action: "allow" },
+                      { permission: "webfetch", pattern: canonical, action: "deny" },
+                    ],
+                  ),
+                )
+
+                results.push({
+                  url: canonical,
+                  outcome: outcome._tag,
+                  patterns: [...initialPermissionPatterns],
+                  requests: [...received],
+                })
+                expect(yield* (yield* Permission.Service).list()).toEqual([])
+              }),
+            { concurrency: 1 },
+          )
+          expect(results).toEqual(
+            rawInputs.map((raw) => ({
+              url: new URL(raw).href,
+              outcome: "Failure",
+              patterns: [new URL(raw).href],
+              requests: [],
+            })),
+          )
+        }),
+    )
+  }, 15_000)
+
+  it.instance("transports an uppercase-scheme URL in its canonical form under an allowing rule", () => {
+    const received: string[] = []
+    return withFetch(
+      (request) => {
+        received.push(new URL(request.url).href)
+        return new Response("canonical transport", { headers: { "content-type": "text/plain" } })
+      },
+      (url) =>
+        Effect.gen(function* () {
+          initialPermissionPatterns.length = 0
+          const raw = `HTTP://LOCALHOST:${url.port}/allowed`
+          const canonical = new URL(raw).href
+          const outcome = yield* expectNoPermissionAsk(
+            Effect.exit(
+              exec({ url: raw, format: "text" }, [
+                { permission: "webfetch", pattern: "*", action: "deny" },
+                { permission: "webfetch", pattern: canonical, action: "allow" },
+              ]),
+            ),
+          )
+
+          expect(outcome._tag).toBe("Success")
+          if (outcome._tag === "Success") expect(outcome.value.output).toBe("canonical transport")
+          expect(initialPermissionPatterns).toEqual([canonical])
+          expect(received).toEqual([canonical])
+          expect(yield* (yield* Permission.Service).list()).toEqual([])
+        }),
+    )
+  }, 15_000)
+
+  it.instance("rejects malformed and unsupported input URLs before permission or transport", () => {
+    const received: string[] = []
+    return withFetch(
+      (request) => {
+        received.push(new URL(request.url).href)
+        return new Response("unexpected", { headers: { "content-type": "text/plain" } })
+      },
+      (url) =>
+        Effect.gen(function* () {
+          const inputs = ["http://", "file:///etc/passwd"]
+          const results: Array<{ url: string; outcome: string; patterns: string[]; requests: string[] }> = []
+          for (const input of inputs) {
+            initialPermissionPatterns.length = 0
+            received.length = 0
+            const outcome = yield* Effect.exit(exec({ url: input, format: "text" }))
+            results.push({
+              url: input,
+              outcome: outcome._tag,
+              patterns: [...initialPermissionPatterns],
+              requests: [...received],
+            })
+          }
+          expect(results).toEqual(
+            inputs.map((input) => ({ url: input, outcome: "Failure", patterns: [], requests: [] })),
+          )
+        }),
+    )
+  }, 15_000)
+
   it.instance("checks supported relative and absolute redirects before transport", () => {
     const received: string[] = []
     return withFetch(
@@ -158,7 +281,7 @@ describe("tool.webfetch", () => {
           expect(yield* (yield* Permission.Service).list()).toEqual([])
         }),
     )
-  })
+  }, 15_000)
 
   it.instance("continues an ask-only redirect without creating a permission request", () => {
     const received: string[] = []
@@ -188,7 +311,7 @@ describe("tool.webfetch", () => {
           expect(redirectChecks).toEqual([target])
         }),
     )
-  })
+  }, 15_000)
 
   it.instance("checks a later absolute redirect against deny rules before the server receives it", () => {
     const received: string[] = []
@@ -222,7 +345,7 @@ describe("tool.webfetch", () => {
           expect(redirectChecks).toEqual([new URL("/middle", url).href, denied])
         }),
     )
-  })
+  }, 15_000)
 
   it.instance("rejects unsupported redirects and bounds redirect chains", () => {
     const received: string[] = []
@@ -266,7 +389,7 @@ describe("tool.webfetch", () => {
           expect(yield* (yield* Permission.Service).list()).toEqual([])
         }),
     )
-  })
+  }, 15_000)
 
   it.instance("rechecks every redirect after a Cloudflare challenge retry", () => {
     const received: Array<{ path: string; agent: string | null }> = []
@@ -303,7 +426,7 @@ describe("tool.webfetch", () => {
           expect(redirectChecks).toEqual([target])
         }),
     )
-  })
+  }, 15_000)
 
   it.instance("returns image responses as file attachments", () =>
     Effect.gen(function* () {

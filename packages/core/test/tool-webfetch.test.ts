@@ -164,12 +164,113 @@ const expectNoPermissionV2Ask = <A, E, R>(self: Effect.Effect<A, E, R>) =>
     return outcome.value
   }).pipe(
     Effect.timeoutOrElse({
-      duration: "5 seconds",
+      duration: "4 seconds",
       orElse: () => Effect.fail(new Error("Webfetch neither completed nor opened a permission request")),
     }),
   )
 
 describe("WebFetchTool real permission policy", () => {
+  policy.live("matches canonical URL identity for the invoking V2 agent", () =>
+    Effect.acquireUseRelease(
+      Effect.sync(() => {
+        const received: string[] = []
+        const server = Bun.serve({
+          port: 0,
+          fetch: (request) => {
+            received.push(new URL(request.url).href)
+            return new Response("fetched", { headers: { "content-type": "text/plain" } })
+          },
+        })
+        return { server, received }
+      }),
+      ({ server, received }) =>
+        Effect.gen(function* () {
+          yield* setupPolicy()
+          const registry = yield* ToolRegistry.Service
+          const permissions = yield* PermissionV2.Service
+          const reviewer = AgentV2.ID.make("reviewer")
+          yield* setPermissions("test", [{ action: "webfetch", resource: "*", effect: "allow" }])
+
+          const rawInputs = [
+            `http://LOCALHOST:${server.port}/mixed-case`,
+            `http://%6cocalhost:${server.port}/encoded-host`,
+          ]
+          const results: Array<{ url: string; result: string; requests: string[] }> = []
+          yield* Effect.forEach(
+            rawInputs,
+            (url) =>
+              Effect.gen(function* () {
+                const canonical = new URL(url).href
+                yield* setPermissions("reviewer", [
+                  { action: "webfetch", resource: "*", effect: "allow" },
+                  { action: "webfetch", resource: canonical, effect: "deny" },
+                ])
+                received.length = 0
+
+                const result = yield* executeTool(registry, call({ url, format: "text" }, `call-denied-${results.length}`, reviewer))
+                results.push({ url: canonical, result: result.type, requests: [...received] })
+                expect(yield* permissions.list()).toEqual([])
+              }),
+            { concurrency: 1 },
+          )
+          const raw = `HTTP://LOCALHOST:${server.port}/allowed`
+          const canonical = new URL(raw).href
+          yield* setPermissions("test", [{ action: "webfetch", resource: "*", effect: "deny" }])
+          yield* setPermissions("reviewer", [
+            { action: "webfetch", resource: "*", effect: "deny" },
+            { action: "webfetch", resource: canonical, effect: "allow" },
+          ])
+          received.length = 0
+
+          const allowed = yield* executeTool(registry, call({ url: raw, format: "text" }, "call-uppercase", reviewer))
+          const allowedRequests = [...received]
+          expect(yield* permissions.list()).toEqual([])
+          expect(results.map((result) => [result.url, result.result, result.requests])).toEqual(
+            rawInputs.map((url) => [new URL(url).href, "error", []]),
+          )
+          expect(allowed).toEqual({ type: "text", value: "fetched" })
+          expect(allowedRequests).toEqual([canonical])
+        }),
+      ({ server }) => Effect.promise(() => server.stop(true)),
+    ),
+  )
+
+  policy.live("rejects malformed and unsupported inputs before policy or transport", () =>
+    Effect.acquireUseRelease(
+      Effect.sync(() => {
+        const received: string[] = []
+        const server = Bun.serve({
+          port: 0,
+          fetch: (request) => {
+            received.push(new URL(request.url).href)
+            return new Response("unexpected", { headers: { "content-type": "text/plain" } })
+          },
+        })
+        return { server, received }
+      }),
+      ({ server, received }) =>
+        Effect.gen(function* () {
+          yield* setupPolicy()
+          const registry = yield* ToolRegistry.Service
+          const permissions = yield* PermissionV2.Service
+          const reviewer = AgentV2.ID.make("reviewer")
+          yield* setPermissions("test", [{ action: "webfetch", resource: "*", effect: "allow" }])
+          yield* setPermissions("reviewer", [{ action: "webfetch", resource: "*", effect: "allow" }])
+
+          for (const [index, url] of ["http://", "file:///etc/passwd"].entries()) {
+            received.length = 0
+            expect(yield* executeTool(registry, call({ url, format: "text" }, `call-invalid-${index}`, reviewer))).toEqual({
+              type: "error",
+              value: `Unable to fetch ${url}`,
+            })
+            expect(received).toEqual([])
+            expect(yield* permissions.list()).toEqual([])
+          }
+        }),
+      ({ server }) => Effect.promise(() => server.stop(true)),
+    ),
+  )
+
   policy.live("manually follows every supported status and an absolute redirect", () =>
     Effect.acquireUseRelease(
       Effect.sync(() => {
@@ -494,15 +595,29 @@ describe("WebFetchTool registration", () => {
 
   it.effect("rejects non-HTTP schemes before permission or transport", () =>
     Effect.gen(function* () {
-      reset()
       const registry = yield* ToolRegistry.Service
-
-      expect(yield* executeTool(registry, call({ url: "file:///etc/passwd", format: "text" }))).toEqual({
-        type: "error",
-        value: "Unable to fetch file:///etc/passwd",
-      })
-      expect(assertions).toEqual([])
-      expect(requests).toEqual([])
+      const urls = ["file:///etc/passwd", "http://"]
+      const outcomes: Array<{ url: string; type: string; value: string; assertions: number; requests: string[] }> = []
+      for (const url of urls) {
+        reset()
+        const result = yield* executeTool(registry, call({ url, format: "text" }))
+        outcomes.push({
+          url,
+          type: result.type,
+          value: result.value,
+          assertions: assertions.length,
+          requests: requests.map((request) => request.url),
+        })
+      }
+      expect(outcomes).toEqual(
+        urls.map((url) => ({
+          url,
+          type: "error",
+          value: `Unable to fetch ${url}`,
+          assertions: 0,
+          requests: [],
+        })),
+      )
     }),
   )
 

@@ -160,14 +160,20 @@ const layer = Layer.effectDiscard(
           toModelOutput: ({ output }) => [{ type: "text", text: output.output }],
           execute: (input, context) =>
             Effect.gen(function* () {
-              yield* Effect.try({
-                try: () => assertHttpUrl(new URL(input.url)),
+              // Rules are matched against the URL that is requested, so `HTTPS://EVIL.COM` meets a rule for
+              // `https://evil.com/*`.
+              const url = yield* Effect.try({
+                try: () => {
+                  const parsed = new URL(input.url)
+                  assertHttpUrl(parsed)
+                  return parsed.href
+                },
                 catch: (error) => error,
               })
 
               yield* permission.assert({
                 action: name,
-                resources: [input.url],
+                resources: [url],
                 save: ["*"],
                 metadata: input,
                 sessionID: context.sessionID,
@@ -176,19 +182,17 @@ const layer = Layer.effectDiscard(
               })
 
               const { body, contentType } = yield* Effect.gen(function* () {
-                const check = (url: string) =>
+                const check = (next: string) =>
                   permission.assertNotDenied({
                     action: name,
-                    resources: [url],
-                    metadata: { ...input, url },
+                    resources: [next],
+                    metadata: { ...input, url: next },
                     sessionID: context.sessionID,
                     agent: context.agent,
                     source: { type: "tool", messageID: context.assistantMessageID, callID: context.toolCallID },
                   })
-                const response = yield* execute(http, check, input.url, input.format).pipe(
-                  Effect.catchIf(isCloudflareChallenge, () =>
-                    execute(http, check, input.url, input.format, "opencode"),
-                  ),
+                const response = yield* execute(http, check, url, input.format).pipe(
+                  Effect.catchIf(isCloudflareChallenge, () => execute(http, check, url, input.format, "opencode")),
                 )
                 const contentType = response.headers["content-type"] || ""
                 const mime = mimeFrom(contentType)

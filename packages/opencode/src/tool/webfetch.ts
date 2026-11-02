@@ -31,16 +31,21 @@ export const WebFetchTool = Tool.define(
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         Effect.gen(function* () {
-          if (!params.url.startsWith("http://") && !params.url.startsWith("https://")) {
-            throw new Error("URL must start with http:// or https://")
-          }
+          const url = yield* Effect.try({
+            try: () => {
+              const parsed = new URL(params.url)
+              assertHttpUrl(parsed)
+              return parsed.href
+            },
+            catch: (error) => error,
+          })
 
           yield* ctx.ask({
             permission: "webfetch",
-            patterns: [params.url],
+            patterns: [url],
             always: ["*"],
             metadata: {
-              url: params.url,
+              url,
               format: params.format,
               timeout: params.timeout,
             },
@@ -83,8 +88,8 @@ export const WebFetchTool = Tool.define(
               : Effect.fail(new Error("Webfetch redirect permission check is unavailable"))
 
           // Retry with honest UA if blocked by Cloudflare bot detection (TLS fingerprint mismatch)
-          const response = yield* execute(http, params.url, headers, check).pipe(
-            Effect.catchIf(isCloudflareChallenge, () => execute(http, params.url, headers, check, "opencode")),
+          const response = yield* execute(http, url, headers, check).pipe(
+            Effect.catchIf(isCloudflareChallenge, () => execute(http, url, headers, check, "opencode")),
             Effect.timeoutOrElse({ duration: timeout, orElse: () => Effect.die(new Error("Request timed out")) }),
           )
 
@@ -154,6 +159,10 @@ export const WebFetchTool = Tool.define(
 export const MAX_REDIRECTS = 10
 const redirectStatuses = new Set([301, 302, 303, 307, 308])
 
+function assertHttpUrl(url: URL) {
+  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("URL must use http:// or https://")
+}
+
 const isCloudflareChallenge = (error: unknown) => {
   if (!HttpClientError.isHttpClientError(error) || error.reason._tag !== "StatusCodeError") return false
   const response = error.reason.response
@@ -183,9 +192,7 @@ function execute(
           const next = yield* Effect.try({
             try: () => {
               const target = new URL(location, url)
-              if (target.protocol !== "http:" && target.protocol !== "https:") {
-                throw new Error("URL must use http:// or https://")
-              }
+              assertHttpUrl(target)
               return target.href
             },
             catch: (error) => (error instanceof Error ? error : new Error(String(error))),
