@@ -1,0 +1,11 @@
+# Operation log
+
+Evidence collected on `vm001` and `vm14-001` on 2026-11-02 UTC for the fleet refresh. Source selection, build, transport, install, and readback details are retained in the neighboring evidence files.
+
+- Immediately before build work, the read-only check on `vm14-001` found `/home/byates/vm14-leases/ACTIVE` absent. The task's captain-authorized one-time exception was used; no lease was acquired or released, and no file under the lease root was written.
+- The required `working: vm14-001 one-off arm64 build STARTING` and `working: vm14-001 one-off arm64 build FINISHED` wake events were appended. Source, dependency caches, build outputs, and stage target stayed inside `/tmp/fm-opencode-binary-refresh-pr383-765d66be6b`; the tree was removed after transfer.
+- The remote clean source checkout ran `./local-release.sh` with its install target inside that scratch tree. Its own version and database-path checks and the built binary's smoke check passed.
+- The executable and matching FFF library were copied into a temporary directory inside `/home/byates/.local/opencode-swxtch/bin`, compared by SHA-256, and checked as ARM64 ELF artifacts. The previous executable was copied to the versioned recovery path and verified before the executable pathname was replaced by a same-directory atomic rename.
+- Fresh processes invoked the absolute installed path for `--version`, both prune help forms, `db path`, and `file -L`; their complete outputs and statuses are retained under `postinstall/`.
+- No process signal, session stop/restart, online or offline pruning action, stock-opencode replacement, compatibility setting change, or configuration-file edit was run. Only read-only process snapshots were taken.
+- The local transfer candidate directory was removed after installation; the versioned previous executable backup and its required adjacent FFF library remain available for recovery.
