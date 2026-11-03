@@ -53,7 +53,7 @@ describe("server action referer", () => {
 })
 
 describe("server function payloads", () => {
-  test("rejects a forged Promise resolver before invoking a callable plugin", () => {
+  test("rejects a forged Promise resolver before invoking a callable plugin", async () => {
     const invoked: unknown[] = []
     const plugin = {
       tag: "test/PromiseResolver",
@@ -80,8 +80,13 @@ describe("server function payloads", () => {
       },
     }
 
-    expect(() => seroval.fromJSON(payload, { plugins: [...serverFunctionPlugins, plugin] })).toThrow()
-    expect(invoked).toEqual([])
+    const rejected = await Promise.resolve()
+      .then(() => seroval.fromJSON(payload, { plugins: [...serverFunctionPlugins, plugin] }))
+      .then(
+        () => false,
+        () => true,
+      )
+    expect({ rejected, invoked }).toEqual({ rejected: true, invoked: [] })
   })
 
   test("round-trips server-function arguments and results with the installed codecs", () => {
