@@ -81,7 +81,7 @@ Newest first. Each entry names the upstream range brought in.
 ### Database maintenance
 
 - **#395** Partially port the atomic SQLite acquisition behavior from `anomalyco/opencode#60651`
-  (`c6056f39312748c633de00ad2c2576b7e042b97d`, downstream `5f484b965becbc96b58aa519a4d2159ec69d0e99`)
+  (`c6056f39312748c633de00ad2c2576b7e042b97d`, downstream `79aafa2f82e7293ba7f2c1222e35b2f58dc5c5ea`; review correction `9f7cc80702fee80e82dd811a35f9b8d16e97ae29`)
   into `packages/core/src/database/sqlite.bun.ts`, `packages/core/src/database/sqlite.node.ts`, and
   `packages/effect-sqlite-node/src/index.ts`. Use the fork's pinned Effect beta.83 with a Scope-owned child and
   `Semaphore.withPermits` instead of upstream's Effect 4.1 `Semaphore.takeScoped`; retain the current adapters and
@@ -91,7 +91,7 @@ Newest first. Each entry names the upstream range brought in.
   pinned `SqlClient.makeWithTransaction` masks `acquireConnection`. A separate bounded reserve-wait control cancels
   while the permit holder remains active and passes with both the original and fixed acquirers. Partially adapt the
   owner-only file behavior from `anomalyco/opencode#52150`
-  (`89d37a0f6de691979f65e52ba35913b5f0b957bf`, downstream `e8f93d1987b121c62ead692ba3274d9f03aa0116`) at the fork's
+  (`89d37a0f6de691979f65e52ba35913b5f0b957bf`, downstream `5c5df6c8e604452d87c823e4aee5cacb9a8b8f5b`; symlink/birth correction `9f7cc80702fee80e82dd811a35f9b8d16e97ae29`) at the fork's
   `Database.layerFromPath` boundary. `packages/core/src/database/file-permissions.ts` resolves final-component
   symlinks to the database path SQLite uses, exclusively creates missing files at mode 0600 before later tightening,
   and chmods existing database/WAL/SHM files without an open/close cycle. It supports dangling links by preparing
