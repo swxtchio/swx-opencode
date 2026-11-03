@@ -1,0 +1,43 @@
+{
+  "result": "passed",
+  "checks": {
+    "all_exit_statuses_zero": true,
+    "version_matches_selected_source": true,
+    "database_path_unchanged": true,
+    "installed_binary_hash_matches_candidate": true,
+    "installed_binary_is_linux_arm64_elf": true,
+    "installed_sidecar_hash_matches_candidate": true,
+    "installed_sidecar_is_arm64_elf": true,
+    "help_forms_satisfy_capture_gate": true
+  },
+  "help": {
+    "prune-help": {
+      "status": 0,
+      "defined": {
+        "--usage-capture-status": true,
+        "--usage-capture-session": true,
+        "--online": true,
+        "--reserve-bytes": true,
+        "--before": true
+      },
+      "before_optional": true,
+      "before_required": false
+    },
+    "prune-online-help": {
+      "status": 0,
+      "defined": {
+        "--usage-capture-status": true,
+        "--usage-capture-session": true,
+        "--online": true,
+        "--reserve-bytes": true,
+        "--before": true
+      },
+      "before_optional": true,
+      "before_required": false
+    }
+  },
+  "version": "1.18.32-swxtch.21b47f6d",
+  "database_path": "/home/byates/fm-llmrouter/data/opencode/opencode.db",
+  "binary_sha256": "cec507b89cb00d0ea752b784d4e61d3fb5e97f64b5699b3ac93350c9ab0b873d",
+  "sidecar_sha256": "0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42"
+}

@@ -1,0 +1,7 @@
+# Leased build command
+
+Local helper argv prefix: `/home/byates/fm-llmrouter/bin/fm-buildbox-build.sh --host vm14-001 --architecture arm64 --workdir /tmp -- bash -c`.
+
+The exact remote `bash -c` payload is retained in `build-helper-command.txt`. It creates its private `/tmp/fm-opencode-binary-refresh-385-*` root only after lease acquisition, fetches and checks the live `swxtch` full SHA, sets HOME/cache/TMPDIR/GOTMPDIR under that root, and runs `./local-release.sh` followed by the exact focused source-test command in `tests/`.
+
+Helper terminal status: `1`; lease terminal record: `released`; `local-release.sh` status: `1` at its private candidate database-path guard; focused source tests: status `0`, 19 pass. The generated build output, rather than the script's private target-copy step, was hash-checked, transferred, candidate-accepted, and installed. `operation-log.txt` explains the XDG/`OPENCODE_DB` mismatch; no second helper invocation or unleased build was run.

@@ -1,0 +1,12 @@
+build_host=vm14-001
+build_machine=aarch64
+selected_architecture=arm64
+source_ref=refs/heads/swxtch
+source_sha=21b47f6db3ce1f48ccca6a2aba153bd0405be585
+workdir=/tmp
+task_root=/tmp/fm-opencode-binary-refresh-385-B6FLc6Dc
+fetched_sha=21b47f6db3ce1f48ccca6a2aba153bd0405be585
+selected_sha=21b47f6db3ce1f48ccca6a2aba153bd0405be585
+bun_version=1.4.2
+package_version=1.18.32
+expected_release=1.18.32-swxtch.21b47f6d

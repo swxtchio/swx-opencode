@@ -1,0 +1,1 @@
+cd /tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/opencode && bun test test/cli/db/prune.test.ts -t 'capture is|capture that covers|fully confirmed capture scope|invalid captured Session ID|db retire requires complete caller capture confirmation|online reclaim-only remains available'

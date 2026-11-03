@@ -1,0 +1,2 @@
+21b47f6db3ce1f48ccca6a2aba153bd0405be585
+feat(opencode): gate pruning on usage capture (#384)

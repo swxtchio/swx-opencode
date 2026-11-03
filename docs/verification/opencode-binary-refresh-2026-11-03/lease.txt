@@ -1,0 +1,8 @@
+# Build-box lease evidence
+
+- The single helper invocation was `/home/byates/fm-llmrouter/bin/fm-buildbox-build.sh --host vm14-001 --architecture arm64 --workdir /tmp -- bash -c <task payload>`; it reported `acquired host=vm14-001 architecture=arm64`.
+- The acquisition record is retained at `/home/byates/vm14-leases/.released.6d5f364c94db45ac.931333/lease.json`; task identity `adhoc-build-2350202-12793`, host `vm14-001`, architecture `arm64`, acquired at `2026-11-03T15:31:43Z`. SHA-256: `0690b2f5b89a3be50d5717d43bca27a0140372fb579078dea2399e61ef1810b4`.
+- The matching terminal record is `/home/byates/vm14-leases/.released.6d5f364c94db45ac.931333/release.json`; event `released`, event ID `6d5f364c94db45acb5e0b372407e17c35eb4f2c4dd1e0d460f035d2819e491e5`, cause `ad-hoc-build-cleanup`, released at `2026-11-03T15:32:52Z`. SHA-256: `f01c828375313f4eef5e2e3f514346cda8975e16321583e22169214bad62c198`.
+- The recorded request was `ad-hoc-build host=vm14-001 architecture=arm64 workdir=/tmp`; both holder and suite hosts were `vm14-001`, and the matching transient scope was `fm-buildbox-build-adhoc-build-2350202-12793-adhoc-2350202-30314.scope`.
+- The terminal record's holder identity matches the acquired `lease.json` generation field by field. Both immutable records remain in the helper-owned `.released.*` directory; no lease-root file was edited or removed by this task.
+- Lease release succeeded. The helper/payload terminal status was `1`, separately, because `local-release.sh` aborted its candidate database-path guard; the source build output was then validated and transferred, and the focused regressions passed. See `build/` and `tests/` for complete stdout, stderr and status files.

@@ -1,0 +1,26 @@
+{
+  "captured_utc": "2026-11-03T15:40:49.028783+00:00",
+  "hostname": "vm001",
+  "machine": "aarch64",
+  "target": "/home/byates/.local/opencode-swxtch/bin/opencode",
+  "version": "1.18.32-swxtch.765d66be",
+  "version_status": 0,
+  "database_path": "/home/byates/fm-llmrouter/data/opencode/opencode.db",
+  "db_path_status": 0,
+  "sha256": "f2ee621cfe0b752c3cd18c4c8e9e0c80b3359d9ded26ffdcaf43da797d420748",
+  "size": 179161384,
+  "device": 64512,
+  "inode": 3153265,
+  "file_status": 0,
+  "file": "/home/byates/.local/opencode-swxtch/bin/opencode: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpreter /lib/ld-linux-aarch64.so.1, for GNU/Linux 3.7.0, BuildID[sha1]=ea562b973ecaa5f42a519deff871009a25e6b7d7, not stripped",
+  "sidecar_path": "/home/byates/.local/opencode-swxtch/bin/libfff_c-0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42.so",
+  "sidecar_sha256": "0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42",
+  "sidecar_size": 4919152,
+  "sidecar_device": 64512,
+  "sidecar_inode": 3210815,
+  "opencode_env": {
+    "OPENCODE_DB": "/home/byates/fm-llmrouter/data/opencode/opencode.db",
+    "OPENCODE_DB_PATH": null,
+    "XDG_DATA_HOME": null
+  }
+}

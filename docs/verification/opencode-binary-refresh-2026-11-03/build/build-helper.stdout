@@ -1,0 +1,13 @@
+ad-hoc build output tail (last 8192 bytes); full log: /tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/fm-buildbox-build-log.IZTVEl
+From https://github.com/swxtchio/swx-opencode
+ * branch            swxtch     -> FETCH_HEAD
+ * [new branch]      swxtch     -> origin/swxtch
+command=local-release status=1
+TASK_ROOT=/tmp/fm-opencode-binary-refresh-385-B6FLc6Dc
+SOURCE_SHA=21b47f6db3ce1f48ccca6a2aba153bd0405be585
+EXPECTED_VERSION=1.18.32-swxtch.21b47f6d
+BUILD_STATUS=1
+CANDIDATE_ACCEPTANCE_STATUS=not-run
+FOCUSED_TEST_STATUS=0
+payload_result=failed
+

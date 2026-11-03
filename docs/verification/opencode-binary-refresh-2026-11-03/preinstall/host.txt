@@ -1,0 +1,3 @@
+captured_utc=2026-11-03T15:23:38.671256+00:00
+hostname=vm001
+machine=aarch64

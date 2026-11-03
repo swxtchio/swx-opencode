@@ -1,0 +1,11 @@
+# Source and host evidence
+
+Evidence collected on 2026-11-03 UTC.
+
+- Repository: `swxtchio/swx-opencode`; `gh-axi repo view swxtchio/swx-opencode` reported default branch `swxtch`.
+- The live ref `refs/heads/swxtch` resolved through `git ls-remote origin refs/heads/swxtch` to `21b47f6db3ce1f48ccca6a2aba153bd0405be585` before build, after candidate validation, and at installed-state verification; every read returned the same full SHA.
+- The source commit is the #384 gate commit. The leased build checkout was detached at that full SHA, clean before and after build and focused tests, and its `packages/opencode/src/cli/cmd/db-prune.ts` declares both usage-capture options in `pruneOptions` and `--online` in `PruneCommand`.
+- Source-owned regressions are `packages/opencode/test/cli/db/prune.test.ts`; their fixture producer is `packages/opencode/test/fixture/prune-producer.ts`, which creates Session history through Session, queue and durable-event producers. `build/source-gate.txt` retains the checked option and test-name evidence.
+- Firstmate's caller is `/home/byates/fm-llmrouter/bin/fm-opencode-db-retention.sh`; `USAGE_CAPTURE_CAPABILITY` requires successful help and option-start definitions for both `--usage-capture-status` and `--usage-capture-session`, and distinguishes them from prose mentions.
+- Install host: local `hostname -s` returned `vm001`; `uname -m` returned `aarch64`. The executable selected before installation was `/home/byates/.local/opencode-swxtch/bin/opencode`; `type -P opencode` separately resolved `/home/byates/.bun/bin/opencode`.
+- Build host: `vm14-001`; the in-lease payload's `uname -m` returned `aarch64`. The source package version was `1.18.32`, its Bun pin was `1.4.2`, and the selected release identity was `1.18.32-swxtch.21b47f6d`.

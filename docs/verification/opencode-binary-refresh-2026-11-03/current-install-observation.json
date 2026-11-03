@@ -1,0 +1,51 @@
+{
+  "observed_utc": "2026-11-03T15:51:49.729288+00:00",
+  "version": "1.18.32-swxtch.21b47f6d",
+  "version_status": 0,
+  "database_path": "/home/byates/fm-llmrouter/data/opencode/opencode.db",
+  "db_path_status": 0,
+  "binary_sha256": "cec507b89cb00d0ea752b784d4e61d3fb5e97f64b5699b3ac93350c9ab0b873d",
+  "sidecar_sha256": "0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42",
+  "file": "/home/byates/.local/opencode-swxtch/bin/opencode: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpreter /lib/ld-linux-aarch64.so.1, for GNU/Linux 3.7.0, BuildID[sha1]=ea562b973ecaa5f42a519deff871009a25e6b7d7, not stripped",
+  "file_status": 0,
+  "sidecar_file": "/home/byates/.local/opencode-swxtch/bin/libfff_c-0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42.so: ELF 64-bit LSB shared object, ARM aarch64, version 1 (SYSV), dynamically linked, stripped",
+  "sidecar_file_status": 0,
+  "command_resolution": "/home/byates/.bun/bin/opencode",
+  "help": {
+    "verified-prune-help": {
+      "status": 0,
+      "flags": {
+        "--usage-capture-status": true,
+        "--usage-capture-session": true,
+        "--online": true,
+        "--reserve-bytes": true,
+        "--before": true
+      },
+      "before_optional": true,
+      "before_required": false
+    },
+    "verified-prune-online-help": {
+      "status": 0,
+      "flags": {
+        "--usage-capture-status": true,
+        "--usage-capture-session": true,
+        "--online": true,
+        "--reserve-bytes": true,
+        "--before": true
+      },
+      "before_optional": true,
+      "before_required": false
+    }
+  },
+  "backup_path": "/home/byates/.local/opencode-swxtch/bin/opencode.1.18.32-swxtch.765d66be.refresh-385-20261103T154122Z",
+  "backup_exists": true,
+  "backup_sha256": "f2ee621cfe0b752c3cd18c4c8e9e0c80b3359d9ded26ffdcaf43da797d420748",
+  "backup_version": "1.18.32-swxtch.765d66be",
+  "backup_version_status": 0,
+  "backup_database_path": "/home/byates/fm-llmrouter/data/opencode/opencode.db",
+  "backup_db_path_status": 0,
+  "live_source_sha": "21b47f6db3ce1f48ccca6a2aba153bd0405be585",
+  "live_source_status": 0,
+  "process_snapshot_after": "/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-process-after-install.json",
+  "processes_after": 68
+}

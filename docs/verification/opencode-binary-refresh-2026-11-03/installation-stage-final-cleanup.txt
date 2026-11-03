@@ -1,0 +1,8 @@
+target=/home/byates/.local/opencode-swxtch/bin/opencode
+target_sha256=cec507b89cb00d0ea752b784d4e61d3fb5e97f64b5699b3ac93350c9ab0b873d
+backup=/home/byates/.local/opencode-swxtch/bin/opencode.1.18.32-swxtch.765d66be.refresh-385-20261103T154122Z
+backup_sha256=f2ee621cfe0b752c3cd18c4c8e9e0c80b3359d9ded26ffdcaf43da797d420748
+stage_paths_read_back_absent=
+/home/byates/.local/opencode-swxtch/bin/opencode-refresh-385-stage-20261103T154122Z absent=1
+/home/byates/.local/opencode-swxtch/bin/opencode-refresh-385-stage-final-20261103T154839Z absent=1
+final-stage-absence-cause=unestablished; no deletion was issued after the path was observed absent

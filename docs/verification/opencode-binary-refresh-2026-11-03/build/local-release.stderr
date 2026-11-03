@@ -1,0 +1,28 @@
+Resolving dependencies
+Resolved, downloaded and extracted [20]
+
+$ bun run --cwd packages/core fix-node-pty
+$ bun run script/fix-node-pty.ts
+$ husky
+npm notice
+npm notice New major version of npm available! 10.9.9 -> 12.2.1
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v12.2.1
+npm notice To update run: npm install -g npm@12.2.1
+npm notice
+$ vite build
+[plugin vite:reporter] 
+(!) /tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/ui/src/theme/themes/oc-2.json is dynamically imported by /tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/ui/src/theme/context.tsx but also statically imported by /tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/ui/src/theme/context.tsx, /tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/ui/src/theme/default-themes.ts, dynamic import will not move module into another chunk.
+
+[plugin vite:reporter] 
+(!) /tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/app/src/components/dialog-select-model.tsx is dynamically imported by /tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/app/src/pages/session/use-composer-commands.tsx but also statically imported by /tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/app/src/components/prompt-input-v2.tsx, /tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/app/src/components/prompt-input.tsx, dynamic import will not move module into another chunk.
+
+[plugin vite:reporter] 
+(!) /tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/app/src/components/dialog-select-server.tsx is dynamically imported by /tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/app/src/components/status-popover-body.tsx, /tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/app/src/components/status-popover-body.tsx, /tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/app/src/pages/layout.tsx but also statically imported by /tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/app/src/components/settings-servers.tsx, /tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/app/src/components/settings-v2/dialog-server-v2.tsx, /tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/app/src/components/settings-v2/servers.tsx, /tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/app/src/pages/home/home-projects-controller.tsx, /tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/app/src/pages/home/legacy-home.tsx, dynamic import will not move module into another chunk.
+
+The emitted file "assets/wasm-CG6Dc4jp.js.map" overwrites a previously emitted file of the same name.
+
+(!) Some chunks are larger than 500 kB after minification. Consider:
+- Using dynamic import() to code-split the application
+- Use build.rollupOptions.output.manualChunks to improve chunking: https://rollupjs.org/configuration-options/#output-manualchunks
+- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.
+Built binary version or database path did not match; install aborted.

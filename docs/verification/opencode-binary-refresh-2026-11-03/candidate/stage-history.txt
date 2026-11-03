@@ -1,0 +1,10 @@
+initial_stage_path=/home/byates/.local/opencode-swxtch/bin/opencode-refresh-385-stage-20261103T154122Z
+initial_stage_used_for_accepted_replacement=1
+initial_stage_absent_after_acceptance=1
+post-install_preflight_using_initial_stage=refused-because-stage-was-absent; no replacement command issued
+later_stage_path=/home/byates/.local/opencode-swxtch/bin/opencode-refresh-385-stage-final-20261103T154839Z
+later_stage_recreated_from_verified_GOTMPDIR_transfer=1
+later_preflight_observed_installed_candidate_already_at_fleet_path=1
+later_stage_used_for_replacement=0
+later_stage_absent_readback=1
+later_stage_removal_cause=unestablished

@@ -1,0 +1,49 @@
+{
+  "result": "passed",
+  "version": "1.18.32-swxtch.21b47f6d",
+  "database": "/home/byates/fm-llmrouter/data/opencode/opencode.db",
+  "help": {
+    "prune-help": {
+      "status": 0,
+      "defined": {
+        "--usage-capture-status": true,
+        "--usage-capture-session": true,
+        "--online": true,
+        "--reserve-bytes": true,
+        "--before": true
+      },
+      "before_optional": true,
+      "before_required": false
+    },
+    "prune-online-help": {
+      "status": 0,
+      "defined": {
+        "--usage-capture-status": true,
+        "--usage-capture-session": true,
+        "--online": true,
+        "--reserve-bytes": true,
+        "--before": true
+      },
+      "before_optional": true,
+      "before_required": false
+    }
+  },
+  "artifacts": [
+    {
+      "path": "/home/byates/.local/opencode-swxtch/bin/opencode-refresh-385-stage-20261103T154122Z/opencode",
+      "sha256": "cec507b89cb00d0ea752b784d4e61d3fb5e97f64b5699b3ac93350c9ab0b873d",
+      "mode": "0o755",
+      "device": 64512,
+      "inode": 4652925,
+      "size": 179161384
+    },
+    {
+      "path": "/home/byates/.local/opencode-swxtch/bin/opencode-refresh-385-stage-20261103T154122Z/libfff_c-0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42.so",
+      "sha256": "0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42",
+      "mode": "0o644",
+      "device": 64512,
+      "inode": 4652926,
+      "size": 4919152
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+[
+  {
+    "path": "/tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/opencode/dist/opencode-linux-arm64/bin/opencode",
+    "bytes": 179161384,
+    "sha256": "cec507b89cb00d0ea752b784d4e61d3fb5e97f64b5699b3ac93350c9ab0b873d",
+    "file_status": 0,
+    "file_stdout": "/tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/opencode/dist/opencode-linux-arm64/bin/opencode: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpreter /lib/ld-linux-aarch64.so.1, for GNU/Linux 3.7.0, BuildID[sha1]=ea562b973ecaa5f42a519deff871009a25e6b7d7, not stripped\n",
+    "file_stderr": ""
+  },
+  {
+    "path": "/tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/opencode/dist/opencode-linux-arm64/bin/libfff_c-0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42.so",
+    "bytes": 4919152,
+    "sha256": "0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42",
+    "file_status": 0,
+    "file_stdout": "/tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/opencode/dist/opencode-linux-arm64/bin/libfff_c-0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42.so: ELF 64-bit LSB shared object, ARM aarch64, version 1 (SYSV), dynamically linked, stripped\n",
+    "file_stderr": ""
+  }
+]

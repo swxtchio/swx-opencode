@@ -1,0 +1,7 @@
+remote_task_root=/tmp/fm-opencode-binary-refresh-385-B6FLc6Dc
+source_sha=21b47f6db3ce1f48ccca6a2aba153bd0405be585
+expected_release=1.18.32-swxtch.21b47f6d
+build_status=1
+candidate_acceptance_status=not-run
+focused_test_status=0
+source_clean_after=1

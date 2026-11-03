@@ -1,0 +1,67 @@
+[
+  {
+    "name": "verified-version",
+    "argv": [
+      "/home/byates/.local/opencode-swxtch/bin/opencode",
+      "--version"
+    ],
+    "status": 0
+  },
+  {
+    "name": "verified-prune-help",
+    "argv": [
+      "/home/byates/.local/opencode-swxtch/bin/opencode",
+      "db",
+      "prune",
+      "--help"
+    ],
+    "status": 0
+  },
+  {
+    "name": "verified-prune-online-help",
+    "argv": [
+      "/home/byates/.local/opencode-swxtch/bin/opencode",
+      "db",
+      "prune",
+      "--online",
+      "--help"
+    ],
+    "status": 0
+  },
+  {
+    "name": "verified-db-path",
+    "argv": [
+      "/home/byates/.local/opencode-swxtch/bin/opencode",
+      "db",
+      "path"
+    ],
+    "status": 0
+  },
+  {
+    "name": "verified-file-L",
+    "argv": [
+      "file",
+      "-L",
+      "/home/byates/.local/opencode-swxtch/bin/opencode"
+    ],
+    "status": 0
+  },
+  {
+    "name": "verified-fff-file-L",
+    "argv": [
+      "file",
+      "-L",
+      "/home/byates/.local/opencode-swxtch/bin/libfff_c-0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42.so"
+    ],
+    "status": 0
+  },
+  {
+    "name": "verified-path-command-resolution",
+    "argv": [
+      "bash",
+      "-c",
+      "type -P opencode"
+    ],
+    "status": 0
+  }
+]
