@@ -1,0 +1,68 @@
+# Scratch cleanup evidence
+
+Remote scratch root `/tmp/fm-opencode-binary-refresh-385-B6FLc6Dc` was removed on `vm14-001`; `build/remote-cleanup.stdout` records the exact-path absence readback after verifying its task marker, source SHA, and clean checkout.
+Local installation staging `/home/byates/.local/opencode-swxtch/bin/opencode-refresh-385-stage-20261103T154122Z` was absent after the accepted replacement; `installation-stage-cleanup.txt` records that readback.
+Later task staging `/home/byates/.local/opencode-swxtch/bin/opencode-refresh-385-stage-final-20261103T154839Z` was also absent at readback; `installation-stage-final-cleanup.txt` records that the path was not present when the later cleanup check ran, with removal cause unestablished.
+The verified recovery executable `/home/byates/.local/opencode-swxtch/bin/opencode.1.18.32-swxtch.765d66be.refresh-385-20261103T154122Z` and its companion library `/home/byates/.local/opencode-swxtch/bin/libfff_c-0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42.so` were preserved; backup SHA-256 `f2ee621cfe0b752c3cd18c4c8e9e0c80b3359d9ded26ffdcaf43da797d420748` and installed SHA-256 `cec507b89cb00d0ea752b784d4e61d3fb5e97f64b5699b3ac93350c9ab0b873d`.
+Local managed GOTMPDIR root `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp` was retained. The following 55 task-prefixed files and transport staging entries were removed after their durable evidence was copied into this verification directory:
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/fm-buildbox-build-log.IZTVEl` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-build-helper.command.json` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-build-helper.completed-at` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-build-helper.pid` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-build-helper.status` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-build-helper.stderr` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-build-helper.stdout` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-build-output-manifest.json` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-build-output-manifest.status` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-build-output-manifest.stderr` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-candidate-unavailable.txt` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-diagnostic-db-path.status` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-diagnostic-db-path.stderr` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-diagnostic-db-path.stdout` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-diagnostic-version.status` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-diagnostic-version.stderr` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-diagnostic-version.stdout` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-focused-test-cleanup.txt` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-focused-test-command.txt` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-focused-tests.status` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-focused-tests.stderr` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-focused-tests.stdout` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-host-source.txt` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-lease-acquisition.json` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-lease-release.json` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-lease-summary.json` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-local-release.status` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-local-release.stderr` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-local-release.stdout` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-payload-summary.txt` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-process-after-install.json` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-process-before-install.json` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-process-before.json` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-remote-build-command.txt` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-remote-cleanup.status` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-remote-cleanup.stderr` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-remote-cleanup.stdout` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-remote-focused-test-cleanup.txt` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-remote-focused-test-command.txt` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-remote-host-source.txt` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-remote-manifest.txt` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-remote-source-gate.txt` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-remote-source-status-after-build.txt` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-remote-source-status-after-tests.txt` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-remote-source-status-before.txt` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-remote-task-root.txt` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-remote-test-runtime.txt` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-source-commit.txt` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-source-gate.txt` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-source-selection.json` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-source-status-after-build.txt` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-source-status-after-tests-repeat.txt` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-source-status-after-tests.txt` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-source-status-before.txt` absent readback: 1
+- `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-transfer-9u7j5t7p` absent readback: 1
+Final installed executable still exists with SHA-256 `cec507b89cb00d0ea752b784d4e61d3fb5e97f64b5699b3ac93350c9ab0b873d`; the matching installed sidecar exists with SHA-256 `0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42`.
+The retained `.released.*` lease records remain under `/home/byates/vm14-leases`; lease release verification is separate from scratch cleanup.
+
+Replacement and restore temporary paths were absent on readback: `/home/byates/.local/opencode-swxtch/bin/.opencode.refresh-385-20261103T154122Z.new` and `/home/byates/.local/opencode-swxtch/bin/.opencode.restore-385-20261103T154122Z.new`. The sidecar publish temporary path and both task staging directories were also absent.
+
+The retained lease record hashes were re-read on `vm14-001`: `lease.json` `0690b2f5b89a3be50d5717d43bca27a0140372fb579078dea2399e61ef1810b4`; `release.json` `f01c828375313f4eef5e2e3f514346cda8975e16321583e22169214bad62c198`.

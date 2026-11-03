@@ -1,0 +1,11 @@
+packages/opencode/src/cli/cmd/db-prune.ts:284:.option("usage-capture-status", {
+packages/opencode/src/cli/cmd/db-prune.ts:290:.option("usage-capture-session", {
+test-present="capture is "
+test-present=capture that covers only part of a multi-Session scope
+test-present=fully confirmed capture scope
+test-present=invalid captured Session ID
+test-present=db retire requires complete caller capture confirmation
+test-present=online reclaim-only remains available without capture confirmation
+fixture-producer=packages/opencode/test/fixture/prune-producer.ts uses Session create and durable event producers
+checkout-head=21b47f6db3ce1f48ccca6a2aba153bd0405be585
+landed-capture-gate=verified

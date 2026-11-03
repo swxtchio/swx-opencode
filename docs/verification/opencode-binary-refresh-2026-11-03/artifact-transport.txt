@@ -1,0 +1,9 @@
+# Artifact transport evidence
+
+- The native ARM64 build output was `/tmp/fm-opencode-binary-refresh-385-B6FLc6Dc/source/packages/opencode/dist/opencode-linux-arm64/bin/opencode`, SHA-256 `cec507b89cb00d0ea752b784d4e61d3fb5e97f64b5699b3ac93350c9ab0b873d`, size 179161384 bytes; `file -L` identified Linux ELF 64-bit ARM aarch64.
+- Its matching build output sidecar was `libfff_c-0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42.so`, SHA-256 `0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42`, size 4919152 bytes; `file -L` identified an ARM aarch64 ELF shared object.
+- The executable and sidecar were transferred from `vm14-001` into `/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-transfer-9u7j5t7p/`; both SHA-256 values matched the build output manifest.
+- Candidate acceptance from the transfer directory reported `1.18.32-swxtch.21b47f6d`, the pre-install database path `/home/byates/fm-llmrouter/data/opencode/opencode.db`, successful prune help in both forms, both usage-capture definitions, `--online`, `--reserve-bytes`, and optional `--before` without a required marker.
+- The candidate was staged at `/home/byates/.local/opencode-swxtch/bin/opencode-refresh-385-stage-20261103T154122Z/`; its executable and sidecar hashes matched both build output and GOTMPDIR transfer staging. The executable and sidecar at the installed paths retain those same hashes.
+- The installed sidecar was already present with the exact candidate hash, so its bytes were retained. The previous executable and its required sidecar remain recoverable at the versioned backup path and the existing content-addressed sidecar path.
+- `build-output-manifest.json`, `candidate/artifacts.json`, `candidate/acceptance.json`, `candidate/install-stage/`, `candidate/install-stage-final/`, `installation.json`, and `postinstall/` retain the per-stage identities and CLI evidence.

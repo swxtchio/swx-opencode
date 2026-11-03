@@ -1,0 +1,7 @@
+{
+  "path": "/tmp/fm-opencode-binary-refresh-385-B6FLc6Dc",
+  "source_sha": "21b47f6db3ce1f48ccca6a2aba153bd0405be585",
+  "source_clean_before_cleanup": true,
+  "removed": true,
+  "absent_after_readback": true
+}

@@ -1,0 +1,27 @@
+
+test/cli/db/prune.test.ts:
+(pass) offline apply preserves every Session history row when capture is absent [1438.16ms]
+(pass) offline apply preserves every Session history row when capture is unavailable [631.55ms]
+(pass) offline apply preserves every Session history row when capture is failed [581.90ms]
+(pass) offline apply preserves every Session history row when capture is partial [570.98ms]
+(pass) offline apply preserves every Session history row when capture is unknown [560.07ms]
+(pass) offline apply preserves every Session history row when capture is unrecognized [571.69ms]
+(pass) offline apply refuses confirmed capture that covers only part of a multi-Session scope [1198.01ms]
+(pass) offline apply deletes a fully confirmed capture scope and preserves unrelated history [802.81ms]
+(pass) online apply preserves every Session history row when capture is absent [626.67ms]
+(pass) online apply preserves every Session history row when capture is unavailable [597.68ms]
+(pass) online apply preserves every Session history row when capture is failed [588.86ms]
+(pass) online apply preserves every Session history row when capture is partial [597.24ms]
+(pass) online apply preserves every Session history row when capture is unknown [589.83ms]
+(pass) online apply preserves every Session history row when capture is unrecognized [596.44ms]
+(pass) online apply refuses confirmed capture that covers only part of a multi-Session scope [647.72ms]
+(pass) online apply deletes a fully confirmed capture scope and preserves unrelated history [802.83ms]
+(pass) offline apply refuses an invalid captured Session ID without changing rows [1194.77ms]
+(pass) db retire requires complete caller capture confirmation and leaves inventory ungated [2345.02ms]
+(pass) online reclaim-only remains available without capture confirmation and deletes no Session history [583.88ms]
+
+ 19 pass
+ 83 filtered out
+ 0 fail
+ 100 expect() calls
+Ran 19 tests across 1 file. [16.52s]

@@ -1,0 +1,221 @@
+helper=/home/byates/fm-llmrouter/bin/fm-buildbox-build.sh
+helper_arguments=--host vm14-001 --architecture arm64 --workdir /tmp -- bash -c
+remote_command=bash -c <payload below>
+
+--- exact remote payload ---
+set -euo pipefail
+umask 077
+test -d /tmp && test ! -L /tmp || { printf 'remote workdir /tmp is not a real directory\n' >&2; exit 20; }
+TASK_ROOT=$(mktemp -d /tmp/fm-opencode-binary-refresh-385-XXXXXXXX)
+chmod 700 "$TASK_ROOT"
+SOURCE="$TASK_ROOT/source"
+EVIDENCE="$TASK_ROOT/evidence"
+CANDIDATE_DIR="$TASK_ROOT/candidate/bin"
+mkdir -p "$EVIDENCE" "$CANDIDATE_DIR" "$TASK_ROOT/home" "$TASK_ROOT/cache" "$TASK_ROOT/config" "$TASK_ROOT/data" "$TASK_ROOT/tmp" "$TASK_ROOT/npm-cache" "$TASK_ROOT/bun-cache" "$TASK_ROOT/cargo-home" "$TASK_ROOT/rustup-home" "$TASK_ROOT/test-scratch" "$TASK_ROOT/bin"
+printf '%s\n' "$TASK_ROOT" > "$TASK_ROOT/task-root.txt"
+BUILD_HOST=$(hostname -s)
+BUILD_ARCH=$(uname -m)
+printf 'build_host=%s\nbuild_machine=%s\nselected_architecture=arm64\nsource_ref=refs/heads/swxtch\nsource_sha=%s\nworkdir=/tmp\ntask_root=%s\n' "$BUILD_HOST" "$BUILD_ARCH" '21b47f6db3ce1f48ccca6a2aba153bd0405be585' "$TASK_ROOT" > "$EVIDENCE/host-source.txt"
+case "$BUILD_ARCH" in aarch64|arm64) ;; *) printf 'wrong build architecture: %s\n' "$BUILD_ARCH" >&2; exit 21 ;; esac
+export HOME="$TASK_ROOT/home"
+export XDG_CACHE_HOME="$TASK_ROOT/cache"
+export XDG_CONFIG_HOME="$TASK_ROOT/config"
+export XDG_DATA_HOME="$TASK_ROOT/data"
+export XDG_STATE_HOME="$TASK_ROOT/state"
+export XDG_RUNTIME_DIR="$TASK_ROOT/run"
+export TMPDIR="$TASK_ROOT/tmp"
+export BUN_TMPDIR="$TASK_ROOT/tmp"
+export BUN_INSTALL_CACHE="$TASK_ROOT/bun-cache"
+export NPM_CONFIG_CACHE="$TASK_ROOT/npm-cache"
+export npm_config_cache="$TASK_ROOT/npm-cache"
+export CARGO_HOME="$TASK_ROOT/cargo-home"
+export RUSTUP_HOME="$TASK_ROOT/rustup-home"
+export GOTMPDIR="$TASK_ROOT/test-scratch"
+export PATH="$TASK_ROOT/bin:/usr/bin:/bin"
+mkdir -p "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+export OPENCODE_LOCAL_BIN="$CANDIDATE_DIR/opencode"
+export OPENCODE_DB_PATH="$TASK_ROOT/data/opencode.db"
+SOURCE_SHA='21b47f6db3ce1f48ccca6a2aba153bd0405be585'
+SOURCE_URL='https://github.com/swxtchio/swx-opencode.git'
+mkdir "$SOURCE"
+git -C "$SOURCE" init --quiet
+git -C "$SOURCE" remote add origin "$SOURCE_URL"
+git -C "$SOURCE" fetch --no-tags --depth=1 origin refs/heads/swxtch
+FETCHED_SHA=$(git -C "$SOURCE" rev-parse FETCH_HEAD)
+printf 'fetched_sha=%s\nselected_sha=%s\n' "$FETCHED_SHA" "$SOURCE_SHA" >> "$EVIDENCE/host-source.txt"
+if [ "$FETCHED_SHA" != "$SOURCE_SHA" ]; then
+  printf 'source advanced between selection and leased fetch; refusing stale build\n' >&2
+  exit 42
+fi
+git -C "$SOURCE" checkout --quiet --detach "$SOURCE_SHA"
+HEAD_SHA=$(git -C "$SOURCE" rev-parse HEAD)
+[ "$HEAD_SHA" = "$SOURCE_SHA" ] || { printf 'source checkout HEAD mismatch\n' >&2; exit 43; }
+git -C "$SOURCE" status --porcelain > "$EVIDENCE/source-status-before.txt"
+[ ! -s "$EVIDENCE/source-status-before.txt" ] || { printf 'source checkout is not clean before build\n' >&2; exit 44; }
+git -C "$SOURCE" show -s --format='%H%n%s' HEAD > "$EVIDENCE/source-commit.txt"
+python3 - "$SOURCE" "$SOURCE_SHA" > "$EVIDENCE/source-gate.txt" <<'SOURCECHECK'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+sha = sys.argv[2]
+prune_path = root / 'packages/opencode/src/cli/cmd/db-prune.ts'
+test_path = root / 'packages/opencode/test/cli/db/prune.test.ts'
+fixture_path = root / 'packages/opencode/test/fixture/prune-producer.ts'
+prune = prune_path.read_text(encoding='utf-8').splitlines()
+tests = test_path.read_text(encoding='utf-8')
+fixture = fixture_path.read_text(encoding='utf-8')
+needles = ['.option("usage-capture-status", {', '.option("usage-capture-session", {']
+for needle in needles:
+    matches = [(index + 1, line.strip()) for index, line in enumerate(prune) if needle in line]
+    if not matches:
+        raise SystemExit(f'missing landed producer option: {needle}')
+    for line, text in matches:
+        print(f'{prune_path.relative_to(root)}:{line}:{text}')
+required_tests = [
+    'capture is ', 'capture that covers only part of a multi-Session scope',
+    'fully confirmed capture scope', 'invalid captured Session ID',
+    'db retire requires complete caller capture confirmation',
+    'online reclaim-only remains available without capture confirmation',
+]
+for needle in required_tests:
+    if needle not in tests:
+        raise SystemExit(f'missing focused regression name: {needle}')
+    print(f'test-present={needle}')
+if 'sessions.create({' not in fixture or 'events.publish(' not in fixture:
+    raise SystemExit('prune fixture producer path was not established')
+print(f'fixture-producer={fixture_path.relative_to(root)} uses Session create and durable event producers')
+print(f'checkout-head={sha}')
+print('landed-capture-gate=verified')
+SOURCECHECK
+cd "$SOURCE"
+BUN_VERSION=$(node -p 'require("./package.json").packageManager.split("@")[1]')
+PACKAGE_VERSION=$(node -p 'require("./packages/opencode/package.json").version')
+EXPECTED_VERSION="$PACKAGE_VERSION-swxtch.${SOURCE_SHA:0:8}"
+printf 'bun_version=%s\npackage_version=%s\nexpected_release=%s\n' "$BUN_VERSION" "$PACKAGE_VERSION" "$EXPECTED_VERSION" >> "$EVIDENCE/host-source.txt"
+FAIL=0
+capture() {
+  local name=$1
+  shift
+  local status=0
+  if "$@" > "$EVIDENCE/$name.stdout" 2> "$EVIDENCE/$name.stderr"; then status=0; else status=$?; fi
+  printf '%s\n' "$status" > "$EVIDENCE/$name.status"
+  printf 'command=%s status=%s\n' "$name" "$status"
+  return 0
+}
+printf '%s\n' './local-release.sh' > "$EVIDENCE/build-command.txt"
+capture local-release ./local-release.sh
+read -r BUILD_STATUS < "$EVIDENCE/local-release.status"
+[ "$BUILD_STATUS" -eq 0 ] || FAIL=1
+git -C "$SOURCE" status --porcelain > "$EVIDENCE/source-status-after-build.txt"
+if [ -s "$EVIDENCE/source-status-after-build.txt" ]; then FAIL=1; fi
+BUILD_DIR="$SOURCE/packages/opencode/dist/opencode-linux-arm64/bin"
+BUILD_BIN="$BUILD_DIR/opencode"
+shopt -s nullglob
+BUILD_LIBS=("$BUILD_DIR"/libfff_c-*.so)
+CANDIDATE_LIBS=("$CANDIDATE_DIR"/libfff_c-*.so)
+if [ -x "$BUILD_BIN" ] && [ -x "$OPENCODE_LOCAL_BIN" ] && [ "${#BUILD_LIBS[@]}" -eq 1 ] && [ "${#CANDIDATE_LIBS[@]}" -eq 1 ]; then
+  BUILD_LIB=${BUILD_LIBS[0]}
+  CANDIDATE_LIB=${CANDIDATE_LIBS[0]}
+  printf '%s\n' "$BUILD_BIN" "$OPENCODE_LOCAL_BIN" "$BUILD_LIB" "$CANDIDATE_LIB" > "$EVIDENCE/artifact-paths.txt"
+  sha256sum "$BUILD_BIN" "$OPENCODE_LOCAL_BIN" "$BUILD_LIB" "$CANDIDATE_LIB" > "$EVIDENCE/build-and-candidate.sha256"
+  if ! cmp -s "$BUILD_BIN" "$OPENCODE_LOCAL_BIN" || ! cmp -s "$BUILD_LIB" "$CANDIDATE_LIB"; then FAIL=1; fi
+  capture candidate-version "$OPENCODE_LOCAL_BIN" --version
+  capture candidate-prune-help "$OPENCODE_LOCAL_BIN" db prune --help
+  capture candidate-prune-online-help "$OPENCODE_LOCAL_BIN" db prune --online --help
+  capture candidate-db-path "$OPENCODE_LOCAL_BIN" db path
+  capture candidate-file-L file -L "$OPENCODE_LOCAL_BIN"
+  capture candidate-lib-file-L file -L "$CANDIDATE_LIB"
+  python3 - "$EVIDENCE" "$EXPECTED_VERSION" "$OPENCODE_DB_PATH" "$CANDIDATE_LIB" > "$EVIDENCE/candidate-acceptance.json" 2> "$EVIDENCE/candidate-acceptance.stderr" <<'CANDIDATECHECK'
+from pathlib import Path
+import json
+import re
+import sys
+root = Path(sys.argv[1])
+expected_version = sys.argv[2]
+expected_db = sys.argv[3]
+sidecar = sys.argv[4]
+def read(name):
+    return (root / f'{name}.stdout').read_text(encoding='utf-8', errors='replace'), (root / f'{name}.stderr').read_text(encoding='utf-8', errors='replace')
+def status(name):
+    return int((root / f'{name}.status').read_text(encoding='ascii').strip())
+version = read('candidate-version')[0].strip()
+database = read('candidate-db-path')[0].strip()
+help_records = {}
+for name in ('candidate-prune-help', 'candidate-prune-online-help'):
+    stdout, stderr = read(name)
+    text = stdout + stderr
+    defined = {flag: bool(re.search(r'(?m)^[ \t]*' + re.escape(flag) + r'([ \t,]|$)', text)) for flag in ('--usage-capture-status', '--usage-capture-session', '--online', '--reserve-bytes', '--before')}
+    before_lines = text.splitlines()
+    before_block = []
+    collecting = False
+    for line in before_lines:
+        if re.match(r'^[ \t]+--before([ \t,]|$)', line):
+            collecting = True
+        elif collecting and re.match(r'^[ \t]+--[A-Za-z0-9][A-Za-z0-9-]*([ \t,]|$)', line):
+            break
+        if collecting:
+            before_block.append(line)
+    block = '\n'.join(before_block)
+    help_records[name] = {
+        'status': status(name), 'defined': defined,
+        'before_optional': bool(re.search(r'(?i)(^|[ \t])optional([ \t]|$)', block)),
+        'before_required': '[required]' in block,
+    }
+    if status(name) != 0 or not all(defined.values()) or not help_records[name]['before_optional'] or help_records[name]['before_required']:
+        raise SystemExit(f'{name} does not meet the caller capture/online/cutoff help contract: {help_records[name]}')
+if status('candidate-version') != 0 or version != expected_version:
+    raise SystemExit(f'candidate release identity mismatch: {version!r} != {expected_version!r}')
+if status('candidate-db-path') != 0 or database != expected_db:
+    raise SystemExit(f'candidate database path mismatch: {database!r} != {expected_db!r}')
+file_text = read('candidate-file-L')[0]
+if status('candidate-file-L') != 0 or 'ELF 64-bit' not in file_text or 'ARM aarch64' not in file_text:
+    raise SystemExit('candidate is not a Linux ARM aarch64 ELF executable')
+lib_text = read('candidate-lib-file-L')[0]
+if status('candidate-lib-file-L') != 0 or 'ELF 64-bit' not in lib_text or 'ARM aarch64' not in lib_text:
+    raise SystemExit('candidate FFF companion is not an ARM aarch64 ELF shared object')
+print(json.dumps({'result': 'passed', 'version': version, 'database': database, 'help': help_records, 'candidate_file': file_text.strip(), 'sidecar_file': lib_text.strip()}, indent=2))
+CANDIDATECHECK
+  CANDIDATE_ACCEPTANCE_STATUS=$?
+  printf '%s\n' "$CANDIDATE_ACCEPTANCE_STATUS" > "$EVIDENCE/candidate-acceptance.status"
+  [ "$CANDIDATE_ACCEPTANCE_STATUS" -eq 0 ] || FAIL=1
+else
+  printf 'required build or candidate artifact missing; build_status=%s build_lib_count=%s candidate_lib_count=%s\n' "$BUILD_STATUS" "${#BUILD_LIBS[@]}" "${#CANDIDATE_LIBS[@]}" > "$EVIDENCE/candidate-unavailable.txt"
+  FAIL=1
+fi
+SYSTEM_BUN_VERSION=$(/usr/local/bin/bun --version 2>/dev/null || true)
+PINNED_BUN=
+if [ "$SYSTEM_BUN_VERSION" = "$BUN_VERSION" ]; then
+  PINNED_BUN=/usr/local/bin/bun
+else
+  if npx --yes --package="bun@$BUN_VERSION" -- sh -c 'command -v bun' > "$EVIDENCE/pinned-bun-path.stdout" 2> "$EVIDENCE/pinned-bun-path.stderr"; then
+    PINNED_BUN=$(<"$EVIDENCE/pinned-bun-path.stdout")
+  fi
+fi
+printf 'system_bun_version=%s\npinned_bun_path=%s\n' "$SYSTEM_BUN_VERSION" "$PINNED_BUN" > "$EVIDENCE/test-runtime.txt"
+if [ -n "$PINNED_BUN" ] && [ -x "$PINNED_BUN" ] && [ "$("$PINNED_BUN" --version)" = "$BUN_VERSION" ]; then
+  ln -s "$PINNED_BUN" "$TASK_ROOT/bin/bun"
+  printf '%s\n' "cd $SOURCE/packages/opencode && bun test test/cli/db/prune.test.ts -t 'capture is|capture that covers|fully confirmed capture scope|invalid captured Session ID|db retire requires complete caller capture confirmation|online reclaim-only remains available'" > "$EVIDENCE/focused-test-command.txt"
+  if (cd "$SOURCE/packages/opencode" && bun test test/cli/db/prune.test.ts -t 'capture is|capture that covers|fully confirmed capture scope|invalid captured Session ID|db retire requires complete caller capture confirmation|online reclaim-only remains available') > "$EVIDENCE/focused-tests.stdout" 2> "$EVIDENCE/focused-tests.stderr"; then TEST_STATUS=0; else TEST_STATUS=$?; fi
+  printf '%s\n' "$TEST_STATUS" > "$EVIDENCE/focused-tests.status"
+  [ "$TEST_STATUS" -eq 0 ] || FAIL=1
+else
+  printf 'pinned Bun executable unavailable or version mismatched\n' > "$EVIDENCE/focused-tests.stderr"
+  : > "$EVIDENCE/focused-tests.stdout"
+  printf 'not-run\n' > "$EVIDENCE/focused-tests.status"
+  FAIL=1
+fi
+if [ -e "$GOTMPDIR/opencode-commanded-prune-tests" ]; then
+  printf 'focused_test_scratch_absent=0\n' > "$EVIDENCE/focused-test-cleanup.txt"
+  FAIL=1
+else
+  printf 'focused_test_scratch_absent=1\n' > "$EVIDENCE/focused-test-cleanup.txt"
+fi
+SOURCE_STATUS=$(git -C "$SOURCE" status --porcelain)
+printf '%s\n' "$SOURCE_STATUS" > "$EVIDENCE/source-status-after-tests.txt"
+if [ -n "$SOURCE_STATUS" ]; then FAIL=1; fi
+printf 'task_root=%s\nsource_sha=%s\ncandidate=%s\n' "$TASK_ROOT" "$SOURCE_SHA" "$OPENCODE_LOCAL_BIN" > "$TASK_ROOT/manifest.txt"
+printf 'remote_task_root=%s\nsource_sha=%s\nexpected_release=%s\nbuild_status=%s\ncandidate_acceptance_status=%s\nfocused_test_status=%s\nsource_clean_after=%s\n' "$TASK_ROOT" "$SOURCE_SHA" "$EXPECTED_VERSION" "$BUILD_STATUS" "${CANDIDATE_ACCEPTANCE_STATUS:-not-run}" "${TEST_STATUS:-not-run}" "$([ -z "$SOURCE_STATUS" ] && printf 1 || printf 0)" > "$EVIDENCE/payload-summary.txt"
+printf 'TASK_ROOT=%s\nSOURCE_SHA=%s\nEXPECTED_VERSION=%s\nBUILD_STATUS=%s\nCANDIDATE_ACCEPTANCE_STATUS=%s\nFOCUSED_TEST_STATUS=%s\n' "$TASK_ROOT" "$SOURCE_SHA" "$EXPECTED_VERSION" "$BUILD_STATUS" "${CANDIDATE_ACCEPTANCE_STATUS:-not-run}" "${TEST_STATUS:-not-run}"
+if [ "$FAIL" -ne 0 ]; then printf 'payload_result=failed\n' >&2; exit 1; fi
+printf 'payload_result=passed\n'

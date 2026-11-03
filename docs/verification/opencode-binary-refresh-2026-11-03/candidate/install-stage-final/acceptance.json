@@ -1,0 +1,37 @@
+{
+  "result": "passed",
+  "checks": {
+    "all_candidate_commands_succeeded": true,
+    "version_matches_selected_source": true,
+    "database_path_matches_preinstall": true,
+    "executable_and_sidecar_hashes_match_transfer": true,
+    "help_contract_passes_both_forms": true,
+    "executable_and_sidecar_are_arm64_elf": true
+  },
+  "help": {
+    "prune-help": {
+      "status": 0,
+      "defined": {
+        "--usage-capture-status": true,
+        "--usage-capture-session": true,
+        "--online": true,
+        "--reserve-bytes": true,
+        "--before": true
+      },
+      "before_optional": true,
+      "before_required": false
+    },
+    "prune-online-help": {
+      "status": 0,
+      "defined": {
+        "--usage-capture-status": true,
+        "--usage-capture-session": true,
+        "--online": true,
+        "--reserve-bytes": true,
+        "--before": true
+      },
+      "before_optional": true,
+      "before_required": false
+    }
+  }
+}

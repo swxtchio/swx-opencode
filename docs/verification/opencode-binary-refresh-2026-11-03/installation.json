@@ -1,0 +1,111 @@
+{
+  "captured_utc": "2026-11-03T15:44:15.713358+00:00",
+  "hostname": "vm001",
+  "machine": "aarch64",
+  "source_sha": "21b47f6db3ce1f48ccca6a2aba153bd0405be585",
+  "live_source_sha_before_replacement": "21b47f6db3ce1f48ccca6a2aba153bd0405be585",
+  "target": "/home/byates/.local/opencode-swxtch/bin/opencode",
+  "predecessor": {
+    "hostname": "vm001",
+    "machine": "aarch64",
+    "version": "1.18.32-swxtch.765d66be",
+    "database_path": "/home/byates/fm-llmrouter/data/opencode/opencode.db",
+    "sha256": "f2ee621cfe0b752c3cd18c4c8e9e0c80b3359d9ded26ffdcaf43da797d420748",
+    "device": 64512,
+    "inode": 3153265,
+    "size": 179161384,
+    "file": "/home/byates/.local/opencode-swxtch/bin/opencode: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpreter /lib/ld-linux-aarch64.so.1, for GNU/Linux 3.7.0, BuildID[sha1]=ea562b973ecaa5f42a519deff871009a25e6b7d7, not stripped",
+    "sidecar_sha256": "0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42",
+    "live_source_sha": "21b47f6db3ce1f48ccca6a2aba153bd0405be585"
+  },
+  "backup": {
+    "path": "/home/byates/.local/opencode-swxtch/bin/opencode.1.18.32-swxtch.765d66be.refresh-385-20261103T154122Z",
+    "sha256": "f2ee621cfe0b752c3cd18c4c8e9e0c80b3359d9ded26ffdcaf43da797d420748",
+    "version": "1.18.32-swxtch.765d66be",
+    "database_path": "/home/byates/fm-llmrouter/data/opencode/opencode.db",
+    "file": "/home/byates/.local/opencode-swxtch/bin/opencode.1.18.32-swxtch.765d66be.refresh-385-20261103T154122Z: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpreter /lib/ld-linux-aarch64.so.1, for GNU/Linux 3.7.0, BuildID[sha1]=ea562b973ecaa5f42a519deff871009a25e6b7d7, not stripped",
+    "device": 64512,
+    "inode": 3209472
+  },
+  "sidecar_action": "existing-identical-retained",
+  "candidate": {
+    "stage": "/home/byates/.local/opencode-swxtch/bin/opencode-refresh-385-stage-20261103T154122Z/opencode",
+    "sha256": "cec507b89cb00d0ea752b784d4e61d3fb5e97f64b5699b3ac93350c9ab0b873d",
+    "sidecar": "/home/byates/.local/opencode-swxtch/bin/opencode-refresh-385-stage-20261103T154122Z/libfff_c-0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42.so",
+    "sidecar_sha256": "0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42"
+  },
+  "replacement_command": [
+    "mv",
+    "-f",
+    "--",
+    "/home/byates/.local/opencode-swxtch/bin/.opencode.refresh-385-20261103T154122Z.new",
+    "/home/byates/.local/opencode-swxtch/bin/opencode"
+  ],
+  "replacement_status": 0,
+  "installed": {
+    "path": "/home/byates/.local/opencode-swxtch/bin/opencode",
+    "sha256": "cec507b89cb00d0ea752b784d4e61d3fb5e97f64b5699b3ac93350c9ab0b873d",
+    "version": "1.18.32-swxtch.21b47f6d",
+    "database_path": "/home/byates/fm-llmrouter/data/opencode/opencode.db",
+    "device": 64512,
+    "inode": 3209473,
+    "size": 179161384
+  },
+  "acceptance": {
+    "result": "passed",
+    "checks": {
+      "all_exit_statuses_zero": true,
+      "version_matches_selected_source": true,
+      "database_path_unchanged": true,
+      "installed_binary_hash_matches_candidate": true,
+      "installed_binary_is_linux_arm64_elf": true,
+      "installed_sidecar_hash_matches_candidate": true,
+      "installed_sidecar_is_arm64_elf": true,
+      "help_forms_satisfy_capture_gate": true
+    },
+    "help": {
+      "prune-help": {
+        "status": 0,
+        "defined": {
+          "--usage-capture-status": true,
+          "--usage-capture-session": true,
+          "--online": true,
+          "--reserve-bytes": true,
+          "--before": true
+        },
+        "before_optional": true,
+        "before_required": false
+      },
+      "prune-online-help": {
+        "status": 0,
+        "defined": {
+          "--usage-capture-status": true,
+          "--usage-capture-session": true,
+          "--online": true,
+          "--reserve-bytes": true,
+          "--before": true
+        },
+        "before_optional": true,
+        "before_required": false
+      }
+    },
+    "version": "1.18.32-swxtch.21b47f6d",
+    "database_path": "/home/byates/fm-llmrouter/data/opencode/opencode.db",
+    "binary_sha256": "cec507b89cb00d0ea752b784d4e61d3fb5e97f64b5699b3ac93350c9ab0b873d",
+    "sidecar_sha256": "0459657eb78fc6a73a358105f2a6ed06aa9920b28bbe83f2d7ff7b72eae2be42"
+  },
+  "rollback": null,
+  "process_before_snapshot": "/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-process-before-install.json",
+  "process_before_count": 64,
+  "process_before_unreadable": 315,
+  "process_after_count_at_install": 64,
+  "process_after_unreadable_at_install": 315,
+  "process_after_install_snapshot_note": "The installation-time raw snapshot was overwritten by the later post-install verification scan; its recorded count is retained, and the later raw scan is referenced below.",
+  "process_after_snapshot": "/tmp/fm-opencode-binary-refresh-371.Vx0tMCqW/gotmp/opencode-binary-refresh-385-process-after-install.json",
+  "process_after_snapshot_captured_utc": "2026-11-03T15:51:49.729288+00:00",
+  "process_after_snapshot_sha256": "a4a319cdc2164f3018b0bc5aa3728d5d651c247abb79dd202eecb3e1356789d9",
+  "process_after_count": 68,
+  "process_after_unreadable": 330,
+  "process_after_vanished": 66,
+  "result": "installed-accepted"
+}

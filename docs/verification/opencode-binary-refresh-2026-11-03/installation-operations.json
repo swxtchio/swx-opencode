@@ -1,0 +1,88 @@
+[
+  {
+    "name": "version",
+    "argv": [
+      "/home/byates/.local/opencode-swxtch/bin/opencode",
+      "--version"
+    ],
+    "status": 0
+  },
+  {
+    "name": "db-path",
+    "argv": [
+      "/home/byates/.local/opencode-swxtch/bin/opencode",
+      "db",
+      "path"
+    ],
+    "status": 0
+  },
+  {
+    "name": "file-L",
+    "argv": [
+      "file",
+      "-L",
+      "/home/byates/.local/opencode-swxtch/bin/opencode"
+    ],
+    "status": 0
+  },
+  {
+    "name": "backup-copy",
+    "argv": [
+      "cp",
+      "-p",
+      "--",
+      "/home/byates/.local/opencode-swxtch/bin/opencode",
+      "/home/byates/.local/opencode-swxtch/bin/opencode.1.18.32-swxtch.765d66be.refresh-385-20261103T154122Z"
+    ],
+    "status": 0
+  },
+  {
+    "name": "backup-version",
+    "argv": [
+      "/home/byates/.local/opencode-swxtch/bin/opencode.1.18.32-swxtch.765d66be.refresh-385-20261103T154122Z",
+      "--version"
+    ],
+    "status": 0
+  },
+  {
+    "name": "backup-db-path",
+    "argv": [
+      "/home/byates/.local/opencode-swxtch/bin/opencode.1.18.32-swxtch.765d66be.refresh-385-20261103T154122Z",
+      "db",
+      "path"
+    ],
+    "status": 0
+  },
+  {
+    "name": "backup-file-L",
+    "argv": [
+      "file",
+      "-L",
+      "/home/byates/.local/opencode-swxtch/bin/opencode.1.18.32-swxtch.765d66be.refresh-385-20261103T154122Z"
+    ],
+    "status": 0
+  },
+  {
+    "name": "candidate-install-temp",
+    "argv": [
+      "install",
+      "-m",
+      "755",
+      "--",
+      "/home/byates/.local/opencode-swxtch/bin/opencode-refresh-385-stage-20261103T154122Z/opencode",
+      "/home/byates/.local/opencode-swxtch/bin/.opencode.refresh-385-20261103T154122Z.new"
+    ],
+    "status": 0
+  },
+  {
+    "name": "atomic-replacement",
+    "argv": [
+      "mv",
+      "-f",
+      "--",
+      "/home/byates/.local/opencode-swxtch/bin/.opencode.refresh-385-20261103T154122Z.new",
+      "/home/byates/.local/opencode-swxtch/bin/opencode"
+    ],
+    "status": 0
+  }
+]

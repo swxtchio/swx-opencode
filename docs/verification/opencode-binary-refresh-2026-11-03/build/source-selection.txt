@@ -1,0 +1,4 @@
+observed_utc=2026-11-03T15:31:40.967805+00:00
+ls_remote=21b47f6db3ce1f48ccca6a2aba153bd0405be585	refs/heads/swxtch
+selected_sha=21b47f6db3ce1f48ccca6a2aba153bd0405be585
+local_origin_swxtch=21b47f6db3ce1f48ccca6a2aba153bd0405be585

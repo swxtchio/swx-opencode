@@ -1,0 +1,17 @@
+{
+  "acquisition_file_sha256": "0690b2f5b89a3be50d5717d43bca27a0140372fb579078dea2399e61ef1810b4",
+  "release_file_sha256": "f01c828375313f4eef5e2e3f514346cda8975e16321583e22169214bad62c198",
+  "acquisition_task": "adhoc-build-2350202-12793",
+  "acquisition_home": "/home/byates/fm-llmrouter",
+  "build_host": "vm14-001",
+  "architecture": "arm64",
+  "acquired_at": "2026-11-03T15:31:43Z",
+  "release_event": "released",
+  "release_event_id": "6d5f364c94db45acb5e0b372407e17c35eb4f2c4dd1e0d460f035d2819e491e5",
+  "released_at": "2026-11-03T15:32:52Z",
+  "release_cause": "ad-hoc-build-cleanup",
+  "terminal_holder_matches_acquisition": true,
+  "release_history_path": "/home/byates/vm14-leases/.released.6d5f364c94db45ac.931333/release.json",
+  "helper_terminal_status": "1",
+  "payload_summary": null
+}

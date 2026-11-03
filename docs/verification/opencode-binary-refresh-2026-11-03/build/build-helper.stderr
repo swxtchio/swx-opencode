@@ -1,0 +1,3 @@
+fm-buildbox-build: acquired host=vm14-001 architecture=arm64
+released: holder identity matched home=/home/byates/fm-llmrouter task=adhoc-build-2350202-12793 history=/home/byates/vm14-leases/.released.6d5f364c94db45ac.931333/release.json
+fm-buildbox-build: released build-box lease for adhoc-build-2350202-12793 on vm14-001
