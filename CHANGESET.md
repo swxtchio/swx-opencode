@@ -86,17 +86,22 @@ Newest first. Each entry names the upstream range brought in.
   `packages/effect-sqlite-node/src/index.ts`. Use the fork's pinned Effect beta.83 with a Scope-owned child and
   `Semaphore.withPermits` instead of upstream's Effect 4.1 `Semaphore.takeScoped`; retain the current adapters and
   retry/transaction serialization, excluding the Effect upgrade, workerd adapter, generated API changes, and unrelated
-  compatibility edits. Adapt `packages/core/test/sqlite-busy.test.ts` to interrupt queued `reserve` and
-  `withTransaction` acquisitions on Bun, Core Node, and standalone Node, then run SQL on the same client.
-  Complete the assigned owner-only file behavior from `anomalyco/opencode#52150`
-  (`89d37a0f6de691979f65e52ba35913b5f0b957bf`, downstream `e8f93d1987b121c62ead692ba3274d9f03aa0116`) at the
-  fork's `Database.layerFromPath` boundary. `packages/core/src/database/file-permissions.ts` creates missing files
-  exclusively at mode 0600 and tightens existing database/WAL/SHM files before open without an open/close cycle;
-  in-memory paths stay filesystem-free and Windows continues to rely on inherited ACLs. Keep EventWriter registration,
-  fresh-store auto-vacuum ordering, and pure `db path` selection; exclude the donor's different `layer(options)` and
-  Global path-resolution API. Regressions in `packages/core/test/database.test.ts` cover fresh/existing SQLite-produced
-  database and sidecar modes, retained data, and a live same-process lock against an independent contender; the
-  explicit `--database` path is exercised through online prune in `packages/opencode/test/cli/db/prune.test.ts`.
+  compatibility edits. In `packages/core/test/sqlite-busy.test.ts`, the queued `reserve` handoff sweep is the
+  acquisition-interruption red/green proof; the queued `withTransaction` arm is a preservation control because the
+  pinned `SqlClient.makeWithTransaction` masks `acquireConnection`. A separate bounded reserve-wait control cancels
+  while the permit holder remains active and passes with both the original and fixed acquirers. Partially adapt the
+  owner-only file behavior from `anomalyco/opencode#52150`
+  (`89d37a0f6de691979f65e52ba35913b5f0b957bf`, downstream `e8f93d1987b121c62ead692ba3274d9f03aa0116`) at the fork's
+  `Database.layerFromPath` boundary. `packages/core/src/database/file-permissions.ts` resolves final-component
+  symlinks to the database path SQLite uses, exclusively creates missing files at mode 0600 before later tightening,
+  and chmods existing database/WAL/SHM files without an open/close cycle. It supports dangling links by preparing
+  their target, keeps in-memory paths filesystem-free, and leaves Windows on inherited ACLs. Keep EventWriter
+  registration, fresh-store auto-vacuum ordering, and pure `db path` selection; exclude the donor's different
+  `layer(options)` and Global path-resolution API. Regressions in `packages/core/test/database.test.ts` prove fresh-file
+  mode at birth, existing SQLite-produced DB/sidecar modes and retained data, live `OPENCODE_DB` and data-directory
+  symlinks, a dangling `OPENCODE_DB` symlink, and same-process lock preservation against an independent contender.
+  The explicit `--database` path is exercised
+  through online prune in `packages/opencode/test/cli/db/prune.test.ts`.
   _Fork-only adapted ports._
 - **#384** Gate offline and online Session-deleting apply paths, including `db retire`, on caller-confirmed durable usage capture covering the computed deletion scope. Non-confirmed status and incomplete scope refuse before Session history deletion, while inventory and storage-only reclaim remain ungated. Keep run, measurement and ledger reporting separate. See `docs/dead-session-retirement.md` and swxtchio/swx-opencode#371. _Fork-only._
 - **#369** Add `opencode db prune --online` for explicitly selected missing-directory Sessions in a live per-home store, with bounded delete batches, incremental-vacuum/passive-checkpoint progress, and committed partial-result reporting while preserving the offline prune and retire paths. Existing stores use one live-safe proof path:

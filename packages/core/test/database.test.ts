@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test"
-import { chmod, stat } from "node:fs/promises"
+import { chmod, mkdir, stat, symlink } from "node:fs/promises"
 import path from "path"
 import { Context, Effect, Layer } from "effect"
 import { Database } from "../src/database/database"
-import { restrictToOwner } from "../src/database/file-permissions"
+import { Flag } from "../src/flag/flag"
+import { createPrivateDatabaseFile, restrictToOwner } from "../src/database/file-permissions"
+import { Global } from "../src/global"
 import { tmpdir } from "./fixture/tmpdir"
 
 async function startLockContender(filename: string) {
@@ -72,7 +74,36 @@ db.close()
 console.log("closed")
 `
 
+const seedExistingPermissionDatabase = (filename: string) =>
+  Effect.gen(function* () {
+    const context = yield* Layer.build(Database.layerFromPath(filename))
+    const client = Context.get(context, Database.Service).db.$client
+    yield* client.unsafe("CREATE TABLE permission_symlink (value TEXT NOT NULL)").raw
+    yield* client.unsafe("INSERT INTO permission_symlink (value) VALUES ('preserved')").raw
+    yield* Effect.promise(() =>
+      Promise.all(["", "-wal", "-shm"].map((suffix) => chmod(filename + suffix, 0o644))),
+    )
+  })
+
 describe.skipIf(process.platform === "win32")("Database file permissions", () => {
+  test("creates a fresh SQLite file owner-only before later tightening", async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "private-at-birth.sqlite")
+
+    expect(createPrivateDatabaseFile(filename)).toBe(true)
+    expect((await stat(filename)).mode & 0o777).toBe(0o600)
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const sqlite = yield* Effect.promise(() => import("bun:sqlite"))
+          const native = new sqlite.Database(filename)
+          yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
+          native.run("CREATE TABLE birth_probe (value TEXT NOT NULL)")
+        }),
+      ),
+    )
+  })
+
   test("creates an explicit database and its sidecars owner-only while open", async () => {
     await using tmp = await tmpdir()
     const filename = path.join(tmp.path, "explicit.sqlite")
@@ -93,6 +124,126 @@ describe.skipIf(process.platform === "win32")("Database file permissions", () =>
         }),
       ),
     )
+  })
+
+  test.serial("tightens real sidecars reached through a live OPENCODE_DB symlink", async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "real.sqlite")
+    const alias = path.join(tmp.path, "explicit.sqlite")
+    const previousDatabase = Flag.OPENCODE_DB
+    const previousDatabaseEnv = process.env.OPENCODE_DB
+
+    try {
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedExistingPermissionDatabase(filename)
+            yield* Effect.promise(() => symlink(filename, alias))
+            Flag.OPENCODE_DB = alias
+            process.env.OPENCODE_DB = alias
+            const selected = Database.path()
+            expect(selected).toBe(alias)
+
+            const context = yield* Layer.build(Database.layerFromPath(selected))
+            const client = Context.get(context, Database.Service).db.$client
+            expect(yield* client.unsafe("SELECT value FROM permission_symlink").values).toEqual([[
+              "preserved",
+            ]])
+            expect(
+              yield* Effect.promise(() =>
+                Promise.all(["", "-wal", "-shm"].map(async (suffix) => (await stat(filename + suffix)).mode & 0o777)),
+              ),
+            ).toEqual([0o600, 0o600, 0o600])
+          }),
+        ),
+      )
+    } finally {
+      Flag.OPENCODE_DB = previousDatabase
+      if (previousDatabaseEnv === undefined) delete process.env.OPENCODE_DB
+      else process.env.OPENCODE_DB = previousDatabaseEnv
+    }
+  })
+
+  test.serial("tightens real sidecars reached through a symlinked data-directory opencode.db", async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "real.sqlite")
+    const data = path.join(tmp.path, "data")
+    const alias = path.join(data, "opencode.db")
+    const previousDatabase = Flag.OPENCODE_DB
+    const previousData = Global.Path.data
+    const previousDatabaseEnv = process.env.OPENCODE_DB
+    const previousChannelSetting = process.env.OPENCODE_DISABLE_CHANNEL_DB
+    await mkdir(data, { recursive: true })
+
+    try {
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            yield* seedExistingPermissionDatabase(filename)
+            yield* Effect.promise(() => symlink(filename, alias))
+            Flag.OPENCODE_DB = undefined
+            delete process.env.OPENCODE_DB
+            Global.Path.data = data
+            process.env.OPENCODE_DISABLE_CHANNEL_DB = "1"
+            const selected = Database.path()
+            expect(selected).toBe(alias)
+
+            const context = yield* Layer.build(Database.layerFromPath(selected))
+            const client = Context.get(context, Database.Service).db.$client
+            expect(yield* client.unsafe("SELECT value FROM permission_symlink").values).toEqual([[
+              "preserved",
+            ]])
+            expect(
+              yield* Effect.promise(() =>
+                Promise.all(["", "-wal", "-shm"].map(async (suffix) => (await stat(filename + suffix)).mode & 0o777)),
+              ),
+            ).toEqual([0o600, 0o600, 0o600])
+          }),
+        ),
+      )
+    } finally {
+      Flag.OPENCODE_DB = previousDatabase
+      Global.Path.data = previousData
+      if (previousDatabaseEnv === undefined) delete process.env.OPENCODE_DB
+      else process.env.OPENCODE_DB = previousDatabaseEnv
+      if (previousChannelSetting === undefined) delete process.env.OPENCODE_DISABLE_CHANNEL_DB
+      else process.env.OPENCODE_DISABLE_CHANNEL_DB = previousChannelSetting
+    }
+  })
+
+  test.serial("opens a dangling OPENCODE_DB symlink with owner-only target files", async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "dangling-target.sqlite")
+    const alias = path.join(tmp.path, "selected.sqlite")
+    const previousDatabase = Flag.OPENCODE_DB
+    const previousDatabaseEnv = process.env.OPENCODE_DB
+    await symlink(path.basename(filename), alias)
+
+    try {
+      Flag.OPENCODE_DB = alias
+      process.env.OPENCODE_DB = alias
+      expect(Database.path()).toBe(alias)
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const context = yield* Layer.build(Database.layerFromPath(Database.path()))
+            const client = Context.get(context, Database.Service).db.$client
+            yield* client.unsafe("CREATE TABLE dangling_probe (value TEXT NOT NULL)").raw
+            yield* client.unsafe("INSERT INTO dangling_probe (value) VALUES ('created')").raw
+            expect(yield* client.unsafe("SELECT value FROM dangling_probe").values).toEqual([["created"]])
+            expect(
+              yield* Effect.promise(() =>
+                Promise.all(["", "-wal", "-shm"].map(async (suffix) => (await stat(filename + suffix)).mode & 0o777)),
+              ),
+            ).toEqual([0o600, 0o600, 0o600])
+          }),
+        ),
+      )
+    } finally {
+      Flag.OPENCODE_DB = previousDatabase
+      if (previousDatabaseEnv === undefined) delete process.env.OPENCODE_DB
+      else process.env.OPENCODE_DB = previousDatabaseEnv
+    }
   })
 
   test("tightens existing SQLite files and keeps their data", async () => {
@@ -162,13 +313,13 @@ describe.skipIf(process.platform === "win32")("Database file permissions", () =>
           const contender = yield* Effect.promise(() => startLockContender(filename))
           yield* Effect.addFinalizer(() =>
             Effect.promise(() => contender.release()).pipe(
-            Effect.timeoutOrElse({
-              duration: "2 seconds",
-              orElse: () => Effect.fail(new Error("SQLite lock contender did not exit")),
-            }),
-            Effect.orDie,
-          ),
-        )
+              Effect.timeoutOrElse({
+                duration: "2 seconds",
+                orElse: () => Effect.fail(new Error("SQLite lock contender did not exit")),
+              }),
+              Effect.orDie,
+            ),
+          )
 
           expect(yield* Effect.promise(() => contender.probe())).toMatch(/^blocked:SQLITE_BUSY/)
           yield* Effect.promise(() => chmod(filename, 0o644))

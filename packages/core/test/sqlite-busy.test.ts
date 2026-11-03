@@ -253,19 +253,20 @@ const sqliteClientForPermitTest = (clientType: SqliteClientType) =>
 const queuedAcquisition = (client: SqlClient, kind: "reserve" | "transaction") =>
   (kind === "reserve"
     ? Effect.scoped(Effect.andThen(client.reserve, Effect.yieldNow))
-    : client.withTransaction(Effect.yieldNow)
+    : client.withTransaction(client.unsafe("SELECT 2").raw)
   ).pipe(Effect.provideService(References.MaxOpsBeforeYield, 3))
 
 describe("SQLite permit acquisition interruption", () => {
   for (const clientType of ["bun", "core-node", "standalone-node"] as const) {
     test.skipIf(clientType !== "bun" && !nodeSqliteDrivers)(
-      `${clientType} releases a queued reserve and transaction after interruption`,
+      `${clientType} proves reserve handoff and preserves withTransaction scope on interruption`,
       async () => {
         await Effect.runPromise(
           Effect.scoped(
             Effect.gen(function* () {
               const client: SqlClient = yield* sqliteClientForPermitTest(clientType)
 
+              // Reserve is the acquisition proof; the transaction arm preserves SqlClient's masked acquireConnection path.
               for (const kind of ["reserve", "transaction"] as const) {
                 for (let delay = 0; delay < 32; delay++) {
                   const holderReady = yield* Deferred.make<void>()
@@ -329,6 +330,72 @@ describe("SQLite permit acquisition interruption", () => {
         )
       },
       20_000,
+    )
+
+    // Waiting cancellation is a preservation control; the reserve sweep above owns the acquisition-handoff proof.
+    test.skipIf(clientType !== "bun" && !nodeSqliteDrivers)(
+      `${clientType} cancels a queued reserve while its permit holder remains active`,
+      async () => {
+        await Effect.runPromise(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const client: SqlClient = yield* sqliteClientForPermitTest(clientType)
+              const holderReady = yield* Deferred.make<void>()
+              const holderRelease = yield* Deferred.make<void>()
+              const holder = yield* Effect.scoped(
+                Effect.gen(function* () {
+                  yield* client.reserve
+                  yield* Deferred.succeed(holderReady, undefined)
+                  yield* Deferred.await(holderRelease)
+                }),
+              ).pipe(Effect.forkChild({ startImmediately: true }))
+
+              yield* Effect.gen(function* () {
+                yield* Deferred.await(holderReady).pipe(
+                  Effect.timeoutOrElse({
+                    duration: "1 second",
+                    orElse: () => Effect.fail(new Error(`${clientType} holder did not acquire the permit`)),
+                  }),
+                )
+                const queued = yield* Effect.scoped(Effect.andThen(client.reserve, Effect.void)).pipe(
+                  Effect.forkChild({ startImmediately: true }),
+                )
+                yield* Effect.yieldNow
+                expect(queued.pollUnsafe()).toBeUndefined()
+                yield* Fiber.interrupt(queued).pipe(
+                  Effect.timeoutOrElse({
+                    duration: "1 second",
+                    orElse: () => Effect.fail(new Error(`${clientType} reserve wait did not cancel`)),
+                  }),
+                )
+                expect(queued.pollUnsafe()).not.toBeUndefined()
+                expect(holder.pollUnsafe()).toBeUndefined()
+
+                yield* Deferred.succeed(holderRelease, undefined)
+                yield* Fiber.join(holder).pipe(
+                  Effect.timeoutOrElse({
+                    duration: "1 second",
+                    orElse: () => Effect.fail(new Error(`${clientType} holder did not release the permit`)),
+                  }),
+                )
+                expect(
+                  yield* client.unsafe("SELECT 3").values.pipe(
+                    Effect.timeoutOrElse({
+                      duration: "1 second",
+                      orElse: () => Effect.fail(new Error(`${clientType} SQL did not proceed after reserve cancel`)),
+                    }),
+                  ),
+                ).toEqual([[3]])
+              }).pipe(
+                Effect.ensuring(
+                  Deferred.succeed(holderRelease, undefined).pipe(Effect.andThen(Fiber.interrupt(holder))),
+                ),
+              )
+            }),
+          ),
+        )
+      },
+      10_000,
     )
   }
 })
