@@ -162,12 +162,13 @@ describe.skipIf(process.platform === "win32")("Database file permissions", () =>
           const contender = yield* Effect.promise(() => startLockContender(filename))
           yield* Effect.addFinalizer(() =>
             Effect.promise(() => contender.release()).pipe(
-              Effect.timeoutOrElse({
-                duration: "2 seconds",
-                orElse: () => Effect.fail(new Error("SQLite lock contender did not exit")),
-              }),
-            ),
-          )
+            Effect.timeoutOrElse({
+              duration: "2 seconds",
+              orElse: () => Effect.fail(new Error("SQLite lock contender did not exit")),
+            }),
+            Effect.orDie,
+          ),
+        )
 
           expect(yield* Effect.promise(() => contender.probe())).toMatch(/^blocked:SQLITE_BUSY/)
           yield* Effect.promise(() => chmod(filename, 0o644))
