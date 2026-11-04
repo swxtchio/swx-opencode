@@ -515,7 +515,13 @@ describe("SQLite write-lock hold diagnostics", () => {
             Effect.promise(() => tmpdir()),
             (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
           )
-          const { writerStartDelayMs, waitedMs, busyCount, attemptsCount, rows } = yield* withConcurrentUnlabelledHold(
+          const {
+            writerStartDelayMs,
+            additionalBusyAttempts,
+            busyCount,
+            attemptsCount,
+            rows,
+          } = yield* withConcurrentUnlabelledHold(
             path.join(tmp.path, "interference.sqlite"),
             lines,
             owner,
@@ -569,6 +575,8 @@ describe("SQLite write-lock hold diagnostics", () => {
                     return yield* Effect.die(new Error("owned writer wait did not finish its measured interval"))
                   yield* Effect.sleep("10 millis")
                 }
+                const additionalBusyAttempts = attempts.busy.length - busyBeforeNoise
+                expect(additionalBusyAttempts).toBeGreaterThan(0)
                 yield* releaseOnProgress()
                 releaseHolder()
                 yield* Fiber.join(writer).pipe(
@@ -579,7 +587,7 @@ describe("SQLite write-lock hold diagnostics", () => {
                 )
                 return {
                   writerStartDelayMs,
-                  waitedMs: performance.now() - busyAt,
+                  additionalBusyAttempts,
                   busyCount: attempts.busy.length,
                   attemptsCount: attempts.count,
                   rows: yield* db.values("SELECT id FROM hold_test"),
@@ -587,7 +595,7 @@ describe("SQLite write-lock hold diagnostics", () => {
               }),
           )
           expect(writerStartDelayMs).toBeGreaterThanOrEqual(longHoldMs + 50)
-          expect(waitedMs).toBeGreaterThan(longHoldMs)
+          expect(additionalBusyAttempts).toBeGreaterThan(0)
           expect(busyCount).toBeGreaterThan(0)
           expect(attemptsCount).toBeGreaterThan(busyCount)
           const logs = logsOwnedBy(lines, owner)
