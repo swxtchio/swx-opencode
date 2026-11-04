@@ -80,6 +80,32 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Database maintenance
 
+- **#395** Partially port the atomic SQLite acquisition behavior from `anomalyco/opencode#60651`
+  (`c6056f39312748c633de00ad2c2576b7e042b97d`, downstream `79aafa2f82e7293ba7f2c1222e35b2f58dc5c5ea`; review correction `9f7cc80702fee80e82dd811a35f9b8d16e97ae29`)
+  into `packages/core/src/database/sqlite.bun.ts`, `packages/core/src/database/sqlite.node.ts`, and
+  `packages/effect-sqlite-node/src/index.ts`. Ordinary statements first use `Semaphore.withPermitsIfAvailable` for an
+  uncontended synchronous path; contended acquisition uses an immediately started, Scope-owned child so interruption
+  cannot strand the permit. Keep `reserve` and `withTransaction` on the Scope-owned child path instead of upstream's
+  Effect 4.1 `Semaphore.takeScoped`; retain the current adapters and retry/transaction serialization, excluding the
+  Effect upgrade, workerd adapter, generated API changes, and unrelated compatibility edits. In
+  `packages/core/test/sqlite-busy.test.ts`, bounded queued-acquisition sweeps cover ordinary statement execute/raw/values,
+  reserve, transaction/unprepared, `loadExtension`, and Bun `export`, then verify later SQL proceeds. The
+  `packages/core/test/fixture/sqlite-acquisition-node.mjs` runner exercises Core Node and standalone Node in native
+  Node 24, so neither driver is silently skipped. The transaction arm preserves `SqlClient.makeWithTransaction`'s
+  masked `acquireConnection` path; the reserve-wait control cancels while the permit holder remains active. Partially adapt the
+  owner-only file behavior from `anomalyco/opencode#52150`
+  (`89d37a0f6de691979f65e52ba35913b5f0b957bf`, downstream `5c5df6c8e604452d87c823e4aee5cacb9a8b8f5b`; symlink/birth correction `9f7cc80702fee80e82dd811a35f9b8d16e97ae29`) at the fork's
+  `Database.layerFromPath` boundary. `packages/core/src/database/file-permissions.ts` resolves final-component
+  symlinks to the database path SQLite uses, exclusively creates missing files at mode 0600 before later tightening,
+  and chmods existing database/WAL/SHM files without an open/close cycle. It supports dangling links by preparing
+  their target, keeps in-memory paths filesystem-free, and leaves Windows on inherited ACLs. Keep EventWriter
+  registration, fresh-store auto-vacuum ordering, and pure `db path` selection; exclude the donor's different
+  `layer(options)` and Global path-resolution API. Regressions in `packages/core/test/database.test.ts` prove fresh-file
+  mode at birth, existing SQLite-produced DB/sidecar modes and retained data, live `OPENCODE_DB` and data-directory
+  symlinks, a dangling `OPENCODE_DB` symlink, and same-process lock preservation against an independent contender.
+  The explicit `--database` path is exercised
+  through online prune in `packages/opencode/test/cli/db/prune.test.ts`.
+  _Fork-only adapted ports._
 - **#384** Gate offline and online Session-deleting apply paths, including `db retire`, on caller-confirmed durable usage capture covering the computed deletion scope. Non-confirmed status and incomplete scope refuse before Session history deletion, while inventory and storage-only reclaim remain ungated. Keep run, measurement and ledger reporting separate. See `docs/dead-session-retirement.md` and swxtchio/swx-opencode#371. _Fork-only._
 - **#369** Add `opencode db prune --online` for explicitly selected missing-directory Sessions in a live per-home store, with bounded delete batches, incremental-vacuum/passive-checkpoint progress, and committed partial-result reporting while preserving the offline prune and retire paths. Existing stores use one live-safe proof path:
   `--online --apply` advances trigger-maintained Part-scope, stable queue-alias-owner and writer-lifetime maps in transactions capped at 128 rows (at most 128 proof transactions and 16,384 source rows per invocation; fixed, with no CLI override), without building source-table indexes or stopping other database holders. Part backfill keysets on stable `part.id`, not implicit ROWID. `proofPreparation` reports completed batches, rows and remaining proofs. The exact incomplete, busy and state-unavailable reasons are `online-proof-backfill-incomplete:<cross-session-part-scope|queue-alias-owners|event-writer-lifetimes>`, `online-proof-backfill-busy:<name>`, and `online-proof-backfill-state-unavailable:<name>`; unavailable proof metadata reports `online-proof-backfill-unavailable`. All proof-preparation refusals return `action: "refused"`, `committed: false`, `changedRows: 0`, exit 1, and delete no Sessions; retry the same explicit online apply scope after progress, contention or state is addressed. A read-only reserve/holder-inspection preflight runs before proof writes; a preflight refusal leaves proof tables and cursors unchanged (`batches: 0`, `rows: 0`) and reports `free-space-reserve-would-be-violated` or `free-space-measurement-unavailable` for the reserve gate. Reserve is rechecked before every proof transaction; a mid-pass capacity stop reports `free-space-reserve-would-be-violated`, rolls back the current page, and preserves earlier proof progress for retry. An `unregistered-database-holder:<pid>` is deferred only while the writer-lifetime census is incomplete, then rechecked before Session deletion. Retention classifies `online_reclaim_*` tables as structural proof metadata, retaining per-row maps while their source rows remain and relying on source lifecycle triggers to clear them on deletion; global backfill and lifetime state remain global. Historical per-Session writer ownership is paged outside the delete lock; each locked batch rechecks current process-holder identities and event-sequence/row fences rather than rescanning historical writer ownership. See `docs/dead-session-retirement.md`, `docs/online-session-reclamation-plan.md`, the [round-five correction](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6553050249), and the [round-six correction](https://github.com/swxtchio/swx-opencode/issues/353#issuecomment-6555341679). _Fork-only._
