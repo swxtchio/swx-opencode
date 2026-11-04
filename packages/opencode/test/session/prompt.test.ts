@@ -8425,9 +8425,20 @@ const writeLockHold = Effect.fn("test.writeLockHold")(function* () {
   const release = Effect.sync(() => {
     if (lock.holder?.inTransaction) lock.holder.run("COMMIT")
   })
+  const releaseAndProbe = Effect.sync(() => {
+    if (lock.holder?.inTransaction) lock.holder.run("COMMIT")
+    const probe = new Sqlite(consumeLockDbPath)
+    try {
+      probe.run("BEGIN IMMEDIATE")
+      probe.run("COMMIT")
+    } finally {
+      probe.close()
+    }
+  })
   return {
     take,
     release,
+    releaseAndProbe,
     isHeld: Effect.sync(() => lock.holder?.inTransaction === true),
   }
 })
@@ -8448,6 +8459,8 @@ consumeLock.instance(
       const ready = path.join(dir, "tool-ready")
       const release = path.join(dir, "tool-release")
       yield* Effect.addFinalizer(() => Effect.promise(() => writeFile(release, "release")))
+      const reader = new Sqlite(consumeLockDbPath, { readonly: true })
+      yield* Effect.addFinalizer(() => Effect.sync(() => reader.close()))
 
       const attempts = newStatementAttempts()
       yield* patchBunQuery((sql) => sql === "begin immediate", attempts)
@@ -8501,10 +8514,14 @@ consumeLock.instance(
       expect(yield* lock.isHeld).toBe(true)
       expect(attempts.busy.length).toBeGreaterThan(firstBusy)
       expect((yield* status.get(chat.id)).type).toBe("busy")
-      const whileBlocked = yield* sessions.messages({ sessionID: chat.id }).pipe(Effect.orDie)
-      expect(toolPart(whileBlocked.flatMap((message) => message.parts))?.state.status).toBe("running")
+      const blockedTool = reader
+        .query<{ status: string }, [string]>(
+          "select json_extract(data, '$.state.status') as status from part where session_id = ? and json_extract(data, '$.tool') = 'bash'",
+        )
+        .get(chat.id)
+      expect(blockedTool?.status).toBe("running")
 
-      yield* lock.release
+      yield* lock.releaseAndProbe
       expect(yield* lock.isHeld).toBe(false)
       const [taskReply, continuationReply] = yield* awaitWithTimeout(
         Effect.all([Fiber.join(task), Fiber.join(continuation)]),
