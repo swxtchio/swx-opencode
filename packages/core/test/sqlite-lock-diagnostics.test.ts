@@ -125,12 +125,12 @@ const patchBunQueryOn = (native: unknown, match: (sql: string) => boolean, attem
 const slowLayerConstruction = (
   filename: string,
   lines: OwnedLogLine[],
-  caseOwner: TransactionOwner,
   holdMs = longHoldMs,
 ) =>
   Effect.scoped(
     Effect.gen(function* () {
       const setupOwner = Symbol("sqlite-lock-diagnostics-setup")
+      const setupFiberId = yield* Effect.withFiber((fiber) => Effect.succeed(fiber.id))
       // Re-enter the production proof installer during layer construction and slow its immediate transaction.
       const setupLayer = Layer.effectDiscard(
         Effect.gen(function* () {
@@ -168,10 +168,11 @@ const slowLayerConstruction = (
 
       const setupHolds = logsWithAnnotation(lines, setupOwner).filter((line) => line.text === "sqlite write lock held")
       expect(setupHolds).toHaveLength(1)
-      expect(setupHolds[0].fiberId).toBe(caseOwner.rootFiberId)
+      expect(setupHolds[0].fiberId).toBe(setupFiberId)
       expect(setupHolds[0].fields).toMatchObject({ purpose: "unknown", outcome: "commit" })
       expect(setupHolds[0].fields.span).toBeUndefined()
       expect(setupHolds[0].fields.durationMs).toBeGreaterThanOrEqual(longHoldMs)
+      return setupFiberId
     }),
   )
 
@@ -182,7 +183,8 @@ const withConcurrentUnlabelledHold = <A, E, R>(
   work: (releaseOnProgress: () => Effect.Effect<void>) => Effect.Effect<A, E, R>,
 ) =>
   Effect.gen(function* () {
-    yield* slowLayerConstruction(path.join(path.dirname(filename), "slow-setup.sqlite"), lines, owner)
+    if ((yield* slowLayerConstruction(path.join(path.dirname(filename), "slow-setup.sqlite"), lines)) !== owner.rootFiberId)
+      return yield* Effect.die(new Error("setup hold did not run on the case's root fiber"))
 
     const db = yield* productionDatabase(filename)
     yield* db.run("CREATE TABLE hold_test (id INTEGER PRIMARY KEY)")
@@ -536,16 +538,30 @@ describe("SQLite write-lock hold diagnostics", () => {
                 const releaseHolder = yield* inProcessHolder(filename)
                 yield* patchBunQueryOn(native, (sql) => sql === "begin immediate", attempts)
                 const writerStartRequestedAt = performance.now()
-                yield* slowLayerConstruction(path.join(tmp.path, "waiter-delay.sqlite"), lines, owner, longHoldMs + 50)
-                const writerStartDelayMs = performance.now() - writerStartRequestedAt
-
                 const writerStartedAt = performance.now()
-                const writer = yield* annotateTransactionOwner(
-                  owner,
-                  db
-                    .transaction((tx) => tx.run("INSERT INTO hold_test (id) VALUES (1)"), { behavior: "immediate" })
-                    .pipe(Effect.provideService(TransactionPurpose, "test.waiter")),
-                ).pipe(Effect.forkChild({ startImmediately: true }))
+                const writerStarted = yield* Deferred.make<void>()
+                const writer = yield* Effect.gen(function* () {
+                  yield* Deferred.succeed(writerStarted, undefined)
+                  yield* slowLayerConstruction(
+                    path.join(tmp.path, "waiter-delay.sqlite"),
+                    lines,
+                    longHoldMs + 50,
+                  )
+                  const writerStartDelayMs = performance.now() - writerStartRequestedAt
+                  yield* annotateTransactionOwner(
+                    owner,
+                    db
+                      .transaction((tx) => tx.run("INSERT INTO hold_test (id) VALUES (1)"), { behavior: "immediate" })
+                      .pipe(Effect.provideService(TransactionPurpose, "test.waiter")),
+                  )
+                  return writerStartDelayMs
+                }).pipe(Effect.forkChild({ startImmediately: true }))
+                yield* Deferred.await(writerStarted).pipe(
+                  Effect.timeoutOrElse({
+                    duration: "5 seconds",
+                    orElse: () => Effect.die(new Error("writer fiber did not start")),
+                  }),
+                )
 
                 while (attempts.busy.length === 0 && performance.now() - writerStartedAt < lockWindowMs)
                   yield* Effect.sleep("10 millis")
@@ -579,7 +595,7 @@ describe("SQLite write-lock hold diagnostics", () => {
                 expect(additionalBusyAttempts).toBeGreaterThan(0)
                 yield* releaseOnProgress()
                 releaseHolder()
-                yield* Fiber.join(writer).pipe(
+                const writerStartDelayMs = yield* Fiber.join(writer).pipe(
                   Effect.timeoutOrElse({
                     duration: lockBackstop,
                     orElse: () => Effect.die(new Error("writer never finished")),
