@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { Database } from "@opencode-ai/core/database/database"
-import { TransactionPurpose } from "@opencode-ai/effect-drizzle-sqlite"
-import { Cause, Context, Effect, Exit, Fiber, Layer, Logger } from "effect"
+import { EffectDrizzleSqlite, TransactionPurpose } from "@opencode-ai/effect-drizzle-sqlite"
+import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Logger, References } from "effect"
 import { SqlClient } from "effect/unstable/sql/SqlClient"
 import { isSqlError } from "effect/unstable/sql/SqlError"
 import { Sqlite } from "../src/database/sqlite"
@@ -11,8 +11,10 @@ import {
   patchBunQuery,
   type StatementAttempts,
 } from "../src/database/sqlite-attempts"
+import { DatabaseMigration } from "../src/database/migration"
 import path from "path"
 import { tmpdir } from "./fixture/tmpdir"
+import { layer } from "../src/database/sqlite.bun"
 
 const nodeSqliteDrivers = await import("node:sqlite").then(
   async (nodeSqlite) => ({
@@ -32,6 +34,12 @@ const lockBackstop = "15 seconds"
 const exhaustionTestMs = 30_000
 
 type LogLine = { readonly text: unknown; readonly fields: Record<string, unknown> }
+type OwnedLogLine = LogLine & {
+  readonly annotations: Readonly<Record<string, unknown>>
+  readonly fiberId: unknown
+}
+type TransactionOwner = { readonly token: symbol; rootFiberId: unknown }
+const ownerAnnotation = "sqliteLockDiagnosticsOwner"
 
 // Collects what the instrumented code sends to the Effect logger, in place of the file sink.
 const captured = <A, E, R>(effect: (lines: LogLine[]) => Effect.Effect<A, E, R>) =>
@@ -44,9 +52,38 @@ const captured = <A, E, R>(effect: (lines: LogLine[]) => Effect.Effect<A, E, R>)
     return effect(lines).pipe(Effect.provideService(Logger.CurrentLoggers, new Set([capture])))
   })
 
+const annotateTransactionOwner = <A, E, R>(owner: symbol | TransactionOwner, effect: Effect.Effect<A, E, R>) =>
+  Effect.annotateLogs(effect, ownerAnnotation, typeof owner === "symbol" ? owner : owner.token)
+
+const capturedWithTransactionOwner = <A, E, R>(
+  effect: (lines: OwnedLogLine[], owner: TransactionOwner) => Effect.Effect<A, E, R>,
+) =>
+  Effect.suspend(() => {
+    const lines: OwnedLogLine[] = []
+    const owner: TransactionOwner = { token: Symbol("sqlite-lock-diagnostics-case"), rootFiberId: undefined }
+    const capture = Logger.make((options) => {
+      const [text, fields] = Array.isArray(options.message) ? options.message : [options.message]
+      lines.push({
+        annotations: options.fiber.getRef(References.CurrentLogAnnotations),
+        fiberId: options.fiber.id,
+        text,
+        fields: typeof fields === "object" && fields !== null ? fields : {},
+      })
+    })
+    return Effect.withFiber((fiber) => {
+      owner.rootFiberId = fiber.id
+      return effect(lines, owner)
+    }).pipe(
+      Effect.provideService(Logger.CurrentLoggers, new Set([capture])),
+    )
+  })
+
 const holds = (lines: LogLine[]) => lines.filter((line) => line.text === "sqlite write lock held")
 const exhausted = (lines: LogLine[]) => lines.filter((line) => line.text === "sqlite lock retries exhausted")
 const unretried = (lines: LogLine[]) => lines.filter((line) => line.text === "sqlite lock failed without retry")
+const logsWithAnnotation = (lines: OwnedLogLine[], owner: symbol) =>
+  lines.filter((line) => line.annotations[ownerAnnotation] === owner)
+const logsOwnedBy = (lines: OwnedLogLine[], owner: TransactionOwner) => logsWithAnnotation(lines, owner.token)
 
 const run = async <A, E>(effect: Effect.Effect<A, E, import("effect").Scope.Scope>) => {
   const exit = await Effect.runPromiseExit(Effect.scoped(effect))
@@ -56,6 +93,161 @@ const run = async <A, E>(effect: Effect.Effect<A, E, import("effect").Scope.Scop
 
 const productionDatabase = (filename: string) =>
   Layer.build(Database.layerFromPath(filename)).pipe(Effect.map((context) => Context.get(context, Database.Service).db))
+
+const databaseLayerWithNative = (filename: string) =>
+  Layer.effect(
+    Database.Service,
+    EffectDrizzleSqlite.makeWithDefaults().pipe(Effect.map((db) => ({ db }))),
+  ).pipe(Layer.provideMerge(layer({ filename, disableWAL: true })))
+
+const patchBunQueryOn = (native: unknown, match: (sql: string) => boolean, attempts: StatementAttempts) =>
+  Effect.gen(function* () {
+    if (typeof native !== "object" || native === null) return yield* Effect.die(new Error("SQLite native connection was not found"))
+    const query = Reflect.get(native, "query")
+    if (typeof query !== "function") return yield* Effect.die(new Error("SQLite native query method was not found"))
+    const descriptor = Object.getOwnPropertyDescriptor(native, "query")
+    Object.defineProperty(native, "query", {
+      configurable: true,
+      writable: true,
+      value: (sql: string) => {
+        const statement: unknown = Reflect.apply(query, native, [sql])
+        if (typeof statement !== "object" || statement === null) throw new Error("SQLite query was not a statement")
+        return match(sql) ? countStatement(statement, attempts) : statement
+      },
+    })
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        if (descriptor) Object.defineProperty(native, "query", descriptor)
+        else Reflect.deleteProperty(native, "query")
+      }),
+    )
+  })
+const slowLayerConstruction = (
+  filename: string,
+  lines: OwnedLogLine[],
+  holdMs = longHoldMs,
+) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const setupOwner = Symbol("sqlite-lock-diagnostics-setup")
+      const setupFiberId = yield* Effect.withFiber((fiber) => Effect.succeed(fiber.id))
+      // Re-enter the production proof installer during layer construction and slow its immediate transaction.
+      const setupLayer = Layer.effectDiscard(
+        Effect.gen(function* () {
+          const db = (yield* Database.Service).db
+          yield* db.run('DROP TRIGGER "online_reclaim_part_cross_insert"')
+
+          const originalTransaction = db.transaction
+          const transaction = db.transaction.bind(db) as typeof db.transaction
+          db.transaction = ((operation, config) =>
+            annotateTransactionOwner(
+              setupOwner,
+              transaction(
+                (tx) =>
+                  Effect.gen(function* () {
+                    const result = yield* operation(tx)
+                    if (config?.behavior === "immediate") yield* Effect.sleep(`${holdMs} millis`)
+                    return result
+                  }),
+                config,
+              ),
+            )) as typeof db.transaction
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              db.transaction = originalTransaction
+            }),
+          )
+
+          yield* DatabaseMigration.apply(db)
+          yield* Effect.sync(() => {
+            db.transaction = originalTransaction
+          })
+        }),
+      ).pipe(Layer.provideMerge(Database.layerFromPath(filename)))
+      yield* Layer.build(setupLayer)
+
+      const setupHolds = logsWithAnnotation(lines, setupOwner).filter((line) => line.text === "sqlite write lock held")
+      expect(setupHolds).toHaveLength(1)
+      expect(setupHolds[0].fiberId).toBe(setupFiberId)
+      expect(setupHolds[0].fields).toMatchObject({ purpose: "unknown", outcome: "commit" })
+      expect(setupHolds[0].fields.span).toBeUndefined()
+      expect(setupHolds[0].fields.durationMs).toBeGreaterThanOrEqual(longHoldMs)
+      return setupFiberId
+    }),
+  )
+
+const withConcurrentUnlabelledHold = <A, E, R>(
+  filename: string,
+  lines: OwnedLogLine[],
+  owner: TransactionOwner,
+  work: (releaseOnProgress: () => Effect.Effect<void>) => Effect.Effect<A, E, R>,
+) =>
+  Effect.gen(function* () {
+    if ((yield* slowLayerConstruction(path.join(path.dirname(filename), "slow-setup.sqlite"), lines)) !== owner.rootFiberId)
+      return yield* Effect.die(new Error("setup hold did not run on the case's root fiber"))
+
+    const db = yield* productionDatabase(filename)
+    yield* db.run("CREATE TABLE hold_test (id INTEGER PRIMARY KEY)")
+    const progress = { entered: false, completed: false, overlapped: false }
+    const started = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const interferenceOwner = Symbol("sqlite-lock-diagnostics-interference")
+    const hold = annotateTransactionOwner(
+      interferenceOwner,
+      db.transaction(
+        (tx) =>
+          Effect.gen(function* () {
+            yield* tx.run("INSERT INTO hold_test (id) VALUES (1)")
+            progress.entered = true
+            yield* Deferred.succeed(started, undefined)
+            yield* Deferred.await(release)
+          }),
+        { behavior: "immediate" },
+      ),
+    )
+    const fiber = yield* hold.pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          progress.completed = true
+        }),
+      ),
+      Effect.forkChild({ startImmediately: true }),
+    )
+    yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined).pipe(Effect.asVoid))
+    yield* Deferred.await(started).pipe(
+      Effect.timeoutOrElse({
+        duration: "5 seconds",
+        orElse: () => Effect.die(new Error("concurrent hold did not enter its transaction body")),
+      }),
+    )
+    const releaseOnProgress = () =>
+      Effect.gen(function* () {
+        if (progress.completed) return yield* Effect.die(new Error("concurrent hold finished before case progress"))
+        progress.overlapped = true
+        yield* Deferred.succeed(release, undefined)
+      })
+    const result = yield* work(releaseOnProgress)
+    if (!progress.overlapped) {
+      yield* Deferred.succeed(release, undefined)
+      return yield* Effect.die(new Error("case made no progress while the concurrent hold was active"))
+    }
+    yield* Fiber.join(fiber).pipe(
+      Effect.timeoutOrElse({
+        duration: "5 seconds",
+        orElse: () => Effect.die(new Error("concurrent hold did not finish")),
+      }),
+    )
+
+    expect(progress.entered).toBe(true)
+    expect(progress.completed).toBe(true)
+    expect(progress.overlapped).toBe(true)
+    const emitted = holds(logsWithAnnotation(lines, interferenceOwner))
+    expect(emitted).toHaveLength(1)
+    expect(emitted[0].fields).toMatchObject({ pid: process.pid, purpose: "unknown", outcome: "commit" })
+    expect(emitted[0].fields.span).toBeUndefined()
+    expect(emitted[0].fields.durationMs).toBeGreaterThanOrEqual(longHoldMs)
+    return result
+  })
 
 // Holds the write lock from a second connection in this process until the returned release runs.
 const inProcessHolder = Effect.fn("inProcessHolder")(function* (filename: string) {
@@ -141,44 +333,68 @@ const nodeClientWithAttemptCount = (input: {
 describe("SQLite write-lock hold diagnostics", () => {
   test("logs an immediate transaction held past the threshold, by commit and by rollback, and not a short one", () =>
     run(
-      captured((lines) =>
+      capturedWithTransactionOwner((lines, owner) =>
         Effect.gen(function* () {
           const tmp = yield* Effect.acquireRelease(
             Effect.promise(() => tmpdir()),
             (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
           )
-          const db = yield* productionDatabase(path.join(tmp.path, "holds.sqlite"))
-          yield* db.run("CREATE TABLE hold_test (id INTEGER PRIMARY KEY)")
+          const committedElapsedMs = yield* withConcurrentUnlabelledHold(
+            path.join(tmp.path, "interference.sqlite"),
+            lines,
+            owner,
+            (releaseOnProgress) =>
+              Effect.gen(function* () {
+                const db = yield* productionDatabase(path.join(tmp.path, "holds.sqlite"))
+                yield* db.run("CREATE TABLE hold_test (id INTEGER PRIMARY KEY)")
 
-          const committedStartedAt = performance.now()
-          yield* db
-            .transaction(
-              (tx) =>
-                tx.run("INSERT INTO hold_test (id) VALUES (1)").pipe(Effect.andThen(Effect.sleep(`${longHoldMs} millis`))),
-              { behavior: "immediate" },
-            )
-            .pipe(Effect.provideService(TransactionPurpose, "test.commit"))
-          const committedElapsedMs = performance.now() - committedStartedAt
+                const committedStartedAt = performance.now()
+                yield* annotateTransactionOwner(
+                  owner,
+                  db
+                    .transaction(
+                      (tx) =>
+                        Effect.gen(function* () {
+                          yield* tx.run("INSERT INTO hold_test (id) VALUES (1)")
+                          yield* Effect.sleep(`${longHoldMs} millis`)
+                        }),
+                      { behavior: "immediate" },
+                    )
+                    .pipe(Effect.provideService(TransactionPurpose, "test.commit")),
+                )
+                const elapsedMs = performance.now() - committedStartedAt
+                yield* releaseOnProgress()
 
-          const rolledBack = yield* db
-            .transaction(
-              (tx) =>
-                tx.run("INSERT INTO hold_test (id) VALUES (2)").pipe(
-                  Effect.andThen(Effect.sleep(`${longHoldMs} millis`)),
-                  Effect.andThen(Effect.fail("abandoned" as const)),
-                ),
-              { behavior: "immediate" },
-            )
-            .pipe(Effect.provideService(TransactionPurpose, "test.rollback"), Effect.flip)
-          expect(rolledBack).toBe("abandoned")
+                const rolledBack = yield* annotateTransactionOwner(
+                  owner,
+                  db
+                    .transaction(
+                      (tx) =>
+                        tx.run("INSERT INTO hold_test (id) VALUES (2)").pipe(
+                          Effect.andThen(Effect.sleep(`${longHoldMs} millis`)),
+                          Effect.andThen(Effect.fail("abandoned" as const)),
+                        ),
+                      { behavior: "immediate" },
+                    )
+                    .pipe(Effect.provideService(TransactionPurpose, "test.rollback"), Effect.flip),
+                )
+                expect(rolledBack).toBe("abandoned")
 
-          yield* db.transaction((tx) => tx.run("INSERT INTO hold_test (id) VALUES (3)"), { behavior: "immediate" }).pipe(
-            Effect.provideService(TransactionPurpose, "test.short"),
+                yield* annotateTransactionOwner(
+                  owner,
+                  db
+                    .transaction((tx) => tx.run("INSERT INTO hold_test (id) VALUES (3)"), { behavior: "immediate" })
+                    .pipe(Effect.provideService(TransactionPurpose, "test.short")),
+                )
+                // A deferred transaction does not take the write lock at BEGIN, so it is not a hold.
+                yield* annotateTransactionOwner(owner, db.transaction(() => Effect.sleep(`${longHoldMs} millis`)))
+
+                expect(yield* db.values("SELECT id FROM hold_test ORDER BY id")).toEqual([[1], [3]])
+                return elapsedMs
+              }),
           )
-          // A deferred transaction does not take the write lock at BEGIN, so it is not a hold.
-          yield* db.transaction(() => Effect.sleep(`${longHoldMs} millis`))
 
-          const logged = holds(lines)
+          const logged = holds(logsOwnedBy(lines, owner))
           expect(logged.map((line) => [line.fields.purpose, line.fields.outcome])).toEqual([
             ["test.commit", "commit"],
             ["test.rollback", "rollback"],
@@ -188,124 +404,224 @@ describe("SQLite write-lock hold diagnostics", () => {
             expect(line.fields.durationMs).toBeGreaterThanOrEqual(longHoldMs)
           }
           expect(logged[0].fields.durationMs).toBeLessThanOrEqual(Math.ceil(committedElapsedMs))
-          expect(yield* db.values("SELECT id FROM hold_test ORDER BY id")).toEqual([[1], [3]])
         }),
       ),
     ), 20_000)
 
   test("names an unlabelled hold by its span and keeps nested savepoints inside the outer hold", () =>
     run(
-      captured((lines) =>
+      capturedWithTransactionOwner((lines, owner) =>
         Effect.gen(function* () {
           const tmp = yield* Effect.acquireRelease(
             Effect.promise(() => tmpdir()),
             (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
           )
-          const db = yield* productionDatabase(path.join(tmp.path, "nested.sqlite"))
-          yield* db.run("CREATE TABLE hold_test (id INTEGER PRIMARY KEY)")
-
-          // The savepoint alone outlasts the threshold, so only its exclusion keeps it from logging a hold of its own.
           const stepMs = 150
-          yield* db
-            .transaction(
-              (tx) =>
-                Effect.gen(function* () {
-                  yield* Effect.sleep(`${stepMs} millis`)
-                  // A nested immediate transaction, as a durable-event commit inside an open one makes, is a savepoint.
-                  yield* db.transaction(
-                    (inner) =>
-                      inner
-                        .run("INSERT INTO hold_test (id) VALUES (1)")
-                        .pipe(Effect.andThen(Effect.sleep(`${longHoldMs} millis`))),
-                    { behavior: "immediate" },
-                  )
-                  yield* Effect.sleep(`${stepMs} millis`)
-                }),
-              { behavior: "immediate" },
-            )
-            .pipe(Effect.withSpan("test.nestedCaller"))
+          yield* withConcurrentUnlabelledHold(
+            path.join(tmp.path, "interference.sqlite"),
+            lines,
+            owner,
+            (releaseOnProgress) =>
+              Effect.gen(function* () {
+                const db = yield* productionDatabase(path.join(tmp.path, "nested.sqlite"))
+                yield* db.run("CREATE TABLE hold_test (id INTEGER PRIMARY KEY)")
 
-          const logged = holds(lines)
+                yield* annotateTransactionOwner(
+                  owner,
+                  db
+                    .transaction(
+                      (tx) =>
+                        Effect.gen(function* () {
+                          yield* Effect.sleep(`${stepMs} millis`)
+                          // A nested immediate transaction, as a durable-event commit inside an open one makes, is a savepoint.
+                          yield* db.transaction(
+                            (inner) =>
+                              inner
+                                .run("INSERT INTO hold_test (id) VALUES (1)")
+                                .pipe(Effect.andThen(Effect.sleep(`${longHoldMs} millis`))),
+                            { behavior: "immediate" },
+                          )
+                          yield* Effect.sleep(`${stepMs} millis`)
+                        }),
+                      { behavior: "immediate" },
+                    )
+                    .pipe(Effect.withSpan("test.nestedCaller")),
+                )
+                yield* releaseOnProgress()
+              }),
+          )
+
+          const logged = holds(logsOwnedBy(lines, owner))
           expect(logged).toHaveLength(1)
           expect(logged[0].fields).toMatchObject({ purpose: "test.nestedCaller", span: "test.nestedCaller", outcome: "commit" })
           expect(logged[0].fields.durationMs).toBeGreaterThanOrEqual(stepMs * 2 + longHoldMs)
         }),
       ),
-    ))
+    ), 20_000)
 
   test("attributes a failed commit and its rollback to the same hold", () =>
     run(
-      captured((lines) =>
+      capturedWithTransactionOwner((lines, owner) =>
         Effect.gen(function* () {
           const tmp = yield* Effect.acquireRelease(
             Effect.promise(() => tmpdir()),
             (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
           )
-          const db = yield* productionDatabase(path.join(tmp.path, "commit-failure.sqlite"))
-          yield* db.run("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
-          yield* db.run(
-            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
-          )
+          const { failure, childCount } = yield* withConcurrentUnlabelledHold(
+            path.join(tmp.path, "interference.sqlite"),
+            lines,
+            owner,
+            (releaseOnProgress) =>
+              Effect.gen(function* () {
+                const db = yield* productionDatabase(path.join(tmp.path, "commit-failure.sqlite"))
+                yield* db.run("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+                yield* db.run(
+                  "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
+                )
 
-          // The deferred foreign key is checked at COMMIT, which fails and is followed by the rollback.
-          const failure = yield* db
-            .transaction(
-              (tx) =>
-                tx
-                  .run("INSERT INTO child (id, parent_id) VALUES (1, 99)")
-                  .pipe(Effect.andThen(Effect.sleep(`${longHoldMs} millis`))),
-              { behavior: "immediate" },
-            )
-            .pipe(Effect.provideService(TransactionPurpose, "test.failedCommit"), Effect.flip)
+                // The deferred foreign key is checked at COMMIT, which fails and is followed by the rollback.
+                const failure = yield* annotateTransactionOwner(
+                  owner,
+                  db
+                    .transaction(
+                      (tx) =>
+                        Effect.gen(function* () {
+                          yield* tx.run("INSERT INTO child (id, parent_id) VALUES (1, 99)")
+                          yield* Effect.sleep(`${longHoldMs} millis`)
+                        }),
+                      { behavior: "immediate" },
+                    )
+                    .pipe(Effect.provideService(TransactionPurpose, "test.failedCommit"), Effect.flip),
+                )
+                const childCount = yield* db.values("SELECT COUNT(*) FROM child")
+                yield* releaseOnProgress()
+                return { failure, childCount }
+              }),
+          )
           expect(isSqlError(failure) && failure.reason.cause).toMatchObject({ code: "SQLITE_CONSTRAINT_FOREIGNKEY" })
 
-          const logged = holds(lines)
+          const logged = holds(logsOwnedBy(lines, owner))
           expect(logged).toHaveLength(1)
           expect(logged[0].fields).toMatchObject({ purpose: "test.failedCommit", outcome: "rollback" })
           expect(logged[0].fields.durationMs).toBeGreaterThanOrEqual(longHoldMs)
-          expect(yield* db.values("SELECT COUNT(*) FROM child")).toEqual([[0]])
+          expect(childCount).toEqual([[0]])
         }),
       ),
-    ))
+    ), 20_000)
 
   test("does not count a long wait for the lock as a hold, nor log a statement that recovers", () =>
     run(
-      captured((lines) =>
+      capturedWithTransactionOwner((lines, owner) =>
         Effect.gen(function* () {
           const tmp = yield* Effect.acquireRelease(
             Effect.promise(() => tmpdir()),
             (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
           )
-          const filename = path.join(tmp.path, "wait.sqlite")
-          const attempts = newStatementAttempts()
-          yield* patchBunQuery((sql) => sql === "begin immediate", attempts)
-          const db = yield* productionDatabase(filename)
-          yield* db.run("CREATE TABLE hold_test (id INTEGER PRIMARY KEY)")
-          const release = yield* inProcessHolder(filename)
+          const {
+            writerStartDelayMs,
+            additionalBusyAttempts,
+            busyCount,
+            attemptsCount,
+            rows,
+          } = yield* withConcurrentUnlabelledHold(
+            path.join(tmp.path, "interference.sqlite"),
+            lines,
+            owner,
+            (releaseOnProgress) =>
+              Effect.gen(function* () {
+                const filename = path.join(tmp.path, "wait.sqlite")
+                const attempts = newStatementAttempts()
+                const context = yield* Layer.build(databaseLayerWithNative(filename))
+                const db = Context.get(context, Database.Service).db
+                const native = Context.get(context, Sqlite.Native)
+                yield* db.run("CREATE TABLE hold_test (id INTEGER PRIMARY KEY)")
+                const releaseHolder = yield* inProcessHolder(filename)
+                yield* patchBunQueryOn(native, (sql) => sql === "begin immediate", attempts)
+                const writerStartRequestedAt = performance.now()
+                const writerStartedAt = performance.now()
+                const writerStarted = yield* Deferred.make<void>()
+                const writer = yield* Effect.gen(function* () {
+                  yield* Deferred.succeed(writerStarted, undefined)
+                  yield* slowLayerConstruction(
+                    path.join(tmp.path, "waiter-delay.sqlite"),
+                    lines,
+                    longHoldMs + 50,
+                  )
+                  const writerStartDelayMs = performance.now() - writerStartRequestedAt
+                  yield* annotateTransactionOwner(
+                    owner,
+                    db
+                      .transaction((tx) => tx.run("INSERT INTO hold_test (id) VALUES (1)"), { behavior: "immediate" })
+                      .pipe(Effect.provideService(TransactionPurpose, "test.waiter")),
+                  )
+                  return writerStartDelayMs
+                }).pipe(Effect.forkChild({ startImmediately: true }))
+                yield* Deferred.await(writerStarted).pipe(
+                  Effect.timeoutOrElse({
+                    duration: "5 seconds",
+                    orElse: () => Effect.die(new Error("writer fiber did not start")),
+                  }),
+                )
 
-          const waitStartedAt = performance.now()
-          const writer = yield* db
-            .transaction((tx) => tx.run("INSERT INTO hold_test (id) VALUES (1)"), { behavior: "immediate" })
-            .pipe(Effect.provideService(TransactionPurpose, "test.waiter"), Effect.forkChild({ startImmediately: true }))
-          // The BEGIN has met the held lock; keep holding well past the hold threshold before releasing it.
-          while (attempts.busy.length === 0 || performance.now() - waitStartedAt < longHoldMs)
-            yield* Effect.sleep("10 millis")
-          release()
-          yield* Fiber.join(writer).pipe(
-            Effect.timeoutOrElse({ duration: lockBackstop, orElse: () => Effect.die(new Error("writer never finished")) }),
+                while (attempts.busy.length === 0 && performance.now() - writerStartedAt < lockWindowMs)
+                  yield* Effect.sleep("10 millis")
+                if (attempts.busy.length === 0) return yield* Effect.die(new Error("writer never met the held lock"))
+                const busyAt = performance.now()
+
+                const sqlite = yield* Effect.promise(() => import("bun:sqlite"))
+                const noisy = new sqlite.Database(filename)
+                yield* Effect.addFinalizer(() => Effect.sync(() => noisy.close()))
+                noisy.run("PRAGMA busy_timeout = 0")
+                const attemptsBeforeNoise = attempts.count
+                const busyBeforeNoise = attempts.busy.length
+                const noiseFailure = yield* Effect.try({
+                  try: () => noisy.query("begin immediate").all(),
+                  catch: (cause) => cause,
+                }).pipe(Effect.flip)
+                const noiseCode =
+                  typeof noiseFailure === "object" && noiseFailure !== null && "code" in noiseFailure
+                    ? noiseFailure.code
+                    : undefined
+                expect(typeof noiseCode === "string" && noiseCode.startsWith("SQLITE_BUSY")).toBe(true)
+                expect(attempts.count).toBe(attemptsBeforeNoise)
+                expect(attempts.busy.length).toBe(busyBeforeNoise)
+
+                while (performance.now() - busyAt < longHoldMs) {
+                  if (performance.now() - busyAt >= lockWindowMs)
+                    return yield* Effect.die(new Error("owned writer wait did not finish its measured interval"))
+                  yield* Effect.sleep("10 millis")
+                }
+                const additionalBusyAttempts = attempts.busy.length - busyBeforeNoise
+                expect(additionalBusyAttempts).toBeGreaterThan(0)
+                yield* releaseOnProgress()
+                releaseHolder()
+                const writerStartDelayMs = yield* Fiber.join(writer).pipe(
+                  Effect.timeoutOrElse({
+                    duration: lockBackstop,
+                    orElse: () => Effect.die(new Error("writer never finished")),
+                  }),
+                )
+                return {
+                  writerStartDelayMs,
+                  additionalBusyAttempts,
+                  busyCount: attempts.busy.length,
+                  attemptsCount: attempts.count,
+                  rows: yield* db.values("SELECT id FROM hold_test"),
+                }
+              }),
           )
-          const waitedMs = performance.now() - waitStartedAt
-
-          expect(waitedMs).toBeGreaterThan(longHoldMs)
-          expect(attempts.busy.length).toBeGreaterThan(0)
-          expect(attempts.count).toBeGreaterThan(attempts.busy.length)
-          expect(holds(lines)).toEqual([])
-          expect(exhausted(lines)).toEqual([])
-          expect(unretried(lines)).toEqual([])
-          expect(yield* db.values("SELECT id FROM hold_test")).toEqual([[1]])
+          expect(writerStartDelayMs).toBeGreaterThanOrEqual(longHoldMs + 50)
+          expect(additionalBusyAttempts).toBeGreaterThan(0)
+          expect(busyCount).toBeGreaterThan(0)
+          expect(attemptsCount).toBeGreaterThan(busyCount)
+          const logs = logsOwnedBy(lines, owner)
+          expect(holds(logs)).toEqual([])
+          expect(exhausted(logs)).toEqual([])
+          expect(unretried(logs)).toEqual([])
+          expect(rows).toEqual([[1]])
         }),
       ),
-    ))
+    ), 20_000)
 })
 
 describe("SQLite lock retry exhaustion diagnostics", () => {
