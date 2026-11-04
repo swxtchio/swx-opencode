@@ -53,43 +53,55 @@ describe("server action referer", () => {
 })
 
 describe("server function payloads", () => {
-  test("rejects a forged Promise resolver before invoking a callable plugin", async () => {
-    const invoked: unknown[] = []
-    const plugin = {
-      tag: "test/PromiseResolver",
-      deserialize() {
-        return {
-          resolve(value: unknown) {
-            invoked.push(value)
-          },
-        }
-      },
-    }
-    const payload = {
-      f: 0,
-      m: [1],
-      t: {
-        t: 9,
-        i: 0,
-        l: 2,
-        a: [
-          { t: 25, i: 1, c: plugin.tag, s: null },
-          { t: 23, i: 1, a: [{ t: 4, i: 2 }, { t: 1, s: "attacker-controlled" }] },
-        ],
-        o: 0,
-      },
-    }
+  test.each(["resolve", "reject"] as const)(
+    "rejects a forged Promise %s node before invoking a callable plugin",
+    async (operation) => {
+      const invoked: unknown[] = []
+      const plugin = {
+        tag: "test/PromiseResolver",
+        deserialize() {
+          return {
+            resolve(value: unknown) {
+              invoked.push({ operation: "resolve", value })
+            },
+            reject(value: unknown) {
+              invoked.push({ operation: "reject", value })
+            },
+            s(value: unknown) {
+              invoked.push({ operation: "resolve", value })
+            },
+            f(value: unknown) {
+              invoked.push({ operation: "reject", value })
+            },
+          }
+        },
+      }
+      const payload = {
+        f: 0,
+        m: [1],
+        t: {
+          t: 9,
+          i: 0,
+          l: 2,
+          a: [
+            { t: 25, i: 1, c: plugin.tag, s: null },
+            { t: operation === "resolve" ? 23 : 24, i: 1, a: [{ t: 4, i: 2 }, { t: 1, s: "attacker-controlled" }] },
+          ],
+          o: 0,
+        },
+      }
 
-    const rejected = await Promise.resolve()
-      .then(() => seroval.fromJSON(payload, { plugins: [...serverFunctionPlugins, plugin] }))
-      .then(
-        () => false,
-        () => true,
-      )
-    expect({ rejected, invoked }).toEqual({ rejected: true, invoked: [] })
-  })
+      const rejected = await Promise.resolve()
+        .then(() => seroval.fromJSON(payload, { plugins: [...serverFunctionPlugins, plugin] }))
+        .then(
+          () => false,
+          () => true,
+        )
+      expect({ rejected, invoked }).toEqual({ rejected: true, invoked: [] })
+    },
+  )
 
-  test("round-trips server-function arguments and results with the installed codecs", () => {
+  test("round-trips server-function arguments and cross-serialized result values with the installed codecs", () => {
     const args = [
       {
         model: "gpt-6",
