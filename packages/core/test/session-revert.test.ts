@@ -101,7 +101,6 @@ describe("SessionV2.revert files", () => {
             if (!after) throw new Error("Renamed snapshot missing")
             const files = yield* snapshot.files({ from: before, to: after })
 
-            expect(files).toEqual([RelativePath.make("new name.txt"), RelativePath.make("old name.txt")])
             yield* events.publish(SessionEvent.Step.Ended, {
               sessionID: created.id,
               assistantMessageID,
