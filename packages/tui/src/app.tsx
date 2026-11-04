@@ -34,6 +34,7 @@ import { ProjectProvider, useProject } from "./context/project"
 import { EditorContextProvider } from "./context/editor"
 import { useEvent } from "./context/event"
 import { SDKProvider, useSDK } from "./context/sdk"
+import { registerTerminalSighup } from "./terminal-signal"
 import { StartupLoading } from "./component/startup-loading"
 import { SyncProvider, useSync } from "./context/sync"
 import { DataProvider } from "./context/data"
@@ -232,15 +233,9 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
       yield* Effect.addFinalizer(() => Effect.sync(TuiAudio.dispose))
       const shutdown = yield* Deferred.make<unknown>()
       const onSighup = () => destroyRenderer(renderer)
-      const terminal = process.stdin.isTTY || process.stdout.isTTY
       yield* Effect.acquireRelease(
-        Effect.sync(() => {
-          if (terminal) process.on("SIGHUP", onSighup)
-        }),
-        () =>
-          Effect.sync(() => {
-            if (terminal) process.off("SIGHUP", onSighup)
-          }),
+        Effect.sync(() => registerTerminalSighup(onSighup)),
+        (unregister) => Effect.sync(unregister),
       )
       renderer.once("destroy", () => Deferred.doneUnsafe(shutdown, Effect.void))
       const pluginRuntime = createPluginRuntime()
