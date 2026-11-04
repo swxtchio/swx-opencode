@@ -2095,7 +2095,9 @@ itHeldLock.live(
         Effect.gen(function* () {
           const session = yield* Session.Service
           const { chat, msg, lock, terminal } = yield* failTurnUnderHeldLock(dir)
-          expect(lock.produced && sqliteLockMessage(lock.produced)).toBe("Database is locked (SQLITE_BUSY)")
+          expect(lock.produced && sqliteLockMessage(lock.produced)).toMatch(
+            /^Database is locked \(SQLITE_BUSY\) after \d+ ms$/,
+          )
 
           // Keep the retry off the database while the lock is released and the assistant is removed.
           const skipped = yield* Deferred.make<void>()
@@ -2162,7 +2164,9 @@ for (const scenario of [
             const { lock, exit, terminal } = yield* failTurnUnderHeldLock(dir, scenario.trigger).pipe(
               Effect.provideService(Logger.CurrentLoggers, new Set([...loggers, halt.logger])),
             )
-            expect(lock.produced && sqliteLockMessage(lock.produced)).toBe("Database is locked (SQLITE_BUSY)")
+            expect(lock.produced && sqliteLockMessage(lock.produced)).toMatch(
+              /^Database is locked \(SQLITE_BUSY\) after \d+ ms$/,
+            )
 
             expect(halt.lines).toHaveLength(1)
             expect(String(halt.lines[0].error).toLowerCase()).toContain("database is locked (sqlite_busy)")
@@ -2595,7 +2599,9 @@ itSqliteLock.live(
           })
           yield* off
           const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
-          const lockMessage = "Database is locked (SQLITE_BUSY)"
+          const lockMessage = sqliteLockMessage(error)
+          if (!lockMessage) throw new Error("SQLite busy error did not produce a lock message")
+          expect(lockMessage).toMatch(/^Database is locked \(SQLITE_BUSY\) after \d+ ms$/)
 
           expect(result).toBe("stop")
           expect(handle.message.error).toMatchObject({ name: "UnknownError", data: { message: lockMessage } })

@@ -52,6 +52,7 @@ import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
+import { Sqlite } from "@opencode-ai/core/database/sqlite"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { eq } from "drizzle-orm"
@@ -1499,7 +1500,7 @@ const layer = Layer.effect(
           ),
         )
       return yield* drain(input.sessionID, entry.own.id)
-    }, Effect.scoped)
+    }, Effect.scoped, Sqlite.withRetryWindow)
 
     // Failed originals are reported through the existing session error channel.
     const rejected = (sessionID: SessionID) => (cause: Cause.Cause<unknown>) =>

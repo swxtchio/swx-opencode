@@ -34,6 +34,7 @@ import { isDeepStrictEqual } from "node:util"
 import { createHash } from "node:crypto"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { sqliteLockMessage } from "@/util/sqlite-error"
+import { Sqlite } from "@opencode-ai/core/database/sqlite"
 import { MachineMessage } from "./machine-message"
 import { MessageV2 } from "./message-v2"
 import { MessageID, PartID, SessionID } from "./schema"
@@ -115,13 +116,11 @@ export class HistoricalIdentityError extends Schema.TaggedErrorClass<HistoricalI
   { sessionID: SessionID, messageID: MessageID, message: Schema.String },
 ) {}
 
-// Each consume attempt waits out the statement lock window, so a lock released
-// within about this many windows lets the run go on.
+// Attempts share the SessionPrompt retry window; this count only bounds repeated immediate refusals.
 const consumeAttempts = 5
-// Bounds an attempt's wait for the session permit, the shared connection and
-// BEGIN together: its own statement window plus one other statement's window
-// ahead of it on the connection. The body, once begun, is not timed.
+// Bounds one wait for the session permit, shared connection, and BEGIN. The body, once begun, is not timed.
 const consumeAcquireBackstop = Duration.seconds(20)
+const consumeAcquireBackstopSlack = Duration.millis(250)
 // A review hold's lease (#212). Its client renews it on activity and closes its
 // view after 5 minutes without any, so a live view always renews in time; the
 // lease only ends a hold whose client vanished without releasing it.
@@ -2964,21 +2963,37 @@ const layer = Layer.effect(
     // Only an attempt whose consume never ran is made again, so no executed
     // transaction body is replayed. Success is the attempt's own commit.
     const consume = Effect.fn("SessionQueue.consume")(function* (sessionID: SessionID) {
+      const startedAt = performance.now()
+      let sawLock = false
       for (let attempts = 1; ; attempts++) {
-        const attempt = yield* consumeAttempt(sessionID)
+        const window = yield* Sqlite.retryWindowStatus
+        const localElapsedMs = performance.now() - startedAt
+        const remainingMs = Math.max(0, Math.min(window.remainingMs, window.windowMs - localElapsedMs))
+        const backstopMs = Math.max(
+          1,
+          Math.min(
+            Duration.toMillis(consumeAcquireBackstop),
+            Math.ceil(remainingMs + Duration.toMillis(consumeAcquireBackstopSlack)),
+          ),
+        )
+        const attempt = yield* consumeAttempt(sessionID, Duration.millis(backstopMs))
         if (attempt.kind === "consumed") return attempt.seen
+        sawLock ||= attempt.kind === "locked" || window.sawLock
         yield* Effect.logWarning(
           attempt.kind === "locked"
             ? "queue consume met a held write lock"
             : "queue consume waited past its acquisition backstop",
           { "session.id": sessionID, attempts },
         )
-        if (attempts === consumeAttempts)
+        const current = yield* Sqlite.retryWindowStatus
+        const waitedMs = Math.max(Math.round(performance.now() - startedAt), current.elapsedMs)
+        const remaining = Math.min(current.remainingMs, current.windowMs - (performance.now() - startedAt))
+        if (attempts === consumeAttempts || remaining <= 0)
           return yield* Effect.die(
             new ConsumeLockedError({
               sessionID,
-              attempts: consumeAttempts,
-              message: `SessionQueue.consume could not begin its write in ${consumeAttempts} attempts; session ${sessionID} stopped, and its queued prompts stay pending until it is prompted again`,
+              attempts,
+              message: `${sawLock || current.sawLock ? "SQLite lock contention" : "SQLite write acquisition"} persisted for ${waitedMs} ms while SessionQueue.consume tried to begin its write; session ${sessionID} stopped, and its queued prompts stay pending until it is prompted again`,
             }),
           )
       }
@@ -2988,7 +3003,7 @@ const layer = Layer.effect(
     // the attempt runs in its own fiber and the backstop stops waiting for it
     // rather than interrupting it. An abandoned attempt that later reaches its
     // body rolls back without deleting anything.
-    const consumeAttempt = Effect.fnUntraced(function* (sessionID: SessionID) {
+    const consumeAttempt = Effect.fnUntraced(function* (sessionID: SessionID, backstop: Duration.Input) {
       const state = { began: false, abandoned: false }
       // Whether the abandon won: a body that began first is waited for instead,
       // so a committed consume is never reported as a backstop.
@@ -3018,7 +3033,7 @@ const layer = Layer.effect(
         ),
       ).pipe(Effect.forkIn(scope, { startImmediately: true }))
       const waited = yield* Fiber.await(fiber).pipe(
-        Effect.timeoutOption(consumeAcquireBackstop),
+        Effect.timeoutOption(backstop),
         Effect.onInterrupt(() => abandon(fiber)),
       )
       if (Option.isNone(waited) && (yield* abandon(fiber))) return { kind: "backstop" as const }

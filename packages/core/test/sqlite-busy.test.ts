@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { Database } from "../src/database/database"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
-import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, References } from "effect"
+import { Cause, Context, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, References } from "effect"
 import { isSqlError } from "effect/unstable/sql/SqlError"
 import { SqlClient } from "effect/unstable/sql/SqlClient"
 import { Sqlite } from "../src/database/sqlite"
@@ -817,6 +817,65 @@ describe("SQLite busy timeout and statement retries", () => {
     )
     if (Exit.isFailure(exit)) throw new Error(Cause.pretty(exit.cause))
   }, exhaustionTestMs)
+
+  for (const clientType of ["bun", "core-node", "standalone-node"] as const) {
+    test.skipIf(clientType !== "bun" && !nodeSqliteDrivers)(
+      `${clientType} shares one session retry window across consecutive locked statements`,
+      async () => {
+        await using tmp = await tmpdir()
+        const filename = path.join(tmp.path, `${clientType}-session-window.sqlite`)
+        const writerSql = "INSERT INTO busy_retry_test (id, value) VALUES (1, 'session-window-writer')"
+        const exit = await Effect.runPromiseExit(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const attempts = newStatementAttempts()
+              const client = yield* clientWithAttemptCount({ clientType, filename, statement: writerSql, attempts })
+              yield* client.unsafe("CREATE TABLE busy_retry_test (id INTEGER PRIMARY KEY, value TEXT NOT NULL)").raw
+              yield* client.unsafe("PRAGMA busy_timeout = 0").raw
+              const holder = yield* Effect.promise(() =>
+                startLockHolder(filename, clientType === "bun" ? holderScript : nodeHolderScript),
+              )
+              yield* Effect.addFinalizer(() => Effect.promise(() => holder.release()))
+
+              const result = yield* Sqlite.withRetryWindow(
+                Effect.gen(function* () {
+                  const firstStartedAt = performance.now()
+                  const first = yield* client.unsafe(writerSql).raw.pipe(Effect.flip)
+                  const firstElapsedMs = performance.now() - firstStartedAt
+                  const secondStartedAt = performance.now()
+                  const second = yield* client
+                    .unsafe("INSERT INTO busy_retry_test (id, value) VALUES (2, 'session-window-followup')")
+                    .raw.pipe(Effect.flip)
+                  return { first, firstElapsedMs, second, secondElapsedMs: performance.now() - secondStartedAt }
+                }),
+                Duration.millis(500),
+              ).pipe(
+                Effect.timeoutOrElse({
+                  duration: "3 seconds",
+                  orElse: () => Effect.fail(new Error("the shared SQLite retry window did not stop")),
+                }),
+              )
+
+              expect(isSqlError(result.first)).toBe(true)
+              expect(isSqlError(result.second)).toBe(true)
+              expect(attempts.count).toBeGreaterThan(1)
+              expect(result.firstElapsedMs).toBeGreaterThan(300)
+              expect(result.secondElapsedMs).toBeLessThan(400)
+              if (!isSqlError(result.first) || !isSqlError(result.second)) return
+              expect(result.first.reason._tag).toBe("LockTimeoutError")
+              expect(result.second.reason._tag).toBe("LockTimeoutError")
+              expect(Sqlite.lockWaitMs(result.second)).toBeGreaterThan(300)
+              if (clientType === "bun") expect(result.first.reason.cause).toMatchObject({ code: "SQLITE_BUSY" })
+              else expect(result.first.reason.cause).toMatchObject({ errcode: 5 })
+              yield* Effect.promise(() => holder.release())
+            }),
+          ),
+        )
+        if (Exit.isFailure(exit)) throw new Error(Cause.pretty(exit.cause))
+      },
+      10_000,
+    )
+  }
 
   for (const clientType of ["bun", "core-node", "standalone-node"] as const) {
     test.skipIf(clientType !== "bun" && !nodeSqliteDrivers)(

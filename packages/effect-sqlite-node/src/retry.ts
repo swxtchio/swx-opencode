@@ -1,18 +1,78 @@
-import * as Duration from "effect/Duration"
-import * as Effect from "effect/Effect"
-import * as Schedule from "effect/Schedule"
-import type { SqlError } from "effect/unstable/sql/SqlError"
+import { Context, Duration, Effect, Option, Schedule } from "effect"
+import { isSqlError, type SqlError } from "effect/unstable/sql/SqlError"
 
 const sqliteBusySnapshot = 517
+const defaultRetryWindow = Duration.seconds(10)
+const sessionRetryWindow = Duration.minutes(1)
+const lockWaits = new WeakMap<object, number>()
 
-// Give a competing writer up to 10 seconds, since many processes write to one shared database (#196), but wait
-// asynchronously between short native attempts so a contended statement never blocks the event loop. The window runs
-// from the first failed retry, and the backoff cap matches SQLite's own busy-handler sleep.
-const retrySchedule = Schedule.exponential("10 millis").pipe(
-  Schedule.modifyDelay((_output, delay) => Effect.succeed(Duration.millis(Math.min(Duration.toMillis(delay), 100)))),
-  Schedule.jittered,
-  Schedule.both(Schedule.during("10 seconds")),
+type RetryWindowState = {
+  readonly windowMs: number
+  startedAt: number | undefined
+  sawLock: boolean
+}
+
+export class RetryWindow extends Context.Service<RetryWindow, RetryWindowState>()(
+  "@opencode-ai/effect-sqlite-node/RetryWindow",
+) {}
+
+export const withRetryWindow = <A, E, R>(effect: Effect.Effect<A, E, R>, window = sessionRetryWindow) =>
+  Effect.withFiber((fiber) => {
+    if (Option.isSome(Context.getOption(fiber.context, RetryWindow))) return effect
+    return effect.pipe(
+      Effect.provideService(RetryWindow, {
+        windowMs: Duration.toMillis(window),
+        startedAt: undefined,
+        sawLock: false,
+      }),
+    )
+  })
+
+export const withFreshRetryWindow = <A, E, R>(effect: Effect.Effect<A, E, R>, window = sessionRetryWindow) =>
+  effect.pipe(
+    Effect.provideService(RetryWindow, {
+      windowMs: Duration.toMillis(window),
+      startedAt: undefined,
+      sawLock: false,
+    }),
+  )
+
+export const resetRetryWindow = Effect.gen(function* () {
+  const window = yield* Effect.serviceOption(RetryWindow)
+  if (Option.isNone(window)) return
+  window.value.startedAt = undefined
+  window.value.sawLock = false
+})
+
+export const retryWindowStatus = Effect.withFiber((fiber) =>
+  Effect.sync(() => {
+    const window = Context.getOption(fiber.context, RetryWindow)
+    if (Option.isNone(window)) {
+      const windowMs = Duration.toMillis(sessionRetryWindow)
+      return { windowMs, elapsedMs: 0, remainingMs: windowMs, sawLock: false }
+    }
+    const elapsedMs = window.value.startedAt === undefined ? 0 : performance.now() - window.value.startedAt
+    return {
+      windowMs: window.value.windowMs,
+      elapsedMs: Math.round(elapsedMs),
+      remainingMs: Math.max(0, window.value.windowMs - elapsedMs),
+      sawLock: window.value.sawLock,
+    }
+  }),
 )
+
+export const lockWaitMs = (error: unknown) => {
+  if (!isSqlError(error)) return undefined
+  return lockWaits.get(error)
+}
+
+// Keep the default client window short; SessionPrompt supplies one shared recovery window for its dependent writes.
+const retrySchedule = (windowMs: number) =>
+  Schedule.exponential("10 millis").pipe(
+    Schedule.modifyDelay((_output, delay) => Effect.succeed(Duration.millis(Math.min(Duration.toMillis(delay), 100)))),
+    Schedule.jittered,
+    Schedule.both(Schedule.during(Duration.millis(windowMs))),
+  )
 
 // A stale read snapshot fails every retry of the same statement, and only restarting its transaction can recover,
 // so that class fails at once. bun:sqlite reports it by code and node:sqlite by its SQLite result code.
@@ -25,32 +85,55 @@ const isStaleSnapshot = (cause: unknown) =>
 // Every SQLite client routes its statements through this one gate. A lock failure that leaves it logs one summary,
 // never one line per attempt, so a contended statement cannot flood the log.
 export const retryLocked = <A>(execute: Effect.Effect<A, SqlError>, sql: string) =>
-  Effect.suspend(() => {
-    const startedAt = performance.now()
-    let attempts = 0
-    const attempt = Effect.suspend(() => {
-      attempts++
-      return execute
+  Effect.withFiber((fiber) => {
+    const window = Option.getOrUndefined(Context.getOption(fiber.context, RetryWindow))
+    return Effect.suspend(() => {
+      const startedAt = performance.now()
+      let attempts = 0
+      let episodeStartedAt: number | undefined
+      const attempt = Effect.suspend(() => {
+        attempts++
+        return execute
+      })
+      const retryable = (error: SqlError) => error.reason.isRetryable && !isStaleSnapshot(error.reason.cause)
+      const withinWindow = (error: SqlError) => {
+        if (!retryable(error)) return false
+        if (error.reason._tag !== "LockTimeoutError" || !window) return true
+        window.sawLock = true
+        window.startedAt ??= performance.now()
+        episodeStartedAt ??= window.startedAt
+        return performance.now() - window.startedAt < window.windowMs
+      }
+      // Only a statement that met the lock builds the retry schedule, which re-attempts it at once before backing off.
+      return attempt.pipe(
+        Effect.catchIf(withinWindow, (error) =>
+          Effect.retry(attempt, {
+            schedule: retrySchedule(
+              error.reason._tag === "LockTimeoutError" && window
+                ? window.windowMs
+                : Duration.toMillis(defaultRetryWindow),
+            ),
+            while: withinWindow,
+          }),
+        ),
+        Effect.tapError((error) => {
+          if (error.reason._tag !== "LockTimeoutError") return Effect.void
+          const cause: { code?: unknown; errcode?: unknown; errno?: unknown } =
+            typeof error.reason.cause === "object" && error.reason.cause !== null ? error.reason.cause : {}
+          const elapsedMs = Math.round(performance.now() - (episodeStartedAt ?? startedAt))
+          if (!isStaleSnapshot(error.reason.cause) && (attempts > 1 || window?.sawLock)) lockWaits.set(error, elapsedMs)
+          return Effect.logWarning(attempts > 1 ? "sqlite lock retries exhausted" : "sqlite lock failed without retry", {
+            pid: process.pid,
+            statement: statementOperation(sql),
+            attempts,
+            elapsedMs,
+            // node:sqlite's code is generic, so its full extended result code tells BUSY from BUSY_SNAPSHOT.
+            "sqlite.code": cause.code,
+            "sqlite.errcode": cause.errcode ?? cause.errno,
+          })
+        }),
+      )
     })
-    const retryable = (error: SqlError) => error.reason.isRetryable && !isStaleSnapshot(error.reason.cause)
-    // Only a statement that met the lock builds the retry schedule, which re-attempts it at once before backing off.
-    return attempt.pipe(
-      Effect.catchIf(retryable, () => Effect.retry(attempt, { schedule: retrySchedule, while: retryable })),
-      Effect.tapError((error) => {
-        if (error.reason._tag !== "LockTimeoutError") return Effect.void
-        const cause: { code?: unknown; errcode?: unknown; errno?: unknown } =
-          typeof error.reason.cause === "object" && error.reason.cause !== null ? error.reason.cause : {}
-        return Effect.logWarning(retryable(error) ? "sqlite lock retries exhausted" : "sqlite lock failed without retry", {
-          pid: process.pid,
-          statement: statementOperation(sql),
-          attempts,
-          elapsedMs: Math.round(performance.now() - startedAt),
-          // node:sqlite's code is generic, so its full extended result code tells BUSY from BUSY_SNAPSHOT.
-          "sqlite.code": cause.code,
-          "sqlite.errcode": cause.errcode ?? cause.errno,
-        })
-      }),
-    )
   })
 
 // Names a statement by its operation alone: the leading keyword, and a BEGIN's transaction behaviour. Leading comments
