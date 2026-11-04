@@ -131,7 +131,21 @@ const make = (options: Config) =>
     })
 
     const semaphore = yield* Semaphore.make(1)
-    const withPermit = <A, E, R>(effect: Effect.Effect<A, E, R>) => semaphore.withPermit(effect)
+    const withPermit = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      Effect.scoped(
+        Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const immediate = yield* semaphore.withPermitsIfAvailable(1)(restore(effect))
+            if (immediate._tag === "Some") return immediate.value
+            const acquired = yield* Deferred.make<void>()
+            yield* semaphore
+              .withPermits(1)(Effect.andThen(Deferred.succeed(acquired, undefined), Effect.never))
+              .pipe(Effect.forkScoped({ startImmediately: true }))
+            yield* restore(Deferred.await(acquired))
+            return yield* restore(effect)
+          }),
+        ),
+      )
     const lockedConnection = identity<SqliteConnection>({
       execute(query, params, transformRows) {
         return withPermit(connection.execute(query, params, transformRows))

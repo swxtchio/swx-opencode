@@ -250,6 +250,16 @@ const sqliteClientForPermitTest = (clientType: SqliteClientType) =>
     return Context.get(context, SqlClient)
   })
 
+const hasLoadExtension = (
+  client: SqlClient,
+): client is SqlClient & { readonly loadExtension: (path: string) => Effect.Effect<void, unknown> } =>
+  "loadExtension" in client && typeof client.loadExtension === "function"
+
+const hasExport = (
+  client: SqlClient,
+): client is SqlClient & { readonly export: Effect.Effect<Uint8Array, unknown> } =>
+  "export" in client && Effect.isEffect(client.export)
+
 const queuedAcquisition = (client: SqlClient, kind: "reserve" | "transaction") =>
   (kind === "reserve"
     ? Effect.scoped(Effect.andThen(client.reserve, Effect.yieldNow))
@@ -293,12 +303,6 @@ describe("SQLite permit acquisition interruption", () => {
                     expect(queued.pollUnsafe()).toBeUndefined()
 
                     yield* Deferred.succeed(holderRelease, undefined)
-                    yield* Fiber.join(holder).pipe(
-                      Effect.timeoutOrElse({
-                        duration: "1 second",
-                        orElse: () => Effect.fail(new Error(`${clientType} holder did not release the permit`)),
-                      }),
-                    )
                     for (let step = 0; step < delay; step++) yield* Effect.yieldNow
                     yield* Fiber.interrupt(queued).pipe(
                       Effect.timeoutOrElse({
@@ -318,6 +322,12 @@ describe("SQLite permit acquisition interruption", () => {
                         }),
                       ),
                     ).toEqual([[3]])
+                    yield* Fiber.join(holder).pipe(
+                      Effect.timeoutOrElse({
+                        duration: "1 second",
+                        orElse: () => Effect.fail(new Error(`${clientType} holder did not release the permit`)),
+                      }),
+                    )
                   }).pipe(
                     Effect.ensuring(
                       Deferred.succeed(holderRelease, undefined).pipe(Effect.andThen(Fiber.interrupt(holder))),
@@ -331,6 +341,106 @@ describe("SQLite permit acquisition interruption", () => {
       },
       20_000,
     )
+
+    for (const kind of ["execute", "raw", "values", "unprepared", "loadExtension", "export"] as const) {
+      if (kind === "export" && clientType !== "bun") continue
+      test.skipIf(clientType !== "bun" && !nodeSqliteDrivers)(
+        `${clientType} cancels queued ${kind} acquisition without leaking permits`,
+        async () => {
+          await Effect.runPromise(
+            Effect.scoped(
+              Effect.gen(function* () {
+                const client: SqlClient = yield* sqliteClientForPermitTest(clientType)
+                const statement = client.unsafe("SELECT 2")
+                const operation =
+                  kind === "execute"
+                    ? Effect.asVoid(statement)
+                    : kind === "raw"
+                      ? Effect.asVoid(statement.raw)
+                      : kind === "values"
+                        ? Effect.asVoid(statement.values)
+                        : kind === "unprepared"
+                          ? Effect.scoped(
+                              Effect.flatMap(client.reserve, (connection) =>
+                                connection.executeUnprepared("SELECT 2", [], undefined),
+                              ),
+                            ).pipe(Effect.asVoid)
+                          : kind === "loadExtension"
+                            ? hasLoadExtension(client)
+                              ? Effect.asVoid(client.loadExtension("/missing/sqlite-permit-test-extension")).pipe(
+                                  Effect.catchIf(isSqlError, () => Effect.void),
+                                )
+                              : Effect.fail(new Error(`${clientType} layer does not expose loadExtension`))
+                            : hasExport(client)
+                              ? Effect.asVoid(client.export)
+                              : Effect.fail(new Error(`${clientType} layer does not expose export`))
+
+                for (let delay = 0; delay < 32; delay++) {
+                  const holderReady = yield* Deferred.make<void>()
+                  const holderRelease = yield* Deferred.make<void>()
+                  const holder = yield* Effect.scoped(
+                    Effect.gen(function* () {
+                      yield* client.reserve
+                      yield* Deferred.succeed(holderReady, undefined)
+                      yield* Deferred.await(holderRelease)
+                    }),
+                  ).pipe(Effect.forkChild({ startImmediately: true }))
+
+                  yield* Effect.gen(function* () {
+                    yield* Deferred.await(holderReady).pipe(
+                      Effect.timeoutOrElse({
+                        duration: "1 second",
+                        orElse: () => Effect.fail(new Error(`${clientType} holder did not acquire the permit`)),
+                      }),
+                    )
+                    const queued = yield* Effect.scoped(Effect.andThen(operation, Effect.yieldNow)).pipe(
+                      Effect.provideService(References.MaxOpsBeforeYield, 3),
+                      Effect.forkChild({ startImmediately: true }),
+                    )
+                    yield* Effect.yieldNow
+                    expect(queued.pollUnsafe()).toBeUndefined()
+
+                    yield* Deferred.succeed(holderRelease, undefined)
+                    for (let step = 0; step < delay; step++) yield* Effect.yieldNow
+                    yield* Fiber.interrupt(queued).pipe(
+                      Effect.timeoutOrElse({
+                        duration: "1 second",
+                        orElse: () => Effect.fail(new Error(`${clientType} queued ${kind} did not settle after interrupt`)),
+                      }),
+                    )
+                    expect(
+                      yield* client.unsafe("SELECT 3").values.pipe(
+                        Effect.timeoutOrElse({
+                          duration: "1 second",
+                          orElse: () => Effect.fail(new Error(`${clientType} SQL did not proceed after interrupting ${kind}`)),
+                        }),
+                      ),
+                    ).toEqual([[3]])
+                    yield* Fiber.join(holder).pipe(
+                      Effect.timeoutOrElse({
+                        duration: "1 second",
+                        orElse: () => Effect.fail(new Error(`${clientType} holder did not release the permit`)),
+                      }),
+                    )
+                  }).pipe(
+                    Effect.ensuring(
+                      Deferred.succeed(holderRelease, undefined).pipe(
+                        Effect.andThen(
+                          Effect.asVoid(Fiber.interrupt(holder)).pipe(
+                            Effect.timeoutOrElse({ duration: "1 second", orElse: () => Effect.void }),
+                          ),
+                        ),
+                      ),
+                    ),
+                  )
+                }
+              }),
+            ),
+          )
+        },
+        20_000,
+      )
+    }
 
     // Waiting cancellation is a preservation control; the reserve sweep above owns the acquisition-handoff proof.
     test.skipIf(clientType !== "bun" && !nodeSqliteDrivers)(
@@ -1075,3 +1185,28 @@ describe("SQLite busy timeout and statement retries", () => {
     })
   }
 })
+
+test(
+  "native Node runs Core Node and standalone SQLite permit handoff regressions",
+  async () => {
+    const node = Bun.which("node")
+    if (!node) throw new Error("Node is required for the native Node SQLite acquisition tests")
+    const loader = path.join(import.meta.dir, "fixture/node-typescript-loader.mjs")
+    const script = path.join(import.meta.dir, "fixture/sqlite-acquisition-node.mjs")
+    const child = Bun.spawn([node, "--experimental-strip-types", "--loader", loader, script], {
+      cwd: path.resolve(import.meta.dir, ".."),
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const [exitCode, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ])
+    if (exitCode !== 0) throw new Error(`Native Node acquisition tests failed (${exitCode})\n${stdout}\n${stderr}`)
+    expect(stdout).toMatch(/node=24\./)
+    expect(stdout).toContain("PASS core-node")
+    expect(stdout).toContain("PASS standalone-node")
+  },
+  120_000,
+)

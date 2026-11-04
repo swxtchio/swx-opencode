@@ -83,15 +83,16 @@ Newest first. Each entry names the upstream range brought in.
 - **#395** Partially port the atomic SQLite acquisition behavior from `anomalyco/opencode#60651`
   (`c6056f39312748c633de00ad2c2576b7e042b97d`, downstream `79aafa2f82e7293ba7f2c1222e35b2f58dc5c5ea`; review correction `9f7cc80702fee80e82dd811a35f9b8d16e97ae29`)
   into `packages/core/src/database/sqlite.bun.ts`, `packages/core/src/database/sqlite.node.ts`, and
-  `packages/effect-sqlite-node/src/index.ts`. Serialize ordinary statements with `Semaphore.withPermit`; use the
-  fork's pinned Effect beta.83 and an immediately started, Scope-owned child with `Semaphore.withPermits` for
-  reserve/transaction ownership instead of upstream's Effect 4.1 `Semaphore.takeScoped`. This preserves synchronous
-  uncontended query scheduling while allowing interrupted reserve waiters to release their permit. Retain the current
-  adapters and retry/transaction serialization, excluding the Effect upgrade, workerd adapter, generated API changes,
-  and unrelated compatibility edits. In `packages/core/test/sqlite-busy.test.ts`, the queued `reserve` handoff sweep is the
-  acquisition-interruption red/green proof; the queued `withTransaction` arm is a preservation control because the
-  pinned `SqlClient.makeWithTransaction` masks `acquireConnection`. A separate bounded reserve-wait control cancels
-  while the permit holder remains active and passes with both the original and fixed acquirers. Partially adapt the
+  `packages/effect-sqlite-node/src/index.ts`. Ordinary statements first use `Semaphore.withPermitsIfAvailable` for an
+  uncontended synchronous path; contended acquisition uses an immediately started, Scope-owned child so interruption
+  cannot strand the permit. Keep `reserve` and `withTransaction` on the Scope-owned child path instead of upstream's
+  Effect 4.1 `Semaphore.takeScoped`; retain the current adapters and retry/transaction serialization, excluding the
+  Effect upgrade, workerd adapter, generated API changes, and unrelated compatibility edits. In
+  `packages/core/test/sqlite-busy.test.ts`, bounded queued-acquisition sweeps cover ordinary statement execute/raw/values,
+  reserve, transaction/unprepared, `loadExtension`, and Bun `export`, then verify later SQL proceeds. The
+  `packages/core/test/fixture/sqlite-acquisition-node.mjs` runner exercises Core Node and standalone Node in native
+  Node 24, so neither driver is silently skipped. The transaction arm preserves `SqlClient.makeWithTransaction`'s
+  masked `acquireConnection` path; the reserve-wait control cancels while the permit holder remains active. Partially adapt the
   owner-only file behavior from `anomalyco/opencode#52150`
   (`89d37a0f6de691979f65e52ba35913b5f0b957bf`, downstream `5c5df6c8e604452d87c823e4aee5cacb9a8b8f5b`; symlink/birth correction `9f7cc80702fee80e82dd811a35f9b8d16e97ae29`) at the fork's
   `Database.layerFromPath` boundary. `packages/core/src/database/file-permissions.ts` resolves final-component
