@@ -44,12 +44,13 @@ test("uses nested cause text when the worker error message is empty", async () =
 
 async function withWorker(run: (client: Client) => Promise<void>) {
   const worker = new Worker(fileURLToPath(new URL("./rpc-worker.ts", import.meta.url)))
+  worker.onerror = (event) => event.preventDefault()
   const client = Rpc.client<WorkerRpc>(worker)
   try {
     await expect(within(client.call("ready", undefined), "worker did not acknowledge readiness")).resolves.toBe("ready")
     await run(client)
   } finally {
-    await worker.terminate()
+    worker.terminate()
   }
 }
 
