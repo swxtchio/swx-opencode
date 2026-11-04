@@ -10,26 +10,30 @@ import { testEffect } from "../lib/effect"
 const it = testEffect(LayerNode.compile(LayerNodePlatform.requestExecutor))
 
 it.live(
-  "native provider requests override fetch options while preserving the response body",
+  "native provider requests survive Bun's default idle timeout while its control expires",
   Effect.gen(function* () {
     if (process.platform === "win32") return
+    if (process.env.BUN_CONFIG_HTTP_IDLE_TIMEOUT !== undefined)
+      throw new Error("native fetch acceptance requires Bun's unmodified HTTP idle-timeout default")
 
     const providerStarted = Promise.withResolvers<void>()
+    const controlStarted = Promise.withResolvers<void>()
     const providerInit = Promise.withResolvers<unknown>()
     const release = Promise.withResolvers<void>()
     let released = false
     const listening = Promise.withResolvers<void>()
     const server = createServer((request, response) => {
-      if (request.url !== "/provider") {
+      if (request.url !== "/provider" && request.url !== "/control") {
         response.writeHead(404).end()
         return
       }
-      providerStarted.resolve()
       response.writeHead(200, { "content-type": "text/plain" })
       response.write("ready:")
+      if (request.url === "/provider") providerStarted.resolve()
+      else controlStarted.resolve()
       void release.promise.then(() => {
         if (response.destroyed) return
-        response.end("native provider completed")
+        response.end(request.url === "/provider" ? "native provider completed" : "default fetch completed")
       })
     })
     server.on("listening", () => listening.resolve())
@@ -59,22 +63,42 @@ it.live(
       const response = yield* executor.execute(HttpClientRequest.get(`${url}/provider`))
       return yield* response.text
     }).pipe(
+      Effect.timeout("10 minutes"),
       Effect.provideService(FetchHttpClient.Fetch, observeFetch),
       Effect.provideService(FetchHttpClient.RequestInit, configuredTimeout),
       Effect.forkChild,
     )
+    const controlStartedAt = Date.now()
+    const control = fetch(`${url}/control`)
+      .then(async (response) => ({
+        type: "completed" as const,
+        body: await response.text(),
+        elapsed: Date.now() - controlStartedAt,
+      }))
+      .catch((error: unknown) => ({ type: "failed" as const, error, elapsed: Date.now() - controlStartedAt }))
 
-    yield* Effect.promise(() => providerStarted.promise).pipe(Effect.timeout("5 seconds"))
+    yield* Effect.promise(() => Promise.all([providerStarted.promise, controlStarted.promise])).pipe(
+      Effect.timeout("15 seconds"),
+    )
     expect(yield* Effect.promise(() => providerInit.promise).pipe(Effect.timeout("5 seconds"))).toBe(false)
+    const controlOutcome = yield* Effect.promise(() => control).pipe(Effect.timeout("7 minutes"))
+    expect(controlOutcome.type).toBe("failed")
+    if (controlOutcome.type !== "failed") throw new Error("default Bun fetch unexpectedly completed the held control")
+    expect(controlOutcome.error).toBeInstanceOf(Error)
+    if (controlOutcome.error instanceof Error) expect(controlOutcome.error.name).toBe("TimeoutError")
+    expect(controlOutcome.elapsed).toBeGreaterThanOrEqual(300_000)
+    expect(controlOutcome.elapsed).toBeLessThan(390_000)
     expect(released).toBe(false)
     expect(server.listening).toBe(true)
 
+    yield* Effect.sleep("10 seconds")
+    expect(released).toBe(false)
     released = true
     release.resolve()
     const response = yield* Fiber.join(provider).pipe(Effect.timeout("10 seconds"))
     expect(response).toBe("ready:native provider completed")
   }),
-  20_000,
+  480_000,
 )
 
 it.live(
