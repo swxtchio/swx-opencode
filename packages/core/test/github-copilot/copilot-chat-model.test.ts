@@ -1,4 +1,5 @@
 import { OpenAICompatibleChatLanguageModel } from "@opencode-ai/core/github-copilot/chat/openai-compatible-chat-language-model"
+import { convertToOpenAICompatibleChatMessages } from "@opencode-ai/core/github-copilot/chat/convert-to-openai-compatible-chat-messages"
 import { describe, test, expect, mock } from "bun:test"
 import type { LanguageModelV3Prompt } from "@ai-sdk/provider"
 
@@ -107,6 +108,43 @@ function createModel(fetchFn: ReturnType<typeof mock>) {
     headers: () => ({ Authorization: "Bearer test-token" }),
     fetch: fetchFn as any,
   })
+}
+
+async function interleavedReasoningParts() {
+  const model = createModel(createMockFetch(FIXTURES.interleavedReasoningOpaque))
+  const { stream } = await model.doStream({ prompt: TEST_PROMPT, includeRawChunks: false })
+  return convertReadableStreamToArray(stream)
+}
+
+function replayPrompt(parts: Awaited<ReturnType<typeof interleavedReasoningParts>>): LanguageModelV3Prompt {
+  const content: Extract<LanguageModelV3Prompt[number], { role: "assistant" }>["content"] = []
+  for (const part of parts) {
+    if (part.type === "reasoning-delta") {
+      content.push({ type: "reasoning", text: part.delta })
+      continue
+    }
+    if (part.type === "reasoning-end") {
+      const reasoning = content.at(-1)
+      const reasoningOpaque = part.providerMetadata?.copilot?.reasoningOpaque
+      if (reasoning?.type === "reasoning" && reasoningOpaque) {
+        content[content.length - 1] = {
+          ...reasoning,
+          providerOptions: { copilot: { reasoningOpaque } },
+        }
+      }
+      continue
+    }
+    if (part.type !== "tool-call") continue
+    const reasoningOpaque = part.providerMetadata?.copilot?.reasoningOpaque
+    content.push({
+      type: "tool-call",
+      toolCallId: part.toolCallId,
+      toolName: part.toolName,
+      input: part.input,
+      ...(reasoningOpaque ? { providerOptions: { copilot: { reasoningOpaque } } } : {}),
+    })
+  }
+  return [{ role: "assistant", content }]
 }
 
 describe("doStream", () => {
@@ -491,18 +529,14 @@ describe("doStream", () => {
     })
   })
 
-  test("should pair each interleaved reasoning segment with its own reasoning_opaque", async () => {
-    const mockFetch = createMockFetch(FIXTURES.interleavedReasoningOpaque)
-    const model = createModel(mockFetch)
-
-    const { stream } = await model.doStream({
-      prompt: TEST_PROMPT,
-      includeRawChunks: false,
-    })
-
-    const parts = await convertReadableStreamToArray(stream)
-
+  test("should accept successive interleaved reasoning_opaque values", async () => {
+    const parts = await interleavedReasoningParts()
     expect(parts.filter((p) => p.type === "error")).toEqual([])
+    expect(parts.at(-1)).toMatchObject({ type: "finish", finishReason: { unified: "tool-calls" } })
+  })
+
+  test("should emit and replay interleaved reasoning in segment order", async () => {
+    const parts = await interleavedReasoningParts()
     expect(
       parts.filter((p) => p.type === "reasoning-delta" || p.type === "reasoning-end" || p.type === "tool-call"),
     ).toMatchObject([
@@ -521,11 +555,20 @@ describe("doStream", () => {
         providerMetadata: { copilot: { reasoningOpaque: "opaque-second" } },
       },
     ])
+    expect(convertToOpenAICompatibleChatMessages(replayPrompt(parts))).toMatchObject([
+      { role: "assistant", reasoning_text: "Read the readme first.Then the manifest." },
+    ])
+  })
+
+  test("should replay the latest interleaved reasoning_opaque value", async () => {
+    const parts = await interleavedReasoningParts()
     expect(parts.at(-1)).toMatchObject({
       type: "finish",
-      finishReason: { unified: "tool-calls" },
       providerMetadata: { copilot: { reasoningOpaque: "opaque-second" } },
     })
+    expect(convertToOpenAICompatibleChatMessages(replayPrompt(parts))).toMatchObject([
+      { role: "assistant", reasoning_opaque: "opaque-second" },
+    ])
   })
 
   test("should include response metadata from first chunk", async () => {
