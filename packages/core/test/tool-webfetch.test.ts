@@ -755,7 +755,7 @@ describe("WebFetchTool registration", () => {
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
       const urls = ["file:///etc/passwd", "http://"]
-      const outcomes: Array<{ url: string; type: string; value: string; assertions: number; requests: string[] }> = []
+      const outcomes: Array<{ url: string; type: string; value: unknown; assertions: number; requests: string[] }> = []
       for (const url of urls) {
         reset()
         const result = yield* executeTool(registry, call({ url, format: "text" }))

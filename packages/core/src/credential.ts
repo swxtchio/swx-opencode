@@ -1,12 +1,13 @@
 export * as Credential from "./credential"
 
 import { asc, eq } from "drizzle-orm"
-import { Context, Effect, Layer, Schema } from "effect"
+import { Context, Effect, Fiber, Layer, Schema } from "effect"
 import { Credential } from "@opencode-ai/schema/credential"
 import { Integration } from "@opencode-ai/schema/integration"
 import { Database } from "./database/database"
 import { makeGlobalNode } from "./effect/app-node"
 import { CredentialTable } from "./credential/sql"
+import { EffectFlock } from "./util/effect-flock"
 
 export const ID = Credential.ID
 export type ID = Credential.ID
@@ -34,6 +35,11 @@ export interface Interface {
   readonly list: (integrationID: Integration.ID) => Effect.Effect<Info[]>
   /** Returns one stored credential by ID. */
   readonly get: (id: ID) => Effect.Effect<Info | undefined>
+  /** Concurrent callers for the same credential share the running operation's result, including failures. */
+  readonly lock: (
+    id: ID,
+    operation: Effect.Effect<OAuth | undefined, unknown>,
+  ) => Effect.Effect<OAuth | undefined, unknown>
   /** Replaces any credential for an integration and returns the new record. */
   readonly create: (input: {
     readonly integrationID: Integration.ID
@@ -53,6 +59,9 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const { db } = yield* Database.Service
     const decode = Schema.decodeUnknownSync(Value)
+    const flock = yield* EffectFlock.Service
+    const scope = yield* Effect.scope
+    const pending = new Map<ID, Fiber.Fiber<OAuth | undefined, unknown>>()
     const stored = (row: typeof CredentialTable.$inferSelect) => {
       if (!row.integration_id) return
       return new Info({
@@ -64,6 +73,23 @@ const layer = Layer.effect(
     }
 
     return Service.of({
+      lock: Effect.fn("Credential.lock")((id, operation) =>
+        Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const current = pending.get(id)
+            if (current) return yield* restore(Fiber.join(current))
+            // The global scope owns the operation, not the first Session or Location waiting for it.
+            // The file lock extends this to other processes sharing the database.
+            const fiber = yield* operation.pipe(
+              flock.withLock(`credential-refresh:${id}`),
+              Effect.ensuring(Effect.sync(() => pending.delete(id))),
+              Effect.forkIn(scope),
+            )
+            pending.set(id, fiber)
+            return yield* restore(Fiber.join(fiber))
+          }),
+        ),
+      ),
       all: Effect.fn("Credential.all")(function* () {
         return (yield* db
           .select()
@@ -135,4 +161,4 @@ const layer = Layer.effect(
   }),
 )
 
-export const node = makeGlobalNode({ service: Service, layer, deps: [Database.node] })
+export const node = makeGlobalNode({ service: Service, layer, deps: [Database.node, EffectFlock.node] })
