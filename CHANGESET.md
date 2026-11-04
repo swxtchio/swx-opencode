@@ -134,6 +134,23 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
+- **#410** Backport `anomalyco/opencode#55149` (`52a10f573f1da5103c85990da9341e3645a39365`), `#55007`
+  (`460c626acd9e3de8fdffc27bde99bb5f070bb70f`), and `#59411`
+  (`e2bc79dc0bae112b79ab780f7c1a63db8a7f7dae`) in separate `git cherry-pick -x` commits. Assigned behavior is
+  complete: #55149's payload is partial because its existing-session shell-failure UI recovery is unassigned; #55007's
+  payload is complete; #59411's payload is partial because its upstream CLI shutdown-deadline module is absent here
+  and was not imported. `packages/core/src/no-timeout-fetch.ts` is wired to
+  `packages/tui/src/context/sdk.tsx` and `packages/opencode/src/cli/cmd/run.ts` for long TUI/run/mini requests;
+  `packages/core/src/effect/app-node-platform.ts` applies the override at the native `RequestExecutor` composition.
+  Preserve request options, abort signals, configured provider deadlines and fork #303's generation-progress
+  watchdog. `packages/core/src/cross-spawn-spawner.ts` synchronously terminates detached POSIX groups while cleanup
+  remains owed, preserving fork #380 cancellation escalation and intentional descendant release. The terminal
+  SIGHUP adaptation is in `packages/tui/src/app.tsx` / `packages/tui/src/terminal-signal.ts`; a non-terminal process
+  retains nohup's ignored SIGHUP. Regressions exercise the core fetch helper and native composition, TUI SDK event
+  client, runMini and attached run, the #303 stall/slow-reasoning/Chat progress cases, live/cleanup-owed/released
+  process groups, and terminal/nohup child lifecycles. The native acceptance holds a real local HTTP response past
+  Bun's unmodified idle timeout, verifies the default control expires on that timeout while the provider request remains
+  owned, then confirms the provider response and attached-run session content after release. _Partly upstream._
 - **#404** Keep the SQLite write-lock diagnostic behavior tests deterministic under unrelated concurrent transactions by selecting log emissions tagged at each test-owned transaction boundary. Every case also exercises a real unlabelled setup hold on the layer-construction fiber; the lock waiter counts only its native connection's attempts while an independent connection exercises a contended `BEGIN IMMEDIATE`. The concurrent hold is released on observed case progress, and production diagnostics are unchanged. _Fork-only._
 - **#403** Backport four anomalyco/opencode fixes as separate full-SHA `-x` commits. Production behavior is complete for all four; the rename donor's upstream-only `.changeset/rename-undo.md` is omitted because this fork records changes in this root ledger.
   - `anomalyco/opencode#54936` (`bbad8f350f977272faf9d5d9fe652b412a153876`): `packages/opencode/src/util/rpc.ts` returns an error result for synchronous throws and asynchronous rejections, and `Rpc.client` rejects only the matching pending call with useful error text including an empty outer error's cause. The added `packages/opencode/test/util/rpc.test.ts` and `packages/opencode/test/util/rpc-worker.ts` exercise production `Rpc.listen` and `Rpc.client` through a worker boundary, including request isolation, subsequent success and event delivery. Mutation-red proofs cover the missing worker reply, caller rejection and nested-cause text.
