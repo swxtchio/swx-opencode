@@ -1,6 +1,7 @@
 import { expect } from "bun:test"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Agent } from "@/agent/agent"
 import { MCP } from "@/mcp"
@@ -50,6 +51,7 @@ const fakePlugin = Plugin.Service.of({
 
 const fakePermission = Permission.Service.of({
   ask: () => Effect.void,
+  assertNotDenied: () => Effect.void,
   reply: () => Effect.die(new Error("unexpected permission reply")),
   list: () => Effect.succeed([]),
   grant: () => Effect.die(new Error("unexpected permission grant")),
@@ -167,6 +169,120 @@ it.effect("preserves running tool start time across metadata updates", () =>
     if (state.state.status === "running") {
       expect(state.state.time.start).toBe(100)
     }
+  }),
+)
+
+it.effect("binds deny-only checks to the executing agent and merged session rules", () =>
+  Effect.gen(function* () {
+    const target = "https://blocked.example/private"
+    const checked: PermissionV1.AskInput[] = []
+    const webfetch: Tool.Def = {
+      id: "webfetch",
+      description: "checks a URL permission",
+      parameters: Schema.Struct({ url: Schema.String }),
+      jsonSchema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] },
+      execute: ({ url }, ctx) => {
+        if (!ctx.assertNotDenied) return Effect.die(new Error("redirect permission check is unavailable"))
+        return ctx
+          .assertNotDenied({ permission: "webfetch", patterns: [url], metadata: { url }, always: ["*"] })
+          .pipe(Effect.as({ title: "webfetch", metadata: {}, output: "checked" }), Effect.orDie)
+      },
+    }
+    const state: SessionV1.ToolPart = {
+      id: partID,
+      sessionID,
+      messageID,
+      type: "tool",
+      tool: "webfetch",
+      callID,
+      state: { status: "running", input: { url: target }, time: { start: 1 } },
+    }
+    const processor = {
+      message: {
+        id: messageID,
+        sessionID,
+        role: "assistant",
+        parentID: MessageID.ascending(),
+        agent: "build",
+        mode: "build",
+        path: { cwd: "/tmp", root: "/tmp" },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ModelV2.ID.make("test-model"),
+        providerID: ProviderV2.ID.make("test"),
+        time: { created: 1 },
+      } satisfies SessionV1.Assistant,
+      admitToolCall: () =>
+        Effect.succeed({ update: () => Effect.succeed(state), complete: () => Effect.void }),
+    } satisfies Pick<SessionProcessor.Handle, "message" | "admitToolCall">
+    const rules = Permission.Service.of({
+      ...fakePermission,
+      assertNotDenied: (input) =>
+        Effect.sync(() => {
+          checked.push(input)
+          return input.patterns.every(
+            (pattern) => Permission.evaluate(input.permission, pattern, input.ruleset).action !== "deny",
+          )
+        }).pipe(
+          Effect.flatMap((allowed) =>
+            allowed ? Effect.void : Effect.fail(new PermissionV1.DeniedError({ ruleset: input.ruleset })),
+          ),
+        ),
+    })
+    const registry = ToolRegistry.Service.of({
+      ids: () => Effect.succeed([webfetch.id]),
+      all: () => Effect.succeed([]),
+      named: () => Effect.die("unused"),
+      tools: () => Effect.succeed([webfetch]),
+    })
+    const run = (agentRules: PermissionV1.Ruleset, sessionRules: PermissionV1.Ruleset) =>
+      Effect.gen(function* () {
+        const tools = yield* SessionTools.resolve({
+          agent: { ...agent, permission: [...agentRules] },
+          model,
+          session: { id: sessionID, permission: sessionRules } as unknown as Session.Info,
+          processor,
+          bypassAgentCheck: false,
+          messages: [],
+          promptOps: {} as never,
+        }).pipe(
+          Effect.provideService(Permission.Service, rules),
+          Effect.provideService(ToolRegistry.Service, registry),
+        )
+        const execute = tools.webfetch?.execute
+        if (!execute) throw new Error("webfetch tool is missing execute")
+        return yield* Effect.promise(() =>
+          Promise.resolve(
+            execute({ url: target }, {
+              toolCallId: callID,
+              abortSignal: new AbortController().signal,
+              messages: [],
+            }),
+          ).then(
+            () => "fulfilled" as const,
+            () => "rejected" as const,
+          ),
+        )
+      })
+
+    const agentAllow = [{ permission: "webfetch", pattern: "*", action: "allow" }] satisfies PermissionV1.Ruleset
+    const sessionDeny = [{ permission: "webfetch", pattern: target, action: "deny" }] satisfies PermissionV1.Ruleset
+    expect(yield* run(agentAllow, sessionDeny)).toBe("rejected")
+    expect(checked[0]).toMatchObject({
+      sessionID,
+      permission: "webfetch",
+      patterns: [target],
+      tool: { messageID, callID },
+      ruleset: [...agentAllow, ...sessionDeny],
+    })
+    expect(Permission.evaluate("webfetch", target, checked[0]!.ruleset)).toMatchObject({ action: "deny" })
+
+    checked.length = 0
+    const agentDeny = [{ permission: "webfetch", pattern: target, action: "deny" }] satisfies PermissionV1.Ruleset
+    const sessionAllow = [{ permission: "webfetch", pattern: target, action: "allow" }] satisfies PermissionV1.Ruleset
+    expect(yield* run(agentDeny, sessionAllow)).toBe("fulfilled")
+    expect(checked[0]?.ruleset).toEqual([...agentDeny, ...sessionAllow])
+    expect(Permission.evaluate("webfetch", target, checked[0]!.ruleset)).toMatchObject({ action: "allow" })
   }),
 )
 

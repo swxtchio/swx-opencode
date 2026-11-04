@@ -14,6 +14,7 @@ export const Event = PermissionV1.Event
 
 export interface Interface {
   readonly ask: (input: PermissionV1.AskInput) => Effect.Effect<void, PermissionV1.Error>
+  readonly assertNotDenied: (input: PermissionV1.AskInput) => Effect.Effect<void, PermissionV1.DeniedError>
   readonly reply: (
     input: PermissionV1.ReplyInput,
   ) => Effect.Effect<
@@ -134,6 +135,17 @@ const layer = Layer.effect(
         ),
         Effect.onExit(() => ledger.cancel(id).pipe(Effect.flatMap((ended) => (ended ? closed(info) : Effect.void)))),
       )
+    })
+
+    const assertNotDenied = Effect.fn("Permission.assertNotDenied")(function* (input: PermissionV1.AskInput) {
+      const { approved } = yield* InstanceState.get(state)
+      for (const pattern of input.patterns) {
+        const rule = evaluate(input.permission, pattern, input.ruleset, approved)
+        if (rule.action !== "deny") continue
+        return yield* new PermissionV1.DeniedError({
+          ruleset: input.ruleset.filter((rule) => Wildcard.match(input.permission, rule.permission)),
+        })
+      }
     })
 
     // A supervised ask closed without an answer is announced like a refusal, so every attached client drops it.
@@ -292,7 +304,7 @@ const layer = Layer.effect(
         )
     })
 
-    return Service.of({ ask, reply, list, grant })
+    return Service.of({ ask, assertNotDenied, reply, list, grant })
   }),
 )
 
