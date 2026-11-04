@@ -488,6 +488,106 @@ const processTreeReady = (
     return identity
   })
 
+type OwnerExitMode = "live" | "cleanup-owed" | "released"
+
+const ownerExitProbe = (mode: OwnerExitMode) =>
+  Effect.gen(function* () {
+    if (process.platform === "win32") return
+
+    const temp = yield* Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (temp) => Effect.promise(() => temp[Symbol.asyncDispose]()).pipe(Effect.asVoid),
+    )
+    const identityFile = path.join(temp.path, "group.json")
+    const releaseFile = path.join(temp.path, "release")
+    const worker = Bun.spawn(
+      [
+        process.execPath,
+        "test",
+        "--timeout",
+        "30000",
+        "./test/effect/cross-spawn-spawner.test.ts",
+        "-t",
+        "Core process-tree boundary worker",
+      ],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          SWX_CORE_SPAWNER_PROBE_MODE: `owner-exit-${mode}`,
+          SWX_CORE_SPAWNER_PROBE_FILE: identityFile,
+          SWX_CORE_SPAWNER_READY_FILE: releaseFile,
+        },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    )
+    const workerIdentity = processIdentity(worker.pid)
+    if (!workerIdentity?.bootID || !workerIdentity.startTicks)
+      throw new Error("process-tree owner-exit worker has no recorded start identity")
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        if (!sameProcess(workerIdentity)) return
+        try {
+          process.kill(workerIdentity.pid, "SIGKILL")
+        } catch {}
+      }),
+    )
+    const output = Promise.all([new Response(worker.stdout).text(), new Response(worker.stderr).text()])
+    const probe = yield* Effect.promise(async () => {
+      const deadline = Date.now() + 15_000
+      while (Date.now() < deadline) {
+        const result = await readIdentityRecord(identityFile)
+        if (result) return result
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      }
+      throw new Error(`owner-exit fixture did not publish its ${mode} process group`)
+    })
+    if (probe.members.length !== 2) throw new Error(`owner-exit fixture recorded ${probe.members.length} group members`)
+    const pgid = probe.pgid
+    const leader = probe.members.find((member) => member.pid === pgid)
+    const descendant = probe.members.find((member) => member.pid !== pgid)
+    if (!leader || !descendant) throw new Error("owner-exit fixture did not record its leader and descendant")
+    const ownership: RecordedProcessGroup = { pgid, members: probe.members }
+    ownership.members.forEach((member) => recordProcess(pgid, member))
+    yield* Effect.addFinalizer(() => cleanupRecordedProcessGroup(ownership))
+
+    const beforeExit = {
+      groupAlive: groupAlive(pgid),
+      leaderAlive: sameProcess(leader),
+      descendantAlive: sameProcess(descendant),
+    }
+    expect(beforeExit).toEqual(
+      mode === "live"
+        ? { groupAlive: true, leaderAlive: true, descendantAlive: true }
+        : { groupAlive: true, leaderAlive: false, descendantAlive: true },
+    )
+
+    yield* writeAtomically(releaseFile, "ready")
+    const exitCode = yield* Effect.promise(() => worker.exited).pipe(Effect.timeout("20 seconds"))
+    const outputText = (yield* Effect.promise(() => output)).join("\n")
+    if (exitCode !== 0) throw new Error(`owner-exit worker failed (${exitCode}): ${outputText}`)
+
+    if (mode === "released") {
+      expect({
+        groupAlive: groupAlive(pgid),
+        leaderAlive: sameProcess(leader),
+        descendantAlive: sameProcess(descendant),
+      }).toEqual({ groupAlive: true, leaderAlive: false, descendantAlive: true })
+      yield* cleanupRecordedProcessGroup(ownership)
+      expect(yield* Effect.promise(() => groupGone(pgid))).toBe(true)
+      return
+    }
+
+    const gone = yield* Effect.promise(() => groupGone(pgid))
+    expect({
+      groupGone: gone,
+      leaderAlive: sameProcess(leader),
+      descendantAlive: sameProcess(descendant),
+    }).toEqual({ groupGone: true, leaderAlive: false, descendantAlive: false })
+  })
+
 describe("cross-spawn spawner", () => {
   describe("basic spawning", () => {
     fx.effect(
@@ -943,6 +1043,47 @@ describe("cross-spawn spawner", () => {
       "Core process-tree boundary worker",
       Effect.gen(function* () {
         if (!timeoutProbeMode || process.platform === "win32") return
+        if (timeoutProbeMode.startsWith("owner-exit-")) {
+          if (!timeoutProbeFile || !timeoutProbeReadyFile)
+            throw new Error("owner-exit probe paths were not supplied")
+          const mode = timeoutProbeMode.slice("owner-exit-".length)
+          if (mode !== "live" && mode !== "cleanup-owed" && mode !== "released")
+            throw new Error(`unknown owner-exit mode: ${mode}`)
+          const source =
+            mode === "released"
+              ? processTreeSource(resistantDescendant, 'process.on("SIGUSR1", () => process.exit(0))')
+              : termExitingParent(resistantDescendant)
+          const handle = yield* js(source)
+          const pgid = Number(handle.pid)
+          const leader = processIdentity(pgid)
+          if (!leader?.bootID || !leader.startTicks) throw new Error("owner-exit worker leader has no start identity")
+          recordProcess(pgid, leader)
+          const descendant = yield* processTreeReady(handle, pgid)
+
+          if (mode === "cleanup-owed") {
+            yield* handle.kill({ forceKillAfter: "2 minutes" }).pipe(Effect.forkChild)
+            if (!(yield* Effect.promise(() => processExited(leader))))
+              throw new Error("cleanup-owed leader did not exit before owner handoff")
+          }
+          if (mode === "released") {
+            process.kill(pgid, "SIGUSR1")
+            expect(yield* handle.exitCode.pipe(Effect.timeout("5 seconds"))).toBe(ChildProcessSpawner.ExitCode(0))
+          }
+
+          const beforeExit = {
+            groupAlive: groupAlive(pgid),
+            leaderAlive: sameProcess(leader),
+            descendantAlive: sameProcess(descendant),
+          }
+          expect(beforeExit).toEqual(
+            mode === "live"
+              ? { groupAlive: true, leaderAlive: true, descendantAlive: true }
+              : { groupAlive: true, leaderAlive: false, descendantAlive: true },
+          )
+          yield* writeAtomically(timeoutProbeFile, JSON.stringify({ pgid, members: [leader, descendant] }))
+          yield* Effect.promise(() => readReadySignal(timeoutProbeReadyFile, 20_000))
+          process.exit(0)
+        }
         if (!timeoutProbeOwnerFile || !timeoutProbeFile || !timeoutProbeReadyFile)
           throw new Error("process-tree probe paths were not supplied")
 
@@ -967,7 +1108,7 @@ describe("cross-spawn spawner", () => {
         if (!sameProcess(leader) || !sameProcess(descendant)) throw new Error("timeout worker fixture was not live")
         if (timeoutProbeMode === "timeout") yield* Effect.never
       }),
-      timeoutProbeMode === "timeout" ? 5_000 : 15_000,
+      timeoutProbeMode === "timeout" ? 5_000 : timeoutProbeMode.startsWith("owner-exit-") ? 30_000 : 15_000,
     )
 
     fx.live(
@@ -1064,6 +1205,24 @@ describe("cross-spawn spawner", () => {
         yield* run("readiness")
         yield* run("child-started")
       }),
+      30_000,
+    )
+
+    fx.live(
+      "abrupt owner exit kills a live detached group",
+      ownerExitProbe("live"),
+      30_000,
+    )
+
+    fx.live(
+      "abrupt owner exit keeps a cleanup-owed group after its leader exits",
+      ownerExitProbe("cleanup-owed"),
+      30_000,
+    )
+
+    fx.live(
+      "abrupt owner exit leaves descendants released by leader exit",
+      ownerExitProbe("released"),
       30_000,
     )
 
