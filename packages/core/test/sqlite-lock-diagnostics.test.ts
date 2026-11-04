@@ -122,7 +122,12 @@ const patchBunQueryOn = (native: unknown, match: (sql: string) => boolean, attem
       }),
     )
   })
-const slowLayerConstruction = (filename: string, lines: OwnedLogLine[], caseOwner: TransactionOwner) =>
+const slowLayerConstruction = (
+  filename: string,
+  lines: OwnedLogLine[],
+  caseOwner: TransactionOwner,
+  holdMs = longHoldMs,
+) =>
   Effect.scoped(
     Effect.gen(function* () {
       const setupOwner = Symbol("sqlite-lock-diagnostics-setup")
@@ -141,7 +146,7 @@ const slowLayerConstruction = (filename: string, lines: OwnedLogLine[], caseOwne
                 (tx) =>
                   Effect.gen(function* () {
                     const result = yield* operation(tx)
-                    if (config?.behavior === "immediate") yield* Effect.sleep(`${longHoldMs} millis`)
+                    if (config?.behavior === "immediate") yield* Effect.sleep(`${holdMs} millis`)
                     return result
                   }),
                 config,
@@ -510,7 +515,7 @@ describe("SQLite write-lock hold diagnostics", () => {
             Effect.promise(() => tmpdir()),
             (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
           )
-          const { waitedMs, busyCount, attemptsCount, rows } = yield* withConcurrentUnlabelledHold(
+          const { writerStartDelayMs, waitedMs, busyCount, attemptsCount, rows } = yield* withConcurrentUnlabelledHold(
             path.join(tmp.path, "interference.sqlite"),
             lines,
             owner,
@@ -524,8 +529,11 @@ describe("SQLite write-lock hold diagnostics", () => {
                 yield* db.run("CREATE TABLE hold_test (id INTEGER PRIMARY KEY)")
                 const releaseHolder = yield* inProcessHolder(filename)
                 yield* patchBunQueryOn(native, (sql) => sql === "begin immediate", attempts)
+                const writerStartRequestedAt = performance.now()
+                yield* slowLayerConstruction(path.join(tmp.path, "waiter-delay.sqlite"), lines, owner, longHoldMs + 50)
+                const writerStartDelayMs = performance.now() - writerStartRequestedAt
 
-                const waitStartedAt = performance.now()
+                const writerStartedAt = performance.now()
                 const writer = yield* annotateTransactionOwner(
                   owner,
                   db
@@ -533,9 +541,10 @@ describe("SQLite write-lock hold diagnostics", () => {
                     .pipe(Effect.provideService(TransactionPurpose, "test.waiter")),
                 ).pipe(Effect.forkChild({ startImmediately: true }))
 
-                while (attempts.busy.length === 0 && performance.now() - waitStartedAt < lockWindowMs)
+                while (attempts.busy.length === 0 && performance.now() - writerStartedAt < lockWindowMs)
                   yield* Effect.sleep("10 millis")
                 if (attempts.busy.length === 0) return yield* Effect.die(new Error("writer never met the held lock"))
+                const busyAt = performance.now()
 
                 const sqlite = yield* Effect.promise(() => import("bun:sqlite"))
                 const noisy = new sqlite.Database(filename)
@@ -555,7 +564,11 @@ describe("SQLite write-lock hold diagnostics", () => {
                 expect(attempts.count).toBe(attemptsBeforeNoise)
                 expect(attempts.busy.length).toBe(busyBeforeNoise)
 
-                while (performance.now() - waitStartedAt < longHoldMs) yield* Effect.sleep("10 millis")
+                while (performance.now() - busyAt < longHoldMs) {
+                  if (performance.now() - busyAt >= lockWindowMs)
+                    return yield* Effect.die(new Error("owned writer wait did not finish its measured interval"))
+                  yield* Effect.sleep("10 millis")
+                }
                 yield* releaseOnProgress()
                 releaseHolder()
                 yield* Fiber.join(writer).pipe(
@@ -565,13 +578,15 @@ describe("SQLite write-lock hold diagnostics", () => {
                   }),
                 )
                 return {
-                  waitedMs: performance.now() - waitStartedAt,
+                  writerStartDelayMs,
+                  waitedMs: performance.now() - busyAt,
                   busyCount: attempts.busy.length,
                   attemptsCount: attempts.count,
                   rows: yield* db.values("SELECT id FROM hold_test"),
                 }
               }),
           )
+          expect(writerStartDelayMs).toBeGreaterThanOrEqual(longHoldMs + 50)
           expect(waitedMs).toBeGreaterThan(longHoldMs)
           expect(busyCount).toBeGreaterThan(0)
           expect(attemptsCount).toBeGreaterThan(busyCount)
