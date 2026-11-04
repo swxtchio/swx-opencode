@@ -837,7 +837,7 @@ describe("SQLite busy timeout and statement retries", () => {
               )
               yield* Effect.addFinalizer(() => Effect.promise(() => holder.release()))
 
-              const result = yield* Sqlite.withRetryWindow(
+              const result = yield* Sqlite.withFreshRetryWindow(
                 Effect.gen(function* () {
                   const firstStartedAt = performance.now()
                   const first = yield* client.unsafe(writerSql).raw.pipe(Effect.flip)

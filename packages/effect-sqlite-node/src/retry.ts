@@ -16,12 +16,12 @@ export class RetryWindow extends Context.Service<RetryWindow, RetryWindowState>(
   "@opencode-ai/effect-sqlite-node/RetryWindow",
 ) {}
 
-export const withRetryWindow = <A, E, R>(effect: Effect.Effect<A, E, R>, window = sessionRetryWindow) =>
+export const withRetryWindow = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   Effect.withFiber((fiber) => {
     if (Option.isSome(Context.getOption(fiber.context, RetryWindow))) return effect
     return effect.pipe(
       Effect.provideService(RetryWindow, {
-        windowMs: Duration.toMillis(window),
+        windowMs: Duration.toMillis(sessionRetryWindow),
         startedAt: undefined,
         sawLock: false,
       }),

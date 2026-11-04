@@ -8422,9 +8422,12 @@ const writeLockHold = Effect.fn("test.writeLockHold")(function* () {
       lock.holder = new Sqlite(consumeLockDbPath)
       lock.holder.run("BEGIN IMMEDIATE")
     })
+  const release = Effect.sync(() => {
+    if (lock.holder?.inTransaction) lock.holder.run("COMMIT")
+  })
   return {
     take,
-    release: Effect.sync(() => lock.holder!.run("COMMIT")),
+    release,
     isHeld: Effect.sync(() => lock.holder?.inTransaction === true),
   }
 })
@@ -8483,6 +8486,7 @@ consumeLock.instance(
 
       const lock = yield* writeLockHold()
       yield* lock.take(chat.id)
+      yield* Effect.addFinalizer(() => lock.release)
       expect(yield* lock.isHeld).toBe(true)
       yield* Effect.promise(() => writeFile(release, "release"))
       yield* pollWithTimeout(
@@ -8501,6 +8505,7 @@ consumeLock.instance(
       expect(toolPart(whileBlocked.flatMap((message) => message.parts))?.state.status).toBe("running")
 
       yield* lock.release
+      expect(yield* lock.isHeld).toBe(false)
       const [taskReply, continuationReply] = yield* awaitWithTimeout(
         Effect.all([Fiber.join(task), Fiber.join(continuation)]),
         "the tool result and queued turn did not finish after lock release",
@@ -8591,12 +8596,13 @@ consumeLock.instance(
         yield* patchBunQuery((sql) => sql === "begin immediate", attempts)
         const lock = yield* writeLockHold()
         const { llm, sessions, chat, task, continuation, records, toolRuns } = yield* startConsumeLocked(lock.take)
+        yield* Effect.addFinalizer(() => lock.release)
         yield* llm.text("task done")
         yield* llm.text("continuation done")
         const before = records()
         expect(before.queue).toEqual([{ time_promoted: null, message_id: null, time_withdrawn: null }])
         expect(before.tools).toEqual([{ id: expect.any(String), status: "completed" }])
-        expect(lock.holder?.inTransaction).toBe(true)
+        expect(yield* lock.isHeld).toBe(true)
         yield* pollWithTimeout(
           Effect.sync(() => (attempts.busy.length > 0 ? true : undefined)),
           "consume never met the held SQLite write lock",
@@ -8605,7 +8611,7 @@ consumeLock.instance(
         const firstBusy = attempts.busy.length
         // The fifth pre-change consume window ends before this lock is released.
         yield* Effect.sleep("52 seconds")
-        expect(lock.holder?.inTransaction).toBe(true)
+        expect(yield* lock.isHeld).toBe(true)
         expect(attempts.busy.length).toBeGreaterThan(firstBusy)
         expect((yield* status.get(chat.id)).type).toBe("busy")
         const failed = records()
@@ -8666,6 +8672,7 @@ consumeLock.instance(
         const runState = yield* SessionRunState.Service
         const lock = yield* writeLockHold()
         const started = yield* startConsumeLocked(lock.take)
+        yield* Effect.addFinalizer(() => lock.release)
         const { llm, chat, task, continuation, records } = started
         const before = records()
         const startedAt = performance.now()
@@ -8678,7 +8685,7 @@ consumeLock.instance(
 
         consumeRefusals(exits).forEach((refusal) => {
           expect(refusal).toBeInstanceOf(SessionQueue.ConsumeLockedError)
-          if (!SessionQueue.ConsumeLockedError.isInstance(refusal)) return
+          if (!(refusal instanceof SessionQueue.ConsumeLockedError)) return
           expect(refusal).toMatchObject({ sessionID: chat.id, attempts: expect.any(Number) })
           expect(refusal.message).toContain("SQLite lock contention")
           expect(refusal.message).toMatch(/persisted for \d+ ms/)
@@ -8736,7 +8743,7 @@ consumeLock.instance(
 
         consumeRefusals(exits).forEach((refusal) => {
           expect(refusal).toBeInstanceOf(SessionQueue.ConsumeLockedError)
-          if (!SessionQueue.ConsumeLockedError.isInstance(refusal)) return
+          if (!(refusal instanceof SessionQueue.ConsumeLockedError)) return
           expect(refusal).toMatchObject({ sessionID: chat.id, attempts: expect.any(Number) })
           expect(refusal.message).toContain("SQLite write acquisition")
           expect(refusal.message).toMatch(/persisted for \d+ ms/)
@@ -8789,6 +8796,7 @@ consumeLock.instance(
       yield* Effect.gen(function* () {
         const lock = yield* writeLockHold()
         const started = yield* startConsumeLocked(lock.take)
+        yield* Effect.addFinalizer(() => lock.release)
         const { llm, chat, task, continuation, records } = started
         const before = records()
         const deletesBefore = deletes.count
