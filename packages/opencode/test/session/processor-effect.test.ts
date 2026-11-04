@@ -3153,6 +3153,7 @@ const custodyTurn = Effect.fn("test.custodyTurn")(function* (input: {
       Permission.Service,
       Permission.Service.of({
         ask: () => Effect.void,
+        assertNotDenied: () => Effect.void,
         reply: () => Effect.die(new Error("unexpected permission reply")),
         list: () => Effect.succeed([]),
         grant: () => Effect.die(new Error("unexpected permission grant")),

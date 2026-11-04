@@ -106,6 +106,7 @@ const projectToolLayer = (
             Effect.sync(() => {
               requests.push(input)
             }),
+          assertNotDenied: () => Effect.void,
           ask: () => Effect.die("unused"),
           reply: () => Effect.die("unused"),
           get: () => Effect.succeed(undefined),

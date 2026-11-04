@@ -153,6 +153,34 @@ describe("PermissionV2", () => {
     }),
   )
 
+  it.effect("checks for a deny without asking", () =>
+    Effect.gen(function* () {
+      yield* setup([])
+      const service = yield* PermissionV2.Service
+      const events = yield* EventV2.Service
+      const asked = yield* Deferred.make<PermissionV2.Request>()
+      const unsubscribe = yield* events.listen((event) =>
+        event.type === PermissionV2.Event.Asked.type
+          ? Deferred.succeed(asked, event.data as PermissionV2.Request).pipe(Effect.asVoid)
+          : Effect.void,
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+      const outcome = yield* Effect.race(
+        service.assertNotDenied(assertion()).pipe(Effect.as("continued" as const)),
+        Deferred.await(asked).pipe(Effect.as("asked" as const)),
+      ).pipe(
+        Effect.timeoutOrElse({
+          duration: "1 second",
+          orElse: () => Effect.fail(new Error("deny-only permission check did not finish or ask")),
+        }),
+      )
+      expect(outcome).toBe("continued")
+      expect(yield* service.list()).toEqual([])
+      yield* setRules([{ action: "read", resource: "*", effect: "deny" }])
+      expect(yield* service.assertNotDenied(assertion()).pipe(Effect.flip)).toBeInstanceOf(PermissionV2.BlockedError)
+      expect(yield* service.list()).toEqual([])
+    }),
+  )
   it.effect("allows managed output reads without granting external directory access", () =>
     Effect.gen(function* () {
       yield* setup([
