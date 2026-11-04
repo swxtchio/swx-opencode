@@ -1,7 +1,7 @@
 export * as WebFetchTool from "./webfetch"
 
 import { ToolFailure } from "@opencode-ai/llm"
-import { Duration, Effect, Layer, Schema } from "effect"
+import { Duration, Effect, Exit, Layer, Schema, Stream } from "effect"
 import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { Parser } from "htmlparser2"
 import TurndownService from "turndown"
@@ -82,6 +82,34 @@ const isCloudflareChallenge = (error: unknown) => {
 const request = (url: string, format: Format, userAgent = browserUserAgent) =>
   HttpClientRequest.get(url).pipe(HttpClientRequest.setHeaders(headers(format, userAgent)))
 
+// Pull at most one chunk to acquire the Fetch body reader, then cancel; the timeout bounds a silent body.
+const cancelResponseBody = (response: HttpClientResponse.HttpClientResponse) =>
+  Effect.sync(() => Stream.toReadableStream(response.stream).getReader()).pipe(
+    Effect.flatMap((reader) =>
+      Effect.tryPromise({
+        try: () => reader.read(),
+        catch: (error) => error,
+      }).pipe(
+        Effect.timeoutOrElse({
+          duration: "1 second",
+          orElse: () => Effect.void,
+        }),
+        Effect.catch(() => Effect.void),
+        Effect.asVoid,
+        Effect.ensuring(
+          Effect.sync(() => {
+            void reader.cancel().catch(() => undefined)
+          }),
+        ),
+      ),
+    ),
+  )
+
+const filterResponse = (response: HttpClientResponse.HttpClientResponse) =>
+  HttpClientResponse.filterStatusOk(response).pipe(
+    Effect.onExit((exit) => (Exit.isFailure(exit) ? cancelResponseBody(response) : Effect.void)),
+  )
+
 const assertHttpUrl = (url: URL) => {
   if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("URL must use http:// or https://")
 }
@@ -102,20 +130,25 @@ const execute = (
     Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }),
     Effect.flatMap((response) => {
       const location = response.headers.location
-      if (!redirectStatuses.has(response.status) || !location) return HttpClientResponse.filterStatusOk(response)
-      if (redirects >= MAX_REDIRECTS) return Effect.fail(new Error(`Too many redirects (more than ${MAX_REDIRECTS})`))
-      return Effect.gen(function* () {
-        const next = yield* Effect.try({
-          try: () => {
-            const target = new URL(location, url)
-            assertHttpUrl(target)
-            return target.href
-          },
-          catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+      if (!redirectStatuses.has(response.status) || !location) return filterResponse(response)
+      return cancelResponseBody(response).pipe(
+        Effect.flatMap(() => {
+          if (redirects >= MAX_REDIRECTS)
+            return Effect.fail(new Error(`Too many redirects (more than ${MAX_REDIRECTS})`))
+          return Effect.gen(function* () {
+            const next = yield* Effect.try({
+              try: () => {
+                const target = new URL(location, url)
+                assertHttpUrl(target)
+                return target.href
+              },
+              catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+            })
+            yield* check(next)
+            return yield* execute(http, check, next, format, userAgent, redirects + 1)
+          })
         })
-        yield* check(next)
-        return yield* execute(http, check, next, format, userAgent, redirects + 1)
-      })
+      )
     }),
   )
 
@@ -194,13 +227,17 @@ const layer = Layer.effectDiscard(
                 const response = yield* execute(http, check, url, input.format).pipe(
                   Effect.catchIf(isCloudflareChallenge, () => execute(http, check, url, input.format, "opencode")),
                 )
-                const contentType = response.headers["content-type"] || ""
-                const mime = mimeFrom(contentType)
-                if (isImageAttachment(mime))
-                  return yield* Effect.fail(new Error(`Unsupported fetched image content type: ${mime}`))
-                if (!isTextualMime(mime))
-                  return yield* Effect.fail(new Error(`Unsupported fetched file content type: ${mime}`))
-                return { body: yield* collectBody(response), contentType }
+                return yield* Effect.gen(function* () {
+                  const contentType = response.headers["content-type"] || ""
+                  const mime = mimeFrom(contentType)
+                  if (isImageAttachment(mime))
+                    return yield* Effect.fail(new Error(`Unsupported fetched image content type: ${mime}`))
+                  if (!isTextualMime(mime))
+                    return yield* Effect.fail(new Error(`Unsupported fetched file content type: ${mime}`))
+                  return { body: yield* collectBody(response), contentType }
+                }).pipe(
+                  Effect.onExit((exit) => (Exit.isFailure(exit) ? cancelResponseBody(response) : Effect.void)),
+                )
               }).pipe(
                 Effect.timeoutOrElse({
                   duration: Duration.seconds(input.timeout ?? DEFAULT_TIMEOUT_SECONDS),

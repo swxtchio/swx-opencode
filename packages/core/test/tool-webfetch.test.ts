@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { Deferred, Duration, Effect, Fiber, Layer, Schema } from "effect"
 import * as TestClock from "effect/testing/TestClock"
-import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
+import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { AgentV2 } from "@opencode-ai/core/agent"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -169,8 +169,166 @@ const expectNoPermissionV2Ask = <A, E, R>(self: Effect.Effect<A, E, R>) =>
     }),
   )
 
+const unboundedResponse = (
+  id: string,
+  status: number,
+  location: string | undefined,
+  releases: Map<string, Deferred.Deferred<void>>,
+  released: string[],
+  headers: Record<string, string> = {},
+) => {
+  const signal = Deferred.makeUnsafe<void>()
+  releases.set(id, signal)
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array([1]))
+      },
+      // Keep the body open after its first chunk so only reader cancellation ends it.
+      pull: () => new Promise<void>(() => {}),
+      cancel() {
+        released.push(id)
+        Deferred.doneUnsafe(signal, Effect.void)
+      },
+    }),
+    { status, headers: { ...headers, ...(location ? { location } : {}) } },
+  )
+}
+
+const waitForBodyRelease = (releases: Map<string, Deferred.Deferred<void>>, id: string) =>
+  Effect.gen(function* () {
+    const signal = releases.get(id)
+    if (!signal) return yield* Effect.fail(new Error(`missing response body signal: ${id}`))
+    yield* Deferred.await(signal).pipe(
+      Effect.timeoutOrElse({
+        duration: "2 seconds",
+        orElse: () => Effect.fail(new Error(`response body was not released: ${id}`)),
+      }),
+    )
+  })
+
 describe("WebFetchTool real permission policy", () => {
-  policy.live("matches canonical URL identity for the invoking V2 agent", () =>
+  policy.live("cancels discarded streaming responses across redirects and error exits", () =>
+    Effect.gen(function* () {
+      yield* setupPolicy()
+      const registry = yield* ToolRegistry.Service
+      const releases = new Map<string, Deferred.Deferred<void>>()
+      const released: string[] = []
+      const requests: string[] = []
+      // Retain raw Fetch responses so garbage collection cannot make missing cleanup look successful.
+      const heldResponses: Response[] = []
+      const previousBodiesUsedBeforeFetch: boolean[] = []
+      const nativeFetch = globalThis.fetch
+      const trackedFetch = Object.assign(
+        (...args: Parameters<typeof globalThis.fetch>) => {
+          if (heldResponses.length > 0) previousBodiesUsedBeforeFetch.push(heldResponses.at(-1)?.bodyUsed ?? false)
+          return nativeFetch(...args).then((response) => {
+            heldResponses.push(response)
+            return response
+          })
+        },
+        { preconnect: nativeFetch.preconnect },
+      )
+      let limitRequests = 0
+      yield* setPermissions("build", [{ action: "webfetch", resource: "*", effect: "allow" }])
+
+      return yield* Effect.acquireUseRelease(
+        Effect.sync(() =>
+          Bun.serve({
+            port: 0,
+            // Let the release assertion, rather than Bun's idle timeout, own the response lifetime.
+            idleTimeout: 60,
+            fetch: (request) => {
+              const pathname = new URL(request.url).pathname
+              requests.push(pathname)
+              if (pathname === "/follow") return unboundedResponse("follow", 302, "/target", releases, released)
+              if (pathname === "/deny") return unboundedResponse("deny-hop", 302, "/blocked", releases, released)
+              if (pathname === "/limit") {
+                limitRequests++
+                if (limitRequests <= WebFetchTool.MAX_REDIRECTS + 1) {
+                  return unboundedResponse(`limit-${limitRequests}`, 302, "/limit", releases, released)
+                }
+                return unboundedResponse("limit-extra", 404, undefined, releases, released)
+              }
+              if (pathname === "/unsupported") {
+                return unboundedResponse("unsupported", 301, "file:///etc/passwd", releases, released)
+              }
+              if (pathname === "/not-found") return unboundedResponse("not-found", 404, undefined, releases, released)
+              if (pathname === "/unsupported-content") {
+                return unboundedResponse("unsupported-content", 200, undefined, releases, released, {
+                  "content-type": "application/pdf",
+                })
+              }
+              if (pathname === "/challenge" && request.headers.get("user-agent") !== "opencode") {
+                return unboundedResponse("cloudflare", 403, undefined, releases, released, {
+                  "cf-mitigated": "challenge",
+                })
+              }
+              return new Response(pathname === "/challenge" ? "retried" : "target", {
+                headers: { "content-type": "text/plain" },
+              })
+            },
+          }),
+        ),
+        (server) =>
+          Effect.gen(function* () {
+            const execute = (pathname: string, id: string) =>
+              executeTool(registry, call({ url: new URL(pathname, server.url).href, format: "text" }, id)).pipe(
+                Effect.provideService(FetchHttpClient.Fetch, trackedFetch),
+              )
+            const follow = yield* execute("/follow", "call-body-follow")
+            expect(follow).toEqual({ type: "text", value: "target" })
+            expect(heldResponses).toHaveLength(requests.length)
+            expect(heldResponses[0]?.bodyUsed).toBe(true)
+            yield* waitForBodyRelease(releases, "follow")
+
+            const deniedUrl = new URL("/blocked", server.url).href
+            yield* setPermissions("build", [
+              { action: "webfetch", resource: "*", effect: "allow" },
+              { action: "webfetch", resource: deniedUrl, effect: "deny" },
+            ])
+            const denied = yield* execute("/deny", "call-body-denied")
+            expect(denied).toMatchObject({ type: "error" })
+            yield* waitForBodyRelease(releases, "deny-hop")
+            expect(requests).not.toContain("/blocked")
+
+            yield* setPermissions("build", [{ action: "webfetch", resource: "*", effect: "allow" }])
+            const limit = yield* execute("/limit", "call-body-limit")
+            expect(limit).toMatchObject({ type: "error" })
+            yield* Effect.forEach(
+              Array.from({ length: WebFetchTool.MAX_REDIRECTS + 1 }, (_, index) => `limit-${index + 1}`),
+              (id) => waitForBodyRelease(releases, id),
+              { concurrency: 1 },
+            )
+            expect(limitRequests).toBe(WebFetchTool.MAX_REDIRECTS + 1)
+
+            const unsupported = yield* execute("/unsupported", "call-body-unsupported")
+            expect(unsupported).toMatchObject({ type: "error" })
+            yield* waitForBodyRelease(releases, "unsupported")
+
+            const notFound = yield* execute("/not-found", "call-body-not-found")
+            expect(notFound).toMatchObject({ type: "error" })
+            yield* waitForBodyRelease(releases, "not-found")
+
+            const unsupportedContent = yield* execute("/unsupported-content", "call-body-unsupported-content")
+            expect(unsupportedContent).toMatchObject({ type: "error" })
+            yield* waitForBodyRelease(releases, "unsupported-content")
+
+            const challenge = yield* execute("/challenge", "call-body-challenge")
+            expect(challenge).toEqual({ type: "text", value: "retried" })
+            yield* waitForBodyRelease(releases, "cloudflare")
+            expect(heldResponses).toHaveLength(requests.length)
+            expect(heldResponses.every((response) => response.bodyUsed)).toBe(true)
+            expect(previousBodiesUsedBeforeFetch).toHaveLength(requests.length - 1)
+            expect(previousBodiesUsedBeforeFetch.every(Boolean)).toBe(true)
+          }),
+        (server) => Effect.promise(() => server.stop(true)),
+      )
+    }),
+    15_000,
+  )
+
+  policy.live("uses parsed URL hrefs as V2 permission resources", () =>
     Effect.acquireUseRelease(
       Effect.sync(() => {
         const received: string[] = []
@@ -235,7 +393,7 @@ describe("WebFetchTool real permission policy", () => {
     ),
   )
 
-  policy.live("rejects malformed and unsupported inputs before policy or transport", () =>
+  policy.live("rejects malformed and unsupported inputs without transport or pending permission asks", () =>
     Effect.acquireUseRelease(
       Effect.sync(() => {
         const received: string[] = []
@@ -271,7 +429,7 @@ describe("WebFetchTool real permission policy", () => {
     ),
   )
 
-  policy.live("manually follows every supported status and an absolute redirect", () =>
+  policy.live("supports every redirect status and absolute Location values", () =>
     Effect.acquireUseRelease(
       Effect.sync(() => {
         const received: string[] = []

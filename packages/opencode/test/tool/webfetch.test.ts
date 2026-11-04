@@ -50,45 +50,87 @@ const redirectChecks: string[] = []
 const withFetch = <A, E, R>(
   fetch: (req: Request) => Response | Promise<Response>,
   fn: (url: URL) => Effect.Effect<A, E, R>,
+  idleTimeout = 10,
 ) =>
   Effect.acquireUseRelease(
-    Effect.sync(() => Bun.serve({ port: 0, fetch })),
+    Effect.sync(() => Bun.serve({ port: 0, idleTimeout, fetch })),
     (server) => fn(server.url),
     (server) => Effect.sync(() => server.stop(true)),
   )
 
+function unboundedResponse(
+  id: string,
+  status: number,
+  location: string | undefined,
+  releases: Map<string, Deferred.Deferred<void>>,
+  released: string[],
+  headers: Record<string, string> = {},
+) {
+  const signal = Deferred.makeUnsafe<void>()
+  releases.set(id, signal)
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array([1]))
+      },
+      // Keep the body open after its first chunk so only reader cancellation ends it.
+      pull: () => new Promise<void>(() => {}),
+      cancel() {
+        released.push(id)
+        Deferred.doneUnsafe(signal, Effect.void)
+      },
+    }),
+    { status, headers: { ...headers, ...(location ? { location } : {}) } },
+  )
+}
+
+const waitForBodyRelease = (releases: Map<string, Deferred.Deferred<void>>, id: string) =>
+  Effect.gen(function* () {
+    const signal = releases.get(id)
+    if (!signal) return yield* Effect.fail(new Error(`missing response body signal: ${id}`))
+    yield* Deferred.await(signal).pipe(
+      Effect.timeoutOrElse({
+        duration: "2 seconds",
+        orElse: () => Effect.fail(new Error(`response body was not released: ${id}`)),
+      }),
+    )
+  })
+
 const exec = Effect.fn("WebFetchToolTest.exec")(function* (
   args: Tool.InferParameters<typeof WebFetchTool>,
   ruleset: PermissionV1.Ruleset = [{ permission: "webfetch", pattern: "*", action: "allow" }],
+  fetcher: typeof globalThis.fetch = globalThis.fetch,
 ) {
   const permission = yield* Permission.Service
   const info = yield* WebFetchTool
   const tool = yield* info.init()
-  return yield* tool.execute(args, {
-    ...ctx,
-    ask: (request) => {
-      initialPermissionPatterns.push(...request.patterns)
-      return permission
-        .ask({
-          ...request,
-          sessionID: ctx.sessionID,
-          tool: { messageID: ctx.messageID, callID: ctx.callID },
-          ruleset,
-        })
-        .pipe(Effect.orDie)
-    },
-    assertNotDenied: (request) =>
-      Effect.sync(() => redirectChecks.push(...request.patterns)).pipe(
-        Effect.andThen(
-          permission.assertNotDenied({
+  return yield* tool
+    .execute(args, {
+      ...ctx,
+      ask: (request) => {
+        initialPermissionPatterns.push(...request.patterns)
+        return permission
+          .ask({
             ...request,
             sessionID: ctx.sessionID,
             tool: { messageID: ctx.messageID, callID: ctx.callID },
             ruleset,
-          }),
+          })
+          .pipe(Effect.orDie)
+      },
+      assertNotDenied: (request) =>
+        Effect.sync(() => redirectChecks.push(...request.patterns)).pipe(
+          Effect.andThen(
+            permission.assertNotDenied({
+              ...request,
+              sessionID: ctx.sessionID,
+              tool: { messageID: ctx.messageID, callID: ctx.callID },
+              ruleset,
+            }),
+          ),
         ),
-      ),
-  })
+    })
+    .pipe(Effect.provideService(FetchHttpClient.Fetch, fetcher))
 })
 
 const expectNoPermissionAsk = <A, E, R>(self: Effect.Effect<A, E, R>) =>
@@ -177,7 +219,7 @@ describe("tool.webfetch", () => {
     )
   }, 15_000)
 
-  it.instance("transports an uppercase-scheme URL in its canonical form under an allowing rule", () => {
+  it.instance("matches uppercase-scheme URL parsed hrefs under an allowing rule", () => {
     const received: string[] = []
     return withFetch(
       (request) => {
@@ -425,6 +467,130 @@ describe("tool.webfetch", () => {
           expect(received[2]?.agent).toBe("opencode")
           expect(redirectChecks).toEqual([target])
         }),
+    )
+  }, 15_000)
+
+  it.instance("releases every discarded streaming response body", () => {
+    const releases = new Map<string, Deferred.Deferred<void>>()
+    const released: string[] = []
+    const requests: string[] = []
+    // Retain raw Fetch responses so garbage collection cannot make missing cleanup look successful.
+    const heldResponses: Response[] = []
+    const previousBodiesUsedBeforeFetch: boolean[] = []
+    const nativeFetch = globalThis.fetch
+    const trackedFetch = Object.assign(
+      (...args: Parameters<typeof globalThis.fetch>) => {
+        if (heldResponses.length > 0) previousBodiesUsedBeforeFetch.push(heldResponses.at(-1)?.bodyUsed ?? false)
+        return nativeFetch(...args).then((response) => {
+          if (new URL(args[0] instanceof Request ? args[0].url : args[0].toString()).pathname !== "/too-large") {
+            heldResponses.push(response)
+            return response
+          }
+          // Preserve the live body while declaring it oversized to exercise the pre-read rejection path.
+          const headers = new Headers(response.headers)
+          headers.set("content-length", String(5 * 1024 * 1024 + 1))
+          const wrapped = new Response(response.body, { status: response.status, headers })
+          heldResponses.push(wrapped)
+          return wrapped
+        })
+      },
+      { preconnect: nativeFetch.preconnect },
+    )
+    let limitRequests = 0
+    let challengeRequests = 0
+    return withFetch(
+      (request) => {
+        const pathname = new URL(request.url).pathname
+        requests.push(pathname)
+        if (pathname === "/follow") return unboundedResponse("follow", 302, "/target", releases, released)
+        if (pathname === "/deny") return unboundedResponse("denied-hop", 302, "/blocked", releases, released)
+        if (pathname === "/limit") {
+          limitRequests++
+          if (limitRequests <= MAX_REDIRECTS + 1) {
+            return unboundedResponse(`limit-${limitRequests}`, 302, "/limit", releases, released)
+          }
+          return unboundedResponse("limit-extra", 404, undefined, releases, released)
+        }
+        if (pathname === "/unsupported") {
+          return unboundedResponse("unsupported", 301, "file:///etc/passwd", releases, released)
+        }
+        if (pathname === "/not-found") return unboundedResponse("not-found", 404, undefined, releases, released)
+        if (pathname === "/too-large") return unboundedResponse("too-large", 200, undefined, releases, released)
+        if (pathname === "/challenge") {
+          challengeRequests++
+          if (request.headers.get("user-agent") !== "opencode") {
+            return unboundedResponse("cloudflare", 403, undefined, releases, released, {
+              "cf-mitigated": "challenge",
+            })
+          }
+          return new Response("retried", { headers: { "content-type": "text/plain" } })
+        }
+        return new Response("target", { headers: { "content-type": "text/plain" } })
+      },
+      (url) =>
+        Effect.gen(function* () {
+          const allow = [{ permission: "webfetch", pattern: "*", action: "allow" }] satisfies PermissionV1.Ruleset
+          const follow = yield* expectNoPermissionAsk(
+            exec({ url: new URL("/follow", url).href, format: "text" }, allow, trackedFetch),
+          )
+          expect(follow.output).toBe("target")
+          expect(heldResponses).toHaveLength(requests.length)
+          expect(heldResponses[0]?.bodyUsed).toBe(true)
+          yield* waitForBodyRelease(releases, "follow")
+
+          const denied = new URL("/blocked", url).href
+          const deniedOutcome = yield* Effect.exit(
+            exec({ url: new URL("/deny", url).href, format: "text" }, [
+              ...allow,
+              { permission: "webfetch", pattern: denied, action: "deny" },
+            ], trackedFetch),
+          )
+          expect(deniedOutcome._tag).toBe("Failure")
+          yield* waitForBodyRelease(releases, "denied-hop")
+          expect(requests).not.toContain("/blocked")
+
+          limitRequests = 0
+          const limit = yield* Effect.exit(exec({ url: new URL("/limit", url).href, format: "text" }, allow, trackedFetch))
+          expect(limit._tag).toBe("Failure")
+          yield* Effect.forEach(
+            Array.from({ length: MAX_REDIRECTS + 1 }, (_, index) => `limit-${index + 1}`),
+            (id) => waitForBodyRelease(releases, id),
+            { concurrency: 1 },
+          )
+          expect(limitRequests).toBe(MAX_REDIRECTS + 1)
+
+          const unsupported = yield* Effect.exit(
+            exec({ url: new URL("/unsupported", url).href, format: "text" }, allow, trackedFetch),
+          )
+          expect(unsupported._tag).toBe("Failure")
+          yield* waitForBodyRelease(releases, "unsupported")
+
+          const notFound = yield* Effect.exit(
+            exec({ url: new URL("/not-found", url).href, format: "text" }, allow, trackedFetch),
+          )
+          expect(notFound._tag).toBe("Failure")
+          yield* waitForBodyRelease(releases, "not-found")
+
+          const tooLarge = yield* Effect.exit(
+            exec({ url: new URL("/too-large", url).href, format: "text" }, allow, trackedFetch),
+          )
+          expect(tooLarge._tag).toBe("Failure")
+          yield* waitForBodyRelease(releases, "too-large")
+
+          const challenge = yield* expectNoPermissionAsk(
+            exec({ url: new URL("/challenge", url).href, format: "text" }, allow, trackedFetch),
+          )
+          expect(challenge.output).toBe("retried")
+          yield* waitForBodyRelease(releases, "cloudflare")
+          expect(challengeRequests).toBe(2)
+          expect(released).toContain("cloudflare")
+          expect(heldResponses).toHaveLength(requests.length)
+          expect(heldResponses.every((response) => response.bodyUsed)).toBe(true)
+          expect(previousBodiesUsedBeforeFetch).toHaveLength(requests.length - 1)
+          expect(previousBodiesUsedBeforeFetch.every(Boolean)).toBe(true)
+        }),
+      // Keep Bun's idle timeout outside the test's response-release backstop.
+      60,
     )
   }, 15_000)
 
