@@ -1,5 +1,5 @@
-import { Effect, Schema } from "effect"
-import { HttpClient, HttpClientRequest } from "effect/unstable/http"
+import { Effect, Exit, Schema, Stream } from "effect"
+import { FetchHttpClient, HttpClient, HttpClientError, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { Parser } from "htmlparser2"
 import * as Tool from "./tool"
 import TurndownService from "turndown"
@@ -25,23 +25,27 @@ export const WebFetchTool = Tool.define(
   "webfetch",
   Effect.gen(function* () {
     const http = yield* HttpClient.HttpClient
-    const httpOk = HttpClient.filterStatusOk(http)
 
     return {
       description: DESCRIPTION,
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         Effect.gen(function* () {
-          if (!params.url.startsWith("http://") && !params.url.startsWith("https://")) {
-            throw new Error("URL must start with http:// or https://")
-          }
+          const url = yield* Effect.try({
+            try: () => {
+              const parsed = new URL(params.url)
+              assertHttpUrl(parsed)
+              return parsed.href
+            },
+            catch: (error) => error,
+          })
 
           yield* ctx.ask({
             permission: "webfetch",
-            patterns: [params.url],
+            patterns: [url],
             always: ["*"],
             metadata: {
-              url: params.url,
+              url,
               format: params.format,
               timeout: params.timeout,
             },
@@ -73,87 +77,168 @@ export const WebFetchTool = Tool.define(
             "Accept-Language": "en-US,en;q=0.9",
           }
 
-          const request = HttpClientRequest.get(params.url).pipe(HttpClientRequest.setHeaders(headers))
+          const check = (url: string) =>
+            ctx.assertNotDenied
+              ? ctx.assertNotDenied({
+                  permission: "webfetch",
+                  patterns: [url],
+                  always: ["*"],
+                  metadata: { url, format: params.format, timeout: params.timeout },
+                })
+              : Effect.fail(new Error("Webfetch redirect permission check is unavailable"))
 
           // Retry with honest UA if blocked by Cloudflare bot detection (TLS fingerprint mismatch)
-          const response = yield* httpOk.execute(request).pipe(
-            Effect.catchIf(
-              (err) =>
-                err.reason._tag === "StatusCodeError" &&
-                err.reason.response.status === 403 &&
-                err.reason.response.headers["cf-mitigated"] === "challenge",
-              () =>
-                httpOk.execute(
-                  HttpClientRequest.get(params.url).pipe(
-                    HttpClientRequest.setHeaders({ ...headers, "User-Agent": "opencode" }),
-                  ),
-                ),
-            ),
+          const response = yield* execute(http, url, headers, check).pipe(
+            Effect.catchIf(isCloudflareChallenge, () => execute(http, url, headers, check, "opencode")),
             Effect.timeoutOrElse({ duration: timeout, orElse: () => Effect.die(new Error("Request timed out")) }),
           )
 
-          // Check content length
-          const contentLength = response.headers["content-length"]
-          if (contentLength && parseInt(contentLength) > MAX_RESPONSE_SIZE) {
-            throw new Error("Response too large (exceeds 5MB limit)")
-          }
-
-          const arrayBuffer = yield* response.arrayBuffer
-          if (arrayBuffer.byteLength > MAX_RESPONSE_SIZE) {
-            throw new Error("Response too large (exceeds 5MB limit)")
-          }
-
-          const contentType = response.headers["content-type"] || ""
-          const mime = contentType.split(";")[0]?.trim().toLowerCase() || ""
-          const title = `${params.url} (${contentType})`
-
-          if (isImageAttachment(mime)) {
-            const base64Content = Buffer.from(arrayBuffer).toString("base64")
-            return {
-              title,
-              output: "Image fetched successfully",
-              metadata: {},
-              attachments: [
-                {
-                  type: "file" as const,
-                  mime,
-                  url: `data:${mime};base64,${base64Content}`,
-                },
-              ],
+          return yield* Effect.gen(function* () {
+            // Check content length
+            const contentLength = response.headers["content-length"]
+            if (contentLength && parseInt(contentLength) > MAX_RESPONSE_SIZE) {
+              throw new Error("Response too large (exceeds 5MB limit)")
             }
-          }
 
-          const content = new TextDecoder().decode(arrayBuffer)
+            const arrayBuffer = yield* response.arrayBuffer
+            if (arrayBuffer.byteLength > MAX_RESPONSE_SIZE) {
+              throw new Error("Response too large (exceeds 5MB limit)")
+            }
 
-          // Handle content based on requested format and actual content type
-          switch (params.format) {
-            case "markdown":
-              if (contentType.includes("text/html")) {
-                const markdown = convertHTMLToMarkdown(content)
-                return {
-                  output: markdown,
-                  title,
-                  metadata: {},
+            const contentType = response.headers["content-type"] || ""
+            const mime = contentType.split(";")[0]?.trim().toLowerCase() || ""
+            const title = `${params.url} (${contentType})`
+
+            if (isImageAttachment(mime)) {
+              const base64Content = Buffer.from(arrayBuffer).toString("base64")
+              return {
+                title,
+                output: "Image fetched successfully",
+                metadata: {},
+                attachments: [
+                  {
+                    type: "file" as const,
+                    mime,
+                    url: `data:${mime};base64,${base64Content}`,
+                  },
+                ],
+              }
+            }
+
+            const content = new TextDecoder().decode(arrayBuffer)
+
+            // Handle content based on requested format and actual content type
+            switch (params.format) {
+              case "markdown":
+                if (contentType.includes("text/html")) {
+                  const markdown = convertHTMLToMarkdown(content)
+                  return {
+                    output: markdown,
+                    title,
+                    metadata: {},
+                  }
                 }
-              }
-              return { output: content, title, metadata: {} }
+                return { output: content, title, metadata: {} }
 
-            case "text":
-              if (contentType.includes("text/html")) {
-                return { output: extractTextFromHTML(content), title, metadata: {} }
-              }
-              return { output: content, title, metadata: {} }
+              case "text":
+                if (contentType.includes("text/html")) {
+                  return { output: extractTextFromHTML(content), title, metadata: {} }
+                }
+                return { output: content, title, metadata: {} }
 
-            case "html":
-              return { output: content, title, metadata: {} }
+              case "html":
+                return { output: content, title, metadata: {} }
 
-            default:
-              return { output: content, title, metadata: {} }
-          }
+              default:
+                return { output: content, title, metadata: {} }
+            }
+          }).pipe(
+            Effect.onExit((exit) => (Exit.isFailure(exit) ? cancelResponseBody(response) : Effect.void)),
+          )
         }).pipe(Effect.orDie),
     }
   }),
 )
+
+export const MAX_REDIRECTS = 10
+const redirectStatuses = new Set([301, 302, 303, 307, 308])
+
+function assertHttpUrl(url: URL) {
+  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("URL must use http:// or https://")
+}
+
+// Pull at most one chunk to acquire the Fetch body reader, then cancel; the timeout bounds a silent body.
+const cancelResponseBody = (response: HttpClientResponse.HttpClientResponse) =>
+  Effect.sync(() => Stream.toReadableStream(response.stream).getReader()).pipe(
+    Effect.flatMap((reader) =>
+      Effect.tryPromise({
+        try: () => reader.read(),
+        catch: (error) => error,
+      }).pipe(
+        Effect.timeoutOrElse({
+          duration: "1 second",
+          orElse: () => Effect.void,
+        }),
+        Effect.catch(() => Effect.void),
+        Effect.asVoid,
+        Effect.ensuring(
+          Effect.sync(() => {
+            void reader.cancel().catch(() => undefined)
+          }),
+        ),
+      ),
+    ),
+  )
+
+const filterResponse = (response: HttpClientResponse.HttpClientResponse) =>
+  HttpClientResponse.filterStatusOk(response).pipe(
+    Effect.onExit((exit) => (Exit.isFailure(exit) ? cancelResponseBody(response) : Effect.void)),
+  )
+
+const isCloudflareChallenge = (error: unknown) => {
+  if (!HttpClientError.isHttpClientError(error) || error.reason._tag !== "StatusCodeError") return false
+  const response = error.reason.response
+  return response.status === 403 && response.headers["cf-mitigated"] === "challenge"
+}
+
+function execute(
+  http: HttpClient.HttpClient,
+  url: string,
+  headers: Record<string, string>,
+  check: (url: string) => Effect.Effect<void, Error>,
+  userAgent = headers["User-Agent"]!,
+  redirects = 0,
+): Effect.Effect<HttpClientResponse.HttpClientResponse, Error> {
+  return http
+    .execute(
+      HttpClientRequest.get(url).pipe(HttpClientRequest.setHeaders({ ...headers, "User-Agent": userAgent })),
+    )
+    .pipe(
+      Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }),
+      Effect.flatMap((response) => {
+        const location = response.headers.location
+        if (!redirectStatuses.has(response.status) || !location) return filterResponse(response)
+        return cancelResponseBody(response).pipe(
+          Effect.flatMap(() => {
+            if (redirects >= MAX_REDIRECTS)
+              return Effect.fail(new Error(`Too many redirects (more than ${MAX_REDIRECTS})`))
+            return Effect.gen(function* () {
+              const next = yield* Effect.try({
+                try: () => {
+                  const target = new URL(location, url)
+                  assertHttpUrl(target)
+                  return target.href
+                },
+                catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+              })
+              yield* check(next)
+              return yield* execute(http, next, headers, check, userAgent, redirects + 1)
+            })
+          }),
+        )
+      }),
+    )
+}
 
 function extractTextFromHTML(html: string) {
   let text = ""

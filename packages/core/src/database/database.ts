@@ -7,6 +7,7 @@ import { Global } from "../global"
 import { Flag } from "../flag/flag"
 import { DatabaseMigration } from "./migration"
 import { resolvePath } from "./resolve-path"
+import { restrictToOwner } from "./file-permissions"
 import { InstallationChannel } from "../installation/version"
 import { makeGlobalNode } from "../effect/app-node"
 import { EventWriter } from "../event/writer"
@@ -47,7 +48,11 @@ const layer = Layer.effect(
 )
 
 export function layerFromPath(filename: string) {
-  return layer.pipe(Layer.provide(sqliteLayer({ filename, disableWAL: true })))
+  return Layer.unwrap(
+    Effect.map(Effect.promise(() => restrictToOwner(filename)), () =>
+      layer.pipe(Layer.provide(sqliteLayer({ filename, disableWAL: true }))),
+    ),
+  )
 }
 
 export function path() {

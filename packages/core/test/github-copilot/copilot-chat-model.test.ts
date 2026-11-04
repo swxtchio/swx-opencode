@@ -1,4 +1,5 @@
 import { OpenAICompatibleChatLanguageModel } from "@opencode-ai/core/github-copilot/chat/openai-compatible-chat-language-model"
+import { convertToOpenAICompatibleChatMessages } from "@opencode-ai/core/github-copilot/chat/convert-to-openai-compatible-chat-messages"
 import { describe, test, expect, mock } from "bun:test"
 import type { LanguageModelV3Prompt } from "@ai-sdk/provider"
 
@@ -71,6 +72,15 @@ const FIXTURES = {
     `data: {"choices":[{"finish_reason":"tool_calls","index":0,"delta":{"content":null,"role":"assistant","tool_calls":[{"function":{"arguments":"{}","name":"read_file"},"id":"call_reasoning_only_2","index":1,"type":"function"}]}}],"created":1769917420,"id":"opaque-only","usage":{"completion_tokens":12,"prompt_tokens":123,"prompt_tokens_details":{"cached_tokens":0},"total_tokens":135,"reasoning_tokens":0},"model":"gemini-3-flash-preview"}`,
     `data: [DONE]`,
   ],
+
+  // Interleaved thinking (Claude) sends a new reasoning_opaque before each tool call
+  interleavedReasoningOpaque: [
+    `data: {"choices":[{"index":0,"delta":{"content":null,"role":"assistant","reasoning_text":"Read the readme first."}}],"created":1791590400,"id":"interleaved","model":"claude-opus-5.5"}`,
+    `data: {"choices":[{"index":0,"delta":{"content":null,"role":"assistant","tool_calls":[{"function":{"arguments":"{\\"filePath\\":\\"/README.md\\"}","name":"read_file"},"id":"call_first","index":0,"type":"function"}],"reasoning_opaque":"opaque-first"}}],"created":1791590400,"id":"interleaved","model":"claude-opus-5.5"}`,
+    `data: {"choices":[{"index":0,"delta":{"content":null,"role":"assistant","reasoning_text":"Then the manifest."}}],"created":1791590401,"id":"interleaved","model":"claude-opus-5.5"}`,
+    `data: {"choices":[{"finish_reason":"tool_calls","index":0,"delta":{"content":null,"role":"assistant","tool_calls":[{"function":{"arguments":"{\\"filePath\\":\\"/package.json\\"}","name":"read_file"},"id":"call_second","index":1,"type":"function"}],"reasoning_opaque":"opaque-second"}}],"created":1791590401,"id":"interleaved","usage":{"completion_tokens":42,"prompt_tokens":1200,"total_tokens":1242},"model":"claude-opus-5.5"}`,
+    `data: [DONE]`,
+  ],
 }
 
 function createMockFetch(chunks: string[]) {
@@ -98,6 +108,43 @@ function createModel(fetchFn: ReturnType<typeof mock>) {
     headers: () => ({ Authorization: "Bearer test-token" }),
     fetch: fetchFn as any,
   })
+}
+
+async function interleavedReasoningParts() {
+  const model = createModel(createMockFetch(FIXTURES.interleavedReasoningOpaque))
+  const { stream } = await model.doStream({ prompt: TEST_PROMPT, includeRawChunks: false })
+  return convertReadableStreamToArray(stream)
+}
+
+function replayPrompt(parts: Awaited<ReturnType<typeof interleavedReasoningParts>>): LanguageModelV3Prompt {
+  const content: Extract<LanguageModelV3Prompt[number], { role: "assistant" }>["content"] = []
+  for (const part of parts) {
+    if (part.type === "reasoning-delta") {
+      content.push({ type: "reasoning", text: part.delta })
+      continue
+    }
+    if (part.type === "reasoning-end") {
+      const reasoning = content.at(-1)
+      const reasoningOpaque = part.providerMetadata?.copilot?.reasoningOpaque
+      if (reasoning?.type === "reasoning" && reasoningOpaque) {
+        content[content.length - 1] = {
+          ...reasoning,
+          providerOptions: { copilot: { reasoningOpaque } },
+        }
+      }
+      continue
+    }
+    if (part.type !== "tool-call") continue
+    const reasoningOpaque = part.providerMetadata?.copilot?.reasoningOpaque
+    content.push({
+      type: "tool-call",
+      toolCallId: part.toolCallId,
+      toolName: part.toolName,
+      input: part.input,
+      ...(reasoningOpaque ? { providerOptions: { copilot: { reasoningOpaque } } } : {}),
+    })
+  }
+  return [{ role: "assistant", content }]
 }
 
 describe("doStream", () => {
@@ -480,6 +527,48 @@ describe("doStream", () => {
         },
       },
     })
+  })
+
+  test("should accept successive interleaved reasoning_opaque values", async () => {
+    const parts = await interleavedReasoningParts()
+    expect(parts.filter((p) => p.type === "error")).toEqual([])
+    expect(parts.at(-1)).toMatchObject({ type: "finish", finishReason: { unified: "tool-calls" } })
+  })
+
+  test("should emit and replay interleaved reasoning in segment order", async () => {
+    const parts = await interleavedReasoningParts()
+    expect(
+      parts.filter((p) => p.type === "reasoning-delta" || p.type === "reasoning-end" || p.type === "tool-call"),
+    ).toMatchObject([
+      { type: "reasoning-delta", delta: "Read the readme first." },
+      { type: "reasoning-end", providerMetadata: { copilot: { reasoningOpaque: "opaque-first" } } },
+      {
+        type: "tool-call",
+        toolCallId: "call_first",
+        providerMetadata: { copilot: { reasoningOpaque: "opaque-first" } },
+      },
+      { type: "reasoning-delta", delta: "Then the manifest." },
+      { type: "reasoning-end", providerMetadata: { copilot: { reasoningOpaque: "opaque-second" } } },
+      {
+        type: "tool-call",
+        toolCallId: "call_second",
+        providerMetadata: { copilot: { reasoningOpaque: "opaque-second" } },
+      },
+    ])
+    expect(convertToOpenAICompatibleChatMessages(replayPrompt(parts))).toMatchObject([
+      { role: "assistant", reasoning_text: "Read the readme first.Then the manifest." },
+    ])
+  })
+
+  test("should replay the latest interleaved reasoning_opaque value", async () => {
+    const parts = await interleavedReasoningParts()
+    expect(parts.at(-1)).toMatchObject({
+      type: "finish",
+      providerMetadata: { copilot: { reasoningOpaque: "opaque-second" } },
+    })
+    expect(convertToOpenAICompatibleChatMessages(replayPrompt(parts))).toMatchObject([
+      { role: "assistant", reasoning_opaque: "opaque-second" },
+    ])
   })
 
   test("should include response metadata from first chunk", async () => {
