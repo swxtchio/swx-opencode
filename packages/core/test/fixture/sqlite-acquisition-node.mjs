@@ -4,6 +4,11 @@ import { SqlClient } from "effect/unstable/sql/SqlClient"
 import { layer as coreNodeLayer } from "../../src/database/sqlite.node.ts"
 import { NodeSqliteClient } from "../../../effect-sqlite-node/src/index.ts"
 
+const nodeMajor = Number(process.versions.node.split(".")[0])
+assert.equal(process.release.name, "node", "SQLite permit tests must run under native Node.js")
+assert.equal(process.versions.bun, undefined, "SQLite permit tests must not fall back to Bun")
+assert.ok(nodeMajor >= 22, `SQLite permit tests require Node.js 22+, got ${process.versions.node}`)
+
 const operations = (client) => {
   const statement = client.unsafe("SELECT 2")
   const result = [
@@ -96,7 +101,7 @@ const verify = async (name, layer) => {
 }
 
 const failures = []
-process.stdout.write(`node=${process.versions.node}\n`)
+process.stdout.write(`runtime=${process.release.name} node=${process.versions.node}\n`)
 for (const [name, layer] of [
   ["core-node", coreNodeLayer({ filename: ":memory:" })],
   ["standalone-node", NodeSqliteClient.layer({ filename: ":memory:" })],

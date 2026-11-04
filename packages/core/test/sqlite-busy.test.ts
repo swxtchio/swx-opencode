@@ -1204,7 +1204,7 @@ test(
       new Response(child.stderr).text(),
     ])
     if (exitCode !== 0) throw new Error(`Native Node acquisition tests failed (${exitCode})\n${stdout}\n${stderr}`)
-    expect(stdout).toMatch(/node=24\./)
+    expect(stdout).toMatch(/^runtime=node node=\d+\.\d+\.\d+$/m)
     expect(stdout).toContain("PASS core-node")
     expect(stdout).toContain("PASS standalone-node")
   },
