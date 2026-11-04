@@ -59,7 +59,12 @@ test("reports a browser launcher that exits after openUrl returns", async () => 
   const launched = new Promise<{ subprocess: ChildProcess; exitListenerReady: Promise<void> }>((resolve) => {
     captureLateLauncher = resolve
   })
-  const opening = openBrowserFailure("https://example.com/later-failure")
+  const opening = Effect.runPromise(
+    Effect.gen(function* () {
+      const browser = yield* McpBrowser.Service
+      return yield* Effect.flip(browser.open("https://example.com/later-failure"))
+    }).pipe(Effect.provide(LayerNode.compile(McpBrowser.node))),
+  )
   const { subprocess, exitListenerReady } = await within(launched, "browser launcher was not created")
   const closed = once(subprocess, "close")
 
@@ -76,15 +81,6 @@ test("reports a browser launcher that exits after openUrl returns", async () => 
     captureLateLauncher = undefined
   }
 })
-
-function openBrowserFailure(url: string) {
-  return Effect.runPromise(
-    Effect.gen(function* () {
-      const browser = yield* McpBrowser.Service
-      return yield* Effect.flip(browser.open(url))
-    }).pipe(Effect.provide(LayerNode.compile(McpBrowser.node))),
-  )
-}
 
 function within<T>(promise: Promise<T>, message: string) {
   return new Promise<T>((resolve, reject) => {
