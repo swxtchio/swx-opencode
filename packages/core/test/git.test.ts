@@ -136,8 +136,8 @@ describe("Git trees", () => {
       expect(
         (yield* git.tree.diff({ repository, from: before, to: after })).map((file) => [file.path, file.status]),
       ).toEqual([
-        ["new name.txt", "added"],
-        ["old name.txt", "deleted"],
+        [RelativePath.make("new name.txt"), "added"],
+        [RelativePath.make("old name.txt"), "deleted"],
       ])
     }),
   )
