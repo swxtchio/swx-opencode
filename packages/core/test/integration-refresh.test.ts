@@ -217,6 +217,7 @@ it.live("interrupting a joining caller settles that wait without cancelling anot
       const methodID = Integration.MethodID.make("oauth")
       const entered = yield* Deferred.make<void>()
       const release = yield* Deferred.make<void>()
+      const refreshInterrupted = yield* Deferred.make<void>()
       const duplicateRefresh = yield* Deferred.make<void>()
       const refreshFailure = new Error("token endpoint unavailable")
       yield* Effect.acquireUseRelease(
@@ -229,7 +230,9 @@ it.live("interrupting a joining caller settles that wait without cancelling anot
                 calls++
                 if (calls === 1) {
                   yield* Deferred.succeed(entered, undefined)
-                  yield* Deferred.await(release)
+                  yield* Deferred.await(release).pipe(
+                    Effect.onInterrupt(() => Deferred.succeed(refreshInterrupted, undefined)),
+                  )
                   return yield* Effect.fail(refreshFailure)
                 }
                 yield* Deferred.succeed(duplicateRefresh, undefined)
@@ -249,14 +252,30 @@ it.live("interrupting a joining caller settles that wait without cancelling anot
             const waiter = yield* services.second.connection.resolve(connection).pipe(Effect.forkScoped)
             yield* Deferred.await(secondLock)
             yield* Fiber.interrupt(waiter).pipe(Effect.forkScoped)
-            const boundedWait = yield* Fiber.await(waiter).pipe(Effect.timeoutOption("1 second"), Effect.forkScoped)
-            yield* Effect.yieldNow
-            expect(Option.isSome(yield* Fiber.join(boundedWait))).toBe(true)
+            // A correct joiner settles independently; a broken lock interrupts the shared provider instead.
+            const cancellationOutcome = yield* Effect.raceFirst(
+              Fiber.await(waiter).pipe(Effect.as("waiter-settled" as const)),
+              Deferred.await(refreshInterrupted).pipe(Effect.as("shared-refresh-interrupted" as const)),
+            ).pipe(Effect.timeoutOption("4 seconds"))
             yield* Deferred.succeed(release, undefined)
 
-            const ownerExit = yield* Fiber.join(owner)
+            const settled = yield* Effect.all([Fiber.join(owner), Fiber.await(waiter)]).pipe(
+              Effect.timeoutOption("4 seconds"),
+            )
+            expect(Option.isSome(settled)).toBe(true)
+            expect(Option.isSome(cancellationOutcome)).toBe(true)
+            if (!Option.isSome(settled) || !Option.isSome(cancellationOutcome)) return
+            const [ownerExit, waiterExit] = settled.value
             expect(Exit.isFailure(ownerExit)).toBe(true)
-            expect(Exit.isFailure(yield* Fiber.await(waiter))).toBe(true)
+            if (!Exit.isFailure(ownerExit)) throw new Error("Expected the owner to receive the shared refresh failure")
+            expect(Cause.hasInterrupts(ownerExit.cause)).toBe(false)
+            const ownerError = Cause.squash(ownerExit.cause)
+            expect(ownerError).toBeInstanceOf(Integration.AuthorizationError)
+            if (!(ownerError instanceof Integration.AuthorizationError))
+              throw new Error("Expected the owner's refresh to fail with an authorization error")
+            expect(ownerError.cause).toBe(refreshFailure)
+            expect(cancellationOutcome.value).toBe("waiter-settled")
+            expect(Exit.isFailure(waiterExit)).toBe(true)
             const boundedDuplicate = yield* Deferred.await(duplicateRefresh)
               .pipe(Effect.timeoutOption("2 seconds"), Effect.forkScoped)
             expect(Option.isNone(yield* Fiber.join(boundedDuplicate))).toBe(true)
