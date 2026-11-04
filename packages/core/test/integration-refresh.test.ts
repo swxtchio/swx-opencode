@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "child_process"
 import fs from "fs/promises"
 import path from "path"
 import { afterAll, beforeAll, expect } from "bun:test"
-import { Cause, Clock, Context, Deferred, Effect, Exit, Fiber, Layer, Option } from "effect"
+import { Cause, Clock, Context, Deferred, Effect, Exit, Fiber, Layer, Option, Scope } from "effect"
 import * as TestClock from "effect/testing/TestClock"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Credential } from "@opencode-ai/core/credential"
@@ -16,8 +16,10 @@ import { testEffect } from "./lib/effect"
 const it = testEffect(Layer.empty)
 const linuxProcessTest = process.platform === "linux" ? it.live : it.live.skip
 const joiningWorkerMode = process.env.OPENCODE_REFRESH_JOINER_WORKER === "1"
-const joiningScenarioTest = joiningWorkerMode || process.platform !== "linux" ? it.live : it.live.skip
+const joiningWorkerSupervised = process.env.OPENCODE_REFRESH_JOINER_SUPERVISED === "1"
+const joiningScenarioTest = joiningWorkerMode ? it.live : it.live.skip
 const joiningSupervisorTest = joiningWorkerMode ? it.live.skip : linuxProcessTest
+const joiningAssertionPrefix = "JOINING_CALLER_CASE_ASSERTION:"
 const worktreeRoot = path.resolve(import.meta.dir, "../../..")
 const scratchBase = process.env.GOTMPDIR ?? path.join(worktreeRoot, ".scratch")
 let scratchRoot: string | undefined
@@ -40,7 +42,9 @@ beforeAll(async () => {
 })
 
 afterAll(async () => {
-  if (scratchRoot && !preserveScratchRoot) await fs.rm(scratchRoot, { recursive: true, force: true })
+  if (!scratchRoot) return
+  if (preserveScratchRoot && (!joiningWorkerMode || joiningWorkerSupervised)) return
+  await fs.rm(scratchRoot, { recursive: true, force: true })
 })
 
 it.live("shares one failure across Locations rather than retrying after file-lock serialization", () =>
@@ -228,9 +232,17 @@ joiningScenarioTest(
   "joining-caller isolated scenario",
   () =>
     Effect.gen(function* () {
-      const observation = yield* withTemporaryDirectory((directory) =>
-        Effect.scoped(
-          Effect.gen(function* () {
+      const root = scratchRoot
+      if (!root) throw new Error("OAuth refresh test scratch was not initialized")
+      const directory = yield* Effect.promise(() => fs.mkdtemp(path.join(root, "case-")))
+      const observation = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const release = yield* Deferred.make<void>()
+          const releaseOwner = () => Deferred.succeed(release, undefined).pipe(Effect.asVoid)
+          const refreshFailure = new Error("token endpoint unavailable")
+          const scenario = Effect.gen(function* () {
+            const serviceScope = yield* Scope.make()
+            const callerScope = yield* Scope.make()
             const firstLock = yield* Deferred.make<void>()
             const secondLock = yield* Deferred.make<void>()
             const lockSignals = [firstLock, secondLock]
@@ -239,26 +251,15 @@ joiningScenarioTest(
                 const signal = lockSignals.shift()
                 return signal ? Deferred.succeed(signal, undefined).pipe(Effect.asVoid) : Effect.void
               })
-            const services = yield* locations(directory, onLock)
+            const services = yield* locations(directory, onLock, serviceScope)
             const integrationID = Integration.ID.make("refresh-cancel-waiter")
             const methodID = Integration.MethodID.make("oauth")
             const entered = yield* Deferred.make<void>()
-            const release = yield* Deferred.make<void>()
-            const releaseOwner = () => Deferred.succeed(release, undefined).pipe(Effect.asVoid)
-            const refreshInterrupted = yield* Deferred.make<void>()
-            const refreshFailure = new Error("token endpoint unavailable")
-            let calls = 0
-            const implementation = oauthImplementation(integrationID, methodID, (value) =>
+            const implementation = oauthImplementation(integrationID, methodID, () =>
               Effect.gen(function* () {
-                calls++
-                if (calls === 1) {
-                  yield* Deferred.succeed(entered, undefined)
-                  yield* Deferred.await(release).pipe(
-                    Effect.onInterrupt(() => Deferred.succeed(refreshInterrupted, undefined)),
-                  )
-                  return yield* Effect.fail(refreshFailure)
-                }
-                return rotated(value, "duplicate")
+                yield* Deferred.succeed(entered, undefined)
+                yield* Effect.uninterruptible(Deferred.await(release))
+                return yield* Effect.fail(refreshFailure)
               }),
             )
             yield* Effect.forEach([services.first, services.second], (integration) =>
@@ -268,35 +269,55 @@ joiningScenarioTest(
             const stored = yield* services.credentials.create({ integrationID, value: expiredOAuth(methodID) })
             const connection = credentialConnection(stored)
 
-            const owner = yield* services.first.connection.resolve(connection).pipe(Effect.exit, Effect.forkScoped)
-            yield* Effect.addFinalizer(releaseOwner)
+            const owner = yield* services.first.connection.resolve(connection).pipe(
+              Effect.exit,
+              Effect.forkIn(callerScope),
+            )
             yield* Deferred.await(firstLock)
             yield* Deferred.await(entered)
-            const waiter = yield* services.second.connection.resolve(connection).pipe(Effect.forkScoped)
-            yield* Effect.addFinalizer(releaseOwner)
+            const waiter = yield* services.second.connection.resolve(connection).pipe(Effect.forkIn(callerScope))
             yield* Deferred.await(secondLock)
-            yield* Fiber.interrupt(waiter).pipe(Effect.forkScoped)
-            yield* Effect.addFinalizer(releaseOwner)
-            // A correct joiner settles independently; a broken lock interrupts the shared provider instead.
-            const cancellationOutcome = yield* Effect.raceFirst(
-              Fiber.await(waiter).pipe(Effect.as("waiter-settled" as const)),
-              Deferred.await(refreshInterrupted).pipe(Effect.as("shared-refresh-interrupted" as const)),
-            ).pipe(Effect.timeoutOption("4 seconds"))
+            yield* Fiber.interrupt(waiter).pipe(Effect.forkIn(callerScope))
+            const waiterSettled = yield* Fiber.await(waiter).pipe(Effect.timeoutOption("6 seconds"))
+            if (!Option.isSome(waiterSettled)) {
+              yield* releaseOwner()
+              preserveScratchRoot = true
+              const message = "interrupted waiter did not settle within the case's 6-second assertion bound"
+              process.stderr.write(`${joiningAssertionPrefix} ${message}\n`)
+              throw new Error(message)
+            }
             yield* releaseOwner()
 
             const settledCallers = yield* Effect.all([Fiber.join(owner), Fiber.await(waiter)]).pipe(
               Effect.timeoutOption("4 seconds"),
             )
-            return { cancellationOutcome, settledCallers, refreshFailure }
-          }),
-        ),
-      ).pipe(Effect.timeoutOption("8 seconds"))
+            if (!Option.isSome(settledCallers)) {
+              preserveScratchRoot = true
+              const message = "owner and interrupted waiter did not settle within the case's 4-second bound"
+              process.stderr.write(`${joiningAssertionPrefix} ${message}\n`)
+              throw new Error(message)
+            }
+            const [ownerExit, waiterExit] = settledCallers.value
+            if (Exit.isFailure(ownerExit) && Cause.hasInterrupts(ownerExit.cause)) {
+              preserveScratchRoot = true
+              const message = "the shared refresh owner was interrupted when only the joining caller was cancelled"
+              process.stderr.write(`${joiningAssertionPrefix} ${message}\n`)
+              throw new Error(message)
+            }
+            yield* Scope.close(callerScope, Exit.void)
+            yield* Scope.close(serviceScope, Exit.void)
+            yield* Effect.promise(() => fs.rm(directory, { recursive: true, force: true }))
+            return { settledCallers, waiterSettled, refreshFailure }
+          }).pipe(Effect.ensuring(releaseOwner()))
+          return yield* scenario.pipe(Effect.timeoutOption("9 seconds"))
+        }),
+      )
 
       if (!Option.isSome(observation))
-        throw new Error("Joining-caller interruption and teardown exceeded the 8-second case deadline")
+        throw new Error("Joining-caller interruption and teardown exceeded the 9-second case deadline")
       expect(Option.isSome(observation.value.settledCallers)).toBe(true)
-      expect(Option.isSome(observation.value.cancellationOutcome)).toBe(true)
-      if (!Option.isSome(observation.value.settledCallers) || !Option.isSome(observation.value.cancellationOutcome))
+      expect(Option.isSome(observation.value.waiterSettled)).toBe(true)
+      if (!Option.isSome(observation.value.settledCallers) || !Option.isSome(observation.value.waiterSettled))
         throw new Error("Joining-caller observation did not settle both callers within its bound")
       const [ownerExit, waiterExit] = observation.value.settledCallers.value
       expect(Exit.isFailure(ownerExit)).toBe(true)
@@ -307,7 +328,7 @@ joiningScenarioTest(
       if (!(ownerError instanceof Integration.AuthorizationError))
         throw new Error("Expected the owner's refresh to fail with an authorization error")
       expect(ownerError.cause).toBe(observation.value.refreshFailure)
-      expect(observation.value.cancellationOutcome.value).toBe("waiter-settled")
+      expect(Exit.isFailure(observation.value.waiterSettled.value)).toBe(true)
       expect(Exit.isFailure(waiterExit)).toBe(true)
     }),
   15_000,
@@ -319,17 +340,21 @@ joiningSupervisorTest(
     Effect.gen(function* () {
       const result = yield* Effect.promise(() => runBoundedJoinerScenario())
       const output = `${result.stdout}\n${result.stderr}`.trim().slice(-4_000)
+      if (result.caseAssertion)
+        throw new Error(
+          `Joining-caller case assertion failed: ${result.caseAssertion} (${result.reason}); child output: ${output}`,
+        )
       if (result.timedOut)
         throw new Error(`Joining-caller observation exceeded its case deadline (${result.reason}); child output: ${output}`)
       if (!result.close || result.close.code !== 0 || result.close.signal !== null)
         throw new Error(`Joining-caller scenario child failed; child output: ${output}`)
       expect(output).toContain("1 pass")
     }),
-  12_000,
+  15_000,
 )
 
 async function runBoundedJoinerScenario() {
-  const deadline = Date.now() + 8_000
+  const deadline = Date.now() + 10_000
   const remaining = () => Math.max(1, deadline - Date.now())
   if (!scratchRoot) throw new Error("OAuth refresh test scratch was not initialized")
   const childScratch = await within(
@@ -342,14 +367,31 @@ async function runBoundedJoinerScenario() {
     ["test", "test/integration-refresh.test.ts", "-t", "joining-caller isolated scenario"],
     {
       cwd: path.resolve(import.meta.dir, ".."),
-      env: { ...process.env, GOTMPDIR: childScratch, OPENCODE_REFRESH_JOINER_WORKER: "1" },
+      env: {
+        ...process.env,
+        GOTMPDIR: childScratch,
+        OPENCODE_REFRESH_JOINER_WORKER: "1",
+        OPENCODE_REFRESH_JOINER_SUPERVISED: "1",
+      },
       stdio: ["ignore", "pipe", "pipe"],
     },
   )
   let stdout = ""
   let stderr = ""
+  let caseAssertion: string | undefined
+  let resolveCaseAssertion: (message: string) => void = () => {}
+  const caseAssertionObserved = new Promise<string>((resolve) => {
+    resolveCaseAssertion = resolve
+  })
   child.stdout?.on("data", (chunk: Buffer) => (stdout += chunk.toString()))
-  child.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString()))
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString()
+    if (caseAssertion) return
+    const marker = stderr.indexOf(joiningAssertionPrefix)
+    if (marker === -1) return
+    caseAssertion = stderr.slice(marker).split("\n", 1)[0] ?? joiningAssertionPrefix
+    resolveCaseAssertion(caseAssertion)
+  })
   const closed = new Promise<WorkerClose>((resolve) => {
     child.once("close", (code, signal) => resolve({ code, signal }))
   })
@@ -373,14 +415,88 @@ async function runBoundedJoinerScenario() {
       "Joining-caller child start identity read exceeded its case deadline",
       Math.min(500, remaining()),
     ).catch(() => undefined)
-    const close = await within(
-      closed,
-      "Joining-caller scenario child exceeded its 5-second observation bound",
-      Math.max(1, remaining() - 1_500),
-    ).catch(() => undefined)
-    if (close) {
+    let observationTimer: ReturnType<typeof setTimeout> | undefined
+    const observation = await Promise.race([
+      closed.then((close) => ({ type: "closed" as const, close })),
+      caseAssertionObserved.then((message) => ({ type: "case-assertion" as const, message })),
+      new Promise<{ type: "deadline" }>((resolve) => {
+        observationTimer = setTimeout(
+          () => resolve({ type: "deadline" }),
+          Math.max(1, remaining() - 1_500),
+        )
+      }),
+    ])
+    if (observationTimer) clearTimeout(observationTimer)
+    if (observation.type === "closed") {
       childExited = true
-      return { close, timedOut: false, reason: "", stdout, stderr }
+      return { close: observation.close, timedOut: false, caseAssertion, reason: "", stdout, stderr }
+    }
+    if (observation.type === "case-assertion") {
+      const naturalClose = await within(closed, "Joining-caller case assertion teardown", Math.min(2_000, remaining())).catch(
+        () => undefined,
+      )
+      if (naturalClose) {
+        childExited = true
+        return {
+          close: naturalClose,
+          timedOut: false,
+          caseAssertion: observation.message,
+          reason: "",
+          stdout,
+          stderr,
+        }
+      }
+      if (started === undefined) {
+        const closeWithoutSignal = await within(closed, "Joining-caller child identity unavailable after case assertion", remaining()).catch(
+          () => undefined,
+        )
+        childExited = closeWithoutSignal !== undefined
+        if (!childExited) preserveScratchRoot = true
+        return {
+          close: closeWithoutSignal,
+          timedOut: false,
+          caseAssertion: observation.message,
+          reason: "case assertion observed; child left unsignalled because its start identity was unavailable",
+          stdout,
+          stderr,
+        }
+      }
+      const current = await within(
+        processStartIdentity(child.pid),
+        "Joining-caller child identity check after case assertion",
+        Math.min(500, remaining()),
+      ).catch(() => undefined)
+      if (current !== started) {
+        const closeWithoutSignal = await within(closed, "Joining-caller child identity changed after case assertion", remaining()).catch(
+          () => undefined,
+        )
+        childExited = closeWithoutSignal !== undefined
+        if (!childExited) preserveScratchRoot = true
+        return {
+          close: closeWithoutSignal,
+          timedOut: false,
+          caseAssertion: observation.message,
+          reason: "case assertion observed; child left unsignalled because its start identity changed",
+          stdout,
+          stderr,
+        }
+      }
+      child.kill("SIGTERM")
+      const stopped = await within(
+        closed,
+        "Joining-caller child did not close after case assertion cleanup",
+        remaining(),
+      ).catch(() => undefined)
+      childExited = stopped !== undefined
+      if (!childExited) preserveScratchRoot = true
+      return {
+        close: stopped,
+        timedOut: false,
+        caseAssertion: observation.message,
+        reason: "case assertion observed; identity-verified SIGTERM used only to finish cleanup",
+        stdout,
+        stderr,
+      }
     }
     if (started === undefined) {
       const naturalClose = await within(closed, "Joining-caller child identity was unavailable", remaining()).catch(
@@ -391,6 +507,7 @@ async function runBoundedJoinerScenario() {
       return {
         close: naturalClose,
         timedOut: true,
+        caseAssertion,
         reason: "start identity unavailable; child left unsignalled",
         stdout,
         stderr,
@@ -410,6 +527,7 @@ async function runBoundedJoinerScenario() {
       return {
         close: naturalClose,
         timedOut: true,
+        caseAssertion,
         reason: "start identity changed; child left unsignalled",
         stdout,
         stderr,
@@ -426,7 +544,8 @@ async function runBoundedJoinerScenario() {
     return {
       close: stopped,
       timedOut: true,
-      reason: "8-second case deadline reached; matching identity was verified before SIGTERM",
+      caseAssertion,
+      reason: "10-second case deadline reached; matching identity was verified before SIGTERM",
       stdout,
       stderr,
     }
@@ -672,29 +791,24 @@ linuxProcessTest("serializes resolver refreshes across processes and re-reads th
 linuxProcessTest("does not signal an OAuth worker when its start identity cannot be read", () =>
   withTemporaryDirectory((directory) =>
     Effect.gen(function* () {
-      const databasePath = path.join(directory, "credentials.db")
-      const lockRoot = path.join(directory, "state")
-      const integrationID = Integration.ID.make("refresh-identity-failure")
-      const methodID = Integration.MethodID.make("oauth")
-      const store = yield* Layer.build(Layer.fresh(storageLayer(databasePath, lockRoot)))
-      const credentials = Context.get(store, Credential.Service)
-      const created = yield* credentials.create({ integrationID, value: expiredOAuth(methodID) })
       const workers: WorkerSession[] = []
       const identityFailure = new Error("controlled process identity read failure")
       const outcome = yield* Effect.promise(() =>
-        runWorkerPair(
+        spawnRefreshWorker(
+          path.join(import.meta.dir, "fixture", "identity-wait-worker.ts"),
+          path.resolve(import.meta.dir, ".."),
           {
-            databasePath,
-            lockRoot,
-            integrationID,
-            methodID,
-            credentialID: created.id,
-            label: created.label,
-            firstFails: true,
+            databasePath: path.join(directory, "unused.db"),
+            lockRoot: path.join(directory, "state"),
+            integrationID: Integration.ID.make("refresh-identity-failure"),
+            methodID: Integration.MethodID.make("oauth"),
+            credentialID: Credential.ID.make("identity-failure"),
+            label: "identity-failure",
+            firstFails: false,
+            role: "first",
           },
-          async () => {},
-          async () => Promise.reject(identityFailure),
           workers,
+          async () => Promise.reject(identityFailure),
         ).then(
           () => ({ type: "completed" as const }),
           (error) => ({ type: "failed" as const, error }),
@@ -708,13 +822,16 @@ linuxProcessTest("does not signal an OAuth worker when its start identity cannot
       const worker = workers[0]
       if (!worker) return
       expect(worker.started).toBeUndefined()
-      expect(yield* Effect.promise(() => within(worker.closed, "identity-failure worker did not close"))).toEqual({
-        code: 0,
-        signal: null,
-      })
+      expect((yield* Effect.promise(() => worker.next("ready", 8_000))).type).toBe("ready")
+      const stopped = stopRefreshWorker(worker)
+      worker.send("release-refresh")
+      yield* Effect.promise(() => stopped)
+      expect(yield* Effect.promise(() => within(worker.closed, "identity-failure worker did not close", 1_000))).toEqual(
+        { code: 0, signal: null },
+      )
     }),
   ),
-  15_000,
+  12_000,
 )
 
 function storageLayer(databasePath: string, lockRoot: string) {
@@ -727,10 +844,11 @@ function storageLayer(databasePath: string, lockRoot: string) {
 function locations(
   directory: string,
   onLock: (id: Credential.ID) => Effect.Effect<void>,
+  providedScope?: Scope.Scope,
 ) {
   return Effect.gen(function* () {
     const memo = yield* Layer.makeMemoMap
-    const scope = yield* Effect.scope
+    const scope = providedScope ?? (yield* Effect.scope)
     const clock = yield* Clock.Clock
     const clockLayer = Layer.succeed(Clock.Clock, clock)
     const storage = yield* Layer.buildWithMemoMap(
@@ -867,21 +985,16 @@ type WorkerSession = {
 
 class WorkerMessageTimeout extends Error {}
 
-async function runWorkerPair(
-  input: WorkerInput,
-  beforeRelease: () => Promise<void>,
-  readStartIdentity: (pid: number) => Promise<string> = processStartIdentity,
-  workers: WorkerSession[] = [],
-) {
+async function runWorkerPair(input: WorkerInput, beforeRelease: () => Promise<void>) {
   const workerPath = path.join(import.meta.dir, "fixture", "integration-refresh-worker.ts")
   const coreDirectory = path.resolve(import.meta.dir, "..")
+  const workers: WorkerSession[] = []
   try {
     const first = await spawnRefreshWorker(
       workerPath,
       coreDirectory,
       { ...input, role: "first" as const },
       workers,
-      readStartIdentity,
     )
     expect((await first.next("ready")).access).toBe("old-access")
     first.send("resolve")
@@ -896,7 +1009,6 @@ async function runWorkerPair(
       coreDirectory,
       { ...input, role: "second" as const },
       workers,
-      readStartIdentity,
     )
     expect((await second.next("ready")).access).toBe("old-access")
     second.send("resolve")
@@ -940,7 +1052,7 @@ async function spawnRefreshWorker(
   coreDirectory: string,
   input: WorkerInput & { role: string },
   workers: WorkerSession[],
-  readStartIdentity: (pid: number) => Promise<string>,
+  readStartIdentity: (pid: number) => Promise<string> = processStartIdentity,
 ) {
   const child = spawn(process.execPath, [workerPath, JSON.stringify(input)], {
     cwd: coreDirectory,
