@@ -14,8 +14,13 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { testEffect } from "./lib/effect"
 
 const it = testEffect(Layer.empty)
+const worktreeRoot = path.resolve(import.meta.dir, "../../..")
+const scratchRoot = path.join(
+  process.env.GOTMPDIR ?? path.join(worktreeRoot, ".scratch"),
+  "oauth-refresh-tests",
+)
 
-it.live("shares successful and failed refreshes across Locations, then retries", () =>
+it.live("shares one failure across Locations rather than retrying after file-lock serialization", () =>
   withTemporaryDirectory((directory) =>
     Effect.gen(function* () {
       const lockSignals = yield* Effect.forEach([0, 1, 2, 3, 4], () => Deferred.make<void>())
@@ -212,6 +217,8 @@ it.effect("interrupting a joining caller settles that wait without cancelling an
       const methodID = Integration.MethodID.make("oauth")
       const entered = yield* Deferred.make<void>()
       const release = yield* Deferred.make<void>()
+      const duplicateRefresh = yield* Deferred.make<void>()
+      const refreshFailure = new Error("token endpoint unavailable")
       yield* Effect.acquireUseRelease(
         Effect.void,
         () =>
@@ -220,9 +227,13 @@ it.effect("interrupting a joining caller settles that wait without cancelling an
             const implementation = oauthImplementation(integrationID, methodID, (value) =>
               Effect.gen(function* () {
                 calls++
-                yield* Deferred.succeed(entered, undefined)
-                yield* Deferred.await(release)
-                return rotated(value, "waiter")
+                if (calls === 1) {
+                  yield* Deferred.succeed(entered, undefined)
+                  yield* Deferred.await(release)
+                  return yield* Effect.fail(refreshFailure)
+                }
+                yield* Deferred.succeed(duplicateRefresh, undefined)
+                return rotated(value, "duplicate")
               }),
             )
             yield* Effect.forEach([services.first, services.second], (integration) =>
@@ -232,7 +243,7 @@ it.effect("interrupting a joining caller settles that wait without cancelling an
             const stored = yield* services.credentials.create({ integrationID, value: expiredOAuth(methodID) })
             const connection = credentialConnection(stored)
 
-            const owner = yield* services.first.connection.resolve(connection).pipe(Effect.forkScoped)
+            const owner = yield* services.first.connection.resolve(connection).pipe(Effect.exit, Effect.forkScoped)
             yield* Deferred.await(firstLock)
             yield* Deferred.await(entered)
             const waiter = yield* services.second.connection.resolve(connection).pipe(Effect.forkScoped)
@@ -244,13 +255,18 @@ it.effect("interrupting a joining caller settles that wait without cancelling an
             expect(Option.isSome(yield* Fiber.join(boundedWait))).toBe(true)
             yield* Deferred.succeed(release, undefined)
 
-            const value = yield* Fiber.join(owner)
-            expect(value).toEqual(rotated(expiredOAuth(methodID), "waiter"))
+            const ownerExit = yield* Fiber.join(owner)
+            expect(Exit.isFailure(ownerExit)).toBe(true)
             expect(Exit.isFailure(yield* Fiber.await(waiter))).toBe(true)
-            expect((yield* services.credentials.get(stored.id))?.value).toEqual(value)
+            yield* TestClock.adjust("6 minutes")
+            expect(yield* Deferred.isDone(duplicateRefresh)).toBe(false)
             expect(calls).toBe(1)
           }),
-        () => Deferred.succeed(release, undefined).pipe(Effect.asVoid),
+        () =>
+          Deferred.succeed(release, undefined).pipe(
+            Effect.andThen(TestClock.adjust("6 minutes")),
+            Effect.asVoid,
+          ),
       )
     }),
   ),
@@ -577,10 +593,8 @@ function credentialConnection(credential: Credential.Info) {
 function withTemporaryDirectory<A, E, R>(use: (directory: string) => Effect.Effect<A, E, R>) {
   return Effect.acquireUseRelease(
     Effect.promise(async () => {
-      const root = process.env.GOTMPDIR
-      if (!root) throw new Error("GOTMPDIR is required for OAuth refresh test scratch")
-      await fs.access(root)
-      return fs.mkdtemp(path.join(root, "oauth-refresh-"))
+      await fs.mkdir(scratchRoot, { recursive: true, mode: 0o700 })
+      return fs.mkdtemp(path.join(scratchRoot, "case-"))
     }),
     (directory) => Effect.scoped(use(directory)),
     (directory) => Effect.promise(() => fs.rm(directory, { recursive: true, force: true })),
@@ -608,7 +622,7 @@ type WorkerMessage = {
 }
 type WorkerClose = { readonly code: number | null; readonly signal: NodeJS.Signals | null }
 type WorkerWaiter = {
-  readonly type: string
+  readonly types: readonly string[]
   readonly resolve: (message: WorkerMessage) => void
   readonly reject: (error: Error) => void
   timer?: ReturnType<typeof setTimeout>
@@ -621,6 +635,7 @@ type WorkerSession = {
   readonly seen: WorkerMessage[]
   readonly closed: Promise<WorkerClose>
   readonly next: (type: string, timeout?: number) => Promise<WorkerMessage>
+  readonly nextOneOf: (types: readonly string[], timeout?: number) => Promise<WorkerMessage>
   readonly send: (type: string) => void
 }
 
@@ -650,8 +665,10 @@ async function runWorkerPair(input: WorkerInput, beforeRelease: () => Promise<vo
     second.send("continue-lock")
     await second.next("lock-started")
 
-    const earlyRefresh = await optionalMessage(second, "refresh-entered", 1_000)
-    if (earlyRefresh) throw new Error("The second process refreshed while the first resolver still held its refresh")
+    const lockOutcome = await second.nextOneOf(["lock-contended", "refresh-entered"])
+    if (lockOutcome.type !== "lock-contended")
+      throw new Error("The second process refreshed before the first lock holder released ownership")
+    expect(second.seen.some((message) => message.type === "refresh-entered")).toBe(false)
     await beforeRelease()
     first.send("release-refresh")
 
@@ -674,15 +691,6 @@ async function runWorkerPair(input: WorkerInput, beforeRelease: () => Promise<vo
         return stopRefreshWorker(worker)
       }),
     )
-  }
-}
-
-async function optionalMessage(worker: WorkerSession, type: string, timeout: number) {
-  try {
-    return await worker.next(type, timeout)
-  } catch (error) {
-    if (error instanceof WorkerMessageTimeout) return undefined
-    throw error
   }
 }
 
@@ -715,7 +723,7 @@ function observeWorker(child: ChildProcess) {
       resolve(close)
       for (const waiter of waiters.splice(0)) {
         if (waiter.timer) clearTimeout(waiter.timer)
-        waiter.reject(new Error(`OAuth refresh worker closed before ${waiter.type}; stderr: ${stderr}`))
+        waiter.reject(new Error(`OAuth refresh worker closed before ${waiter.types.join(" or ")}; stderr: ${stderr}`))
       }
     })
   })
@@ -730,7 +738,7 @@ function observeWorker(child: ChildProcess) {
       if (!line) continue
       const message = JSON.parse(line) as WorkerMessage
       seen.push(message)
-      const index = waiters.findIndex((waiter) => waiter.type === message.type)
+      const index = waiters.findIndex((waiter) => waiter.types.includes(message.type))
       if (index === -1) {
         queued.push(message)
         continue
@@ -749,25 +757,28 @@ function observeWorker(child: ChildProcess) {
     }
   })
 
+  const nextOneOf = (types: readonly string[], timeout = 5_000) => {
+    const index = queued.findIndex((message) => types.includes(message.type))
+    if (index !== -1) return Promise.resolve(queued.splice(index, 1)[0]!)
+    if (childError) return Promise.reject(childError)
+    if (close) return Promise.reject(new Error(`OAuth refresh worker closed before ${types.join(" or ")}; stderr: ${stderr}`))
+    return new Promise<WorkerMessage>((resolve, reject) => {
+      const waiter: WorkerWaiter = { types, resolve, reject }
+      waiter.timer = setTimeout(() => {
+        const index = waiters.indexOf(waiter)
+        if (index !== -1) waiters.splice(index, 1)
+        reject(new WorkerMessageTimeout(`Timed out waiting for ${types.join(" or ")}; stderr: ${stderr}`))
+      }, timeout)
+      waiters.push(waiter)
+    })
+  }
+
   return {
     child,
     seen,
     closed,
-    next(type: string, timeout = 5_000) {
-      const index = queued.findIndex((message) => message.type === type)
-      if (index !== -1) return Promise.resolve(queued.splice(index, 1)[0]!)
-      if (childError) return Promise.reject(childError)
-      if (close) return Promise.reject(new Error(`OAuth refresh worker closed before ${type}; stderr: ${stderr}`))
-      return new Promise<WorkerMessage>((resolve, reject) => {
-        const waiter: WorkerWaiter = { type, resolve, reject }
-        waiter.timer = setTimeout(() => {
-          const index = waiters.indexOf(waiter)
-          if (index !== -1) waiters.splice(index, 1)
-          reject(new WorkerMessageTimeout(`Timed out waiting for ${type}; stderr: ${stderr}`))
-        }, timeout)
-        waiters.push(waiter)
-      })
-    },
+    next: (type: string, timeout = 5_000) => nextOneOf([type], timeout),
+    nextOneOf,
     send(type: string) {
       if (child.stdin && !child.stdin.destroyed && child.exitCode === null && child.signalCode === null)
         child.stdin.write(`${JSON.stringify({ type })}\n`)

@@ -1,12 +1,16 @@
 import { createInterface } from "node:readline"
+import path from "node:path"
 import { Cause, Context, Effect, Exit, Layer } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Credential } from "@opencode-ai/core/credential"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Global } from "@opencode-ai/core/global"
 import { Integration } from "@opencode-ai/core/integration"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
+import { Hash } from "@opencode-ai/core/util/hash"
 
 type Input = {
   readonly databasePath: string
@@ -51,10 +55,39 @@ function waitFor(type: string) {
 }
 
 const program = Effect.gen(function* () {
+  const filesystemContext = yield* Layer.build(AppNodeBuilder.build(FSUtil.node))
+  const filesystem = Context.get(filesystemContext, FSUtil.Service)
+  const lockDir = path.join(
+    input.lockRoot,
+    "locks",
+    `${Hash.fast(`credential-refresh:${input.credentialID}`)}.lock`,
+  )
+  const heartbeatPath = path.join(lockDir, "heartbeat")
+  let contentionReported = false
+  const observedFilesystem = FSUtil.Service.of({
+    ...filesystem,
+    stat: (file) =>
+      filesystem.stat(file).pipe(
+        Effect.tap(() =>
+          Effect.sync(() => {
+            if (input.role !== "second" || file !== heartbeatPath || contentionReported) return
+            contentionReported = true
+            send({ type: "lock-contended", heartbeatPath })
+          }),
+        ),
+      ),
+  })
+  const flockContext = yield* Layer.build(
+    AppNodeBuilder.build(EffectFlock.node, [
+      [Global.node, Global.layerWith({ state: input.lockRoot })],
+      [FSUtil.node, Layer.succeed(FSUtil.Service, observedFilesystem)],
+    ]),
+  )
+  const flock = Context.get(flockContext, EffectFlock.Service)
   const storage = yield* Layer.build(
     AppNodeBuilder.build(LayerNode.group([Credential.node, EventV2.node]), [
       [Database.node, Database.layerFromPath(input.databasePath)],
-      [Global.node, Global.layerWith({ state: input.lockRoot })],
+      [EffectFlock.node, Layer.succeed(EffectFlock.Service, flock)],
     ]),
   )
   const credentials = Context.get(storage, Credential.Service)
