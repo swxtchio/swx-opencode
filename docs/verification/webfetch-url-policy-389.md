@@ -1,8 +1,8 @@
 # Webfetch URL-policy verification
 
-Tested source tree: `ddb907a42f8136e9a066badc39239f773717e3c4`, containing redirect donor `17837a20d69fc514d337940506335afd75693cb3` and canonicalization donor `805a4b8200274b036d241878ac5b12c46771ad3e`. Commands ran from the package directories; no whole test file or repository-wide suite was run by this crew.
+Initial backport verification used source tree `ddb907a42f8136e9a066badc39239f773717e3c4`, containing redirect donor `17837a20d69fc514d337940506335afd75693cb3` and canonicalization donor `805a4b8200274b036d241878ac5b12c46771ad3e`. Round-1 follow-up verification on code commit `970be7d35ad050d862c0a1d6631a6e62b6a3a88d` is recorded at the end. Commands ran from package directories; no repository-wide suite was run by this crew.
 
-## Focused green runs
+## Initial backport focused green runs
 
 From `packages/core`:
 
@@ -19,7 +19,7 @@ From `packages/opencode`:
 - `bun test test/tool/webfetch.test.ts -t 'denies canonical mixed-case|transports an uppercase-scheme|rejects malformed and unsupported input URLs|checks supported relative and absolute redirects|continues an ask-only redirect|checks a later absolute redirect|rejects unsupported redirects and bounds redirect chains|rechecks every redirect after a Cloudflare challenge'` — 8 pass, 0 fail, 58 assertions.
 - `bun test test/tool/webfetch.test.ts -t 'returns image responses as file attachments|keeps svg as text output|keeps text responses as text output|extracts text from html without scripts or styles'` — 4 pass, 0 fail, 15 assertions.
 
-## Changed-behavior absence proofs
+## Initial backport changed-behavior absence proofs
 
 Each red run removed or reverted only the listed behavior, then restored it before the focused green runs above. Commands below are run from the named package directory.
 
@@ -51,3 +51,34 @@ Each red run removed or reverted only the listed behavior, then restored it befo
 | OpenCode: `bun test test/tool/webfetch.test.ts -t 'rejects malformed and unsupported input URLs before permission or transport'` | Passed raw input without initial URL parsing and scheme validation. | The malformed `http://` input appeared in the permission patterns instead of failing before permission. |
 
 An initial combined OpenCode uppercase-scheme run reached Bun's default test timeout; the regression now has an effect-level backstop and a longer test ceiling, and its final red run fails on a policy/result assertion rather than the runner timeout.
+
+## Round-1 follow-up verification
+
+Tested code tree: `970be7d35ad050d862c0a1d6631a6e62b6a3a88d`.
+
+From `packages/core`:
+
+- `bun typecheck` — passed (`tsgo --noEmit`).
+- `bun test test/tool-webfetch.test.ts` — 21 pass, 0 fail, 97 `expect()` calls.
+- `bun test test/tool-webfetch.test.ts -t 'cancels discarded streaming responses across redirects and error exits'` — 1 pass, 0 fail, 15 `expect()` calls.
+
+From `packages/opencode`:
+
+- `bun typecheck` — passed (`tsgo --noEmit`).
+- `bun test test/tool/webfetch.test.ts` — 13 pass, 0 fail, 92 `expect()` calls.
+- `bun test test/tool/webfetch.test.ts -t 'releases every discarded streaming response body'` — 1 pass, 0 fail, 19 `expect()` calls.
+
+Both live regressions retain the raw Fetch responses, stream an open response body, observe the server's `cancel` callback, and assert each response was used before the executor starts its next request. They cover followed redirects, denied hops, the redirect limit, unsupported targets, rejected 404s, Cloudflare 403 retries, and error exits (V2 unsupported content; V1 declared oversize content).
+
+### Round-1 changed-behavior absence proofs
+
+Each mutation below was restored before the final green runs above.
+
+| Command | Behavior removed | Observed red result |
+| --- | --- | --- |
+| Core: `bun test test/tool-webfetch.test.ts -t 'cancels discarded streaming responses across redirects and error exits'` | Removed redirect-hop `cancelResponseBody`. | The retained raw 302 response stayed `bodyUsed: false`; the test failed before the next hop. |
+| OpenCode: `bun test test/tool/webfetch.test.ts -t 'releases every discarded streaming response body'` | Removed redirect-hop `cancelResponseBody`. | The retained raw 302 response stayed `bodyUsed: false`; the test failed before the next hop. |
+| Core: `bun test test/tool-webfetch.test.ts -t 'cancels discarded streaming responses across redirects and error exits'` | Removed `filterResponse` cleanup for rejected statuses. | The aggregate `bodyUsed` assertion found an unread 404/Cloudflare response and failed. |
+| OpenCode: `bun test test/tool/webfetch.test.ts -t 'releases every discarded streaming response body'` | Removed `filterResponse` cleanup for rejected statuses. | The aggregate `bodyUsed` assertion found an unread 404/Cloudflare response and failed. |
+| Core: `bun test test/tool-webfetch.test.ts -t 'cancels discarded streaming responses across redirects and error exits'` | Removed cleanup from V2 final-response error exits. | The unsupported-content stream remained unread; the aggregate `bodyUsed` assertion failed. |
+| OpenCode: `bun test test/tool/webfetch.test.ts -t 'releases every discarded streaming response body'` | Removed cleanup from V1 final-response error exits. | The declared-oversize stream remained unread; the aggregate `bodyUsed` assertion failed. |
