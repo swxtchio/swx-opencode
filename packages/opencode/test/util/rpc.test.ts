@@ -20,8 +20,10 @@ test("settles only the failed synchronous request and preserves success and even
     const failed = within(client.call("failSync", "synchronous failure"), "missing synchronous RPC result")
     const succeeded = within(client.call("succeed", "still alive"), "successful RPC did not settle")
 
-    await expect(failed).rejects.toThrow("synchronous failure")
-    await expect(succeeded).resolves.toBe("success:still alive")
+    const [failure, success] = await Promise.allSettled([failed, succeeded])
+    expect(failure.status).toBe("rejected")
+    if (failure.status === "rejected") expect(failure.reason).toMatchObject({ message: "synchronous failure" })
+    expect(success).toEqual({ status: "fulfilled", value: "success:still alive" })
     expect(notices).toEqual(["still alive"])
   })
 })
