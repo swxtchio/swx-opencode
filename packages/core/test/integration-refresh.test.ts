@@ -15,7 +15,7 @@ import { testEffect } from "./lib/effect"
 
 const it = testEffect(Layer.empty)
 
-it.effect("shares successful and failed refreshes across Locations, then retries", () =>
+it.live("shares successful and failed refreshes across Locations, then retries", () =>
   withTemporaryDirectory((directory) =>
     Effect.gen(function* () {
       const lockSignals = yield* Effect.forEach([0, 1, 2, 3, 4], () => Deferred.make<void>())
@@ -77,10 +77,18 @@ it.effect("shares successful and failed refreshes across Locations, then retries
       yield* Deferred.await(successEntered)
       const successSecond = yield* services.second.connection.resolve(successConnection).pipe(Effect.forkScoped)
       yield* Deferred.await(lockSignals[1]!)
+      yield* Effect.yieldNow
       expect(successCalls).toBe(1)
       yield* Deferred.succeed(successRelease, undefined)
 
-      const successValues = yield* Effect.all([Fiber.join(successFirst), Fiber.join(successSecond)])
+      const successResults = yield* Effect.all([
+        Fiber.join(successFirst).pipe(Effect.timeoutOption("4 seconds")),
+        Fiber.join(successSecond).pipe(Effect.timeoutOption("4 seconds")),
+      ])
+      expect(Option.isSome(successResults[0])).toBe(true)
+      expect(Option.isSome(successResults[1])).toBe(true)
+      if (!Option.isSome(successResults[0]) || !Option.isSome(successResults[1])) return
+      const successValues = [successResults[0].value, successResults[1].value]
       expect(successValues[0]).toEqual(successValues[1])
       expect(successValues[0]).toEqual(rotated(expiredOAuth(successMethod), "success"))
       expect((yield* services.credentials.get(successCredential.id))?.value).toEqual(successValues[0])
@@ -97,7 +105,14 @@ it.effect("shares successful and failed refreshes across Locations, then retries
       yield* Deferred.await(lockSignals[3]!)
       yield* Deferred.succeed(failureRelease, undefined)
 
-      const failures = yield* Effect.all([Fiber.join(failureFirst), Fiber.join(failureSecond)])
+      const failureResults = yield* Effect.all([
+        Fiber.join(failureFirst).pipe(Effect.timeoutOption("4 seconds")),
+        Fiber.join(failureSecond).pipe(Effect.timeoutOption("4 seconds")),
+      ])
+      expect(Option.isSome(failureResults[0])).toBe(true)
+      expect(Option.isSome(failureResults[1])).toBe(true)
+      if (!Option.isSome(failureResults[0]) || !Option.isSome(failureResults[1])) return
+      const failures = [failureResults[0].value, failureResults[1].value]
       expect(Exit.isFailure(failures[0])).toBe(true)
       expect(Exit.isFailure(failures[1])).toBe(true)
       if (!Exit.isFailure(failures[0]) || !Exit.isFailure(failures[1])) throw new Error("Expected shared refresh failure")
@@ -118,6 +133,7 @@ it.effect("shares successful and failed refreshes across Locations, then retries
       expect(failureCalls).toBe(2)
     }),
   ),
+  10_000,
 )
 
 it.effect("interrupting the initiating caller does not cancel the shared refresh", () =>
