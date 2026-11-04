@@ -14,6 +14,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { testEffect } from "./lib/effect"
 
 const it = testEffect(Layer.empty)
+const linuxProcessTest = process.platform === "linux" ? it.live : it.live.skip
 const worktreeRoot = path.resolve(import.meta.dir, "../../..")
 const scratchRoot = path.join(
   process.env.GOTMPDIR ?? path.join(worktreeRoot, ".scratch"),
@@ -438,7 +439,7 @@ it.effect("preserves environment, missing, key, fresh OAuth, and no-refresh reso
   ),
 )
 
-it.live("serializes resolver refreshes across processes and re-reads the current credential", () =>
+linuxProcessTest("serializes resolver refreshes across processes and re-reads the current credential", () =>
   withTemporaryDirectory((directory) =>
     Effect.gen(function* () {
       const scenarios = ["rotated", "removed", "key"] as const
@@ -646,8 +647,8 @@ type WorkerWaiter = {
 
 type WorkerSession = {
   readonly child: ChildProcess
-  readonly pid: number
-  readonly started: string
+  pid: number | undefined
+  started: string | undefined
   readonly seen: WorkerMessage[]
   readonly closed: Promise<WorkerClose>
   readonly next: (type: string, timeout?: number) => Promise<WorkerMessage>
@@ -662,8 +663,7 @@ async function runWorkerPair(input: WorkerInput, beforeRelease: () => Promise<vo
   const coreDirectory = path.resolve(import.meta.dir, "..")
   const workers: WorkerSession[] = []
   try {
-    const first = await spawnRefreshWorker(workerPath, coreDirectory, { ...input, role: "first" as const })
-    workers.push(first)
+    const first = await spawnRefreshWorker(workerPath, coreDirectory, { ...input, role: "first" as const }, workers)
     expect((await first.next("ready")).access).toBe("old-access")
     first.send("resolve")
     await first.next("resolver-started")
@@ -672,8 +672,7 @@ async function runWorkerPair(input: WorkerInput, beforeRelease: () => Promise<vo
     await first.next("lock-started")
     expect((await first.next("refresh-entered")).refresh).toBe("old-refresh")
 
-    const second = await spawnRefreshWorker(workerPath, coreDirectory, { ...input, role: "second" as const })
-    workers.push(second)
+    const second = await spawnRefreshWorker(workerPath, coreDirectory, { ...input, role: "second" as const }, workers)
     expect((await second.next("ready")).access).toBe("old-access")
     second.send("resolve")
     await second.next("resolver-started")
@@ -710,19 +709,28 @@ async function runWorkerPair(input: WorkerInput, beforeRelease: () => Promise<vo
   }
 }
 
-async function spawnRefreshWorker(workerPath: string, coreDirectory: string, input: WorkerInput & { role: string }) {
+async function spawnRefreshWorker(
+  workerPath: string,
+  coreDirectory: string,
+  input: WorkerInput & { role: string },
+  workers: WorkerSession[],
+) {
   const child = spawn(process.execPath, [workerPath, JSON.stringify(input)], {
     cwd: coreDirectory,
     stdio: ["pipe", "pipe", "pipe"],
   })
   const session = observeWorker(child)
+  const worker: WorkerSession = { ...session, pid: child.pid, started: undefined }
+  workers.push(worker)
   await new Promise<void>((resolve, reject) => {
     if (child.pid !== undefined) return resolve()
     child.once("spawn", () => resolve())
     child.once("error", reject)
   })
   if (child.pid === undefined) throw new Error("OAuth refresh worker has no PID")
-  return { ...session, pid: child.pid, started: await processStartIdentity(child.pid) }
+  worker.pid = child.pid
+  worker.started = await processStartIdentity(child.pid)
+  return worker
 }
 
 function observeWorker(child: ChildProcess) {
@@ -811,8 +819,17 @@ async function processStartIdentity(pid: number) {
 }
 
 async function stopRefreshWorker(worker: WorkerSession) {
+  if (worker.pid === undefined) {
+    await within(worker.closed, "OAuth refresh worker did not close after spawn failed")
+    return
+  }
   if (worker.child.exitCode !== null || worker.child.signalCode !== null) {
     await within(worker.closed, `OAuth refresh worker ${worker.pid} did not report close`)
+    return
+  }
+  if (worker.started === undefined) {
+    worker.child.kill("SIGTERM")
+    await within(worker.closed, `OAuth refresh worker ${worker.pid} did not stop`)
     return
   }
   const identity = await processStartIdentity(worker.pid).catch(() => undefined)
