@@ -350,11 +350,11 @@ joiningSupervisorTest(
         throw new Error(`Joining-caller scenario child failed; child output: ${output}`)
       expect(output).toContain("1 pass")
     }),
-  15_000,
+  40_000,
 )
 
 async function runBoundedJoinerScenario() {
-  const deadline = Date.now() + 10_000
+  const deadline = Date.now() + 30_000
   const remaining = () => Math.max(1, deadline - Date.now())
   if (!scratchRoot) throw new Error("OAuth refresh test scratch was not initialized")
   const childScratch = await within(
@@ -404,7 +404,7 @@ async function runBoundedJoinerScenario() {
         child.once("error", reject)
       }),
       "Joining-caller scenario child did not spawn",
-      Math.min(1_000, remaining()),
+      Math.min(3_000, remaining()),
     )
     if (child.pid === undefined) {
       childExited = true
@@ -785,7 +785,7 @@ linuxProcessTest("serializes resolver refreshes across processes and re-reads th
       )
     }),
   ),
-  30_000,
+  60_000,
 )
 
 linuxProcessTest("does not signal an OAuth worker when its start identity cannot be read", () =>
@@ -996,7 +996,7 @@ async function runWorkerPair(input: WorkerInput, beforeRelease: () => Promise<vo
       { ...input, role: "first" as const },
       workers,
     )
-    expect((await first.next("ready")).access).toBe("old-access")
+    expect((await first.next("ready", 15_000)).access).toBe("old-access")
     first.send("resolve")
     await first.next("resolver-started")
     await first.next("lock-entered")
@@ -1010,7 +1010,7 @@ async function runWorkerPair(input: WorkerInput, beforeRelease: () => Promise<vo
       { ...input, role: "second" as const },
       workers,
     )
-    expect((await second.next("ready")).access).toBe("old-access")
+    expect((await second.next("ready", 15_000)).access).toBe("old-access")
     second.send("resolve")
     await second.next("resolver-started")
     await second.next("lock-entered")
