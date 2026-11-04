@@ -1,4 +1,4 @@
-import { afterAll, expect } from "bun:test"
+import { afterAll, beforeAll, expect } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
 import { Context, Deferred, Effect, Fiber, Layer, Option } from "effect"
@@ -11,12 +11,28 @@ import { testEffect } from "./lib/effect"
 
 const it = testEffect(Layer.empty)
 const worktreeRoot = path.resolve(import.meta.dir, "../../..")
-const scratchRoot = path.join(
-  process.env.GOTMPDIR ?? path.join(worktreeRoot, ".scratch"),
-  "credential-lock-tests",
-)
+const scratchBase = process.env.GOTMPDIR ?? path.join(worktreeRoot, ".scratch")
+let scratchRoot: string | undefined
 
-afterAll(() => fs.rm(scratchRoot, { recursive: true, force: true }))
+beforeAll(async () => {
+  if (process.env.GOTMPDIR) await fs.mkdir(scratchBase, { recursive: true, mode: 0o700 })
+  const parent = process.env.GOTMPDIR
+    ? scratchBase
+    : await fs.stat(scratchBase).then(
+        (stat) => (stat.isDirectory() ? scratchBase : worktreeRoot),
+        (error) => {
+          if (error instanceof Error && "code" in error && error.code === "ENOENT") return worktreeRoot
+          throw error
+        },
+      )
+  scratchRoot = await fs.mkdtemp(
+    path.join(parent, parent === worktreeRoot ? ".scratch-credential-lock-tests-" : "credential-lock-tests-"),
+  )
+})
+
+afterAll(async () => {
+  if (scratchRoot) await fs.rm(scratchRoot, { recursive: true, force: true })
+})
 const id = Credential.ID.make("cred_refresh")
 const value = Credential.OAuth.make({
   type: "oauth",
@@ -72,8 +88,8 @@ it.live("shares failures but allows a later refresh", () =>
 
 function withTemporaryDirectory<A, E, R>(use: (directory: string) => Effect.Effect<A, E, R>) {
   return Effect.acquireUseRelease(
-    Effect.promise(async () => {
-      await fs.mkdir(scratchRoot, { recursive: true, mode: 0o700 })
+    Effect.promise(() => {
+      if (!scratchRoot) throw new Error("Credential lock test scratch was not initialized")
       return fs.mkdtemp(path.join(scratchRoot, "case-"))
     }),
     (directory) => Effect.scoped(use(directory)),
