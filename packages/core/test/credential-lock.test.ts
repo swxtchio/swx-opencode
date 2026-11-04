@@ -1,4 +1,4 @@
-import { expect } from "bun:test"
+import { afterAll, expect } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
 import { Context, Deferred, Effect, Fiber, Layer, Option } from "effect"
@@ -15,6 +15,8 @@ const scratchRoot = path.join(
   process.env.GOTMPDIR ?? path.join(worktreeRoot, ".scratch"),
   "credential-lock-tests",
 )
+
+afterAll(() => fs.rm(scratchRoot, { recursive: true, force: true }))
 const id = Credential.ID.make("cred_refresh")
 const value = Credential.OAuth.make({
   type: "oauth",

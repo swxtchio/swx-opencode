@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "child_process"
 import fs from "fs/promises"
 import path from "path"
-import { expect } from "bun:test"
+import { afterAll, expect } from "bun:test"
 import { Cause, Clock, Context, Deferred, Effect, Exit, Fiber, Layer, Option } from "effect"
 import * as TestClock from "effect/testing/TestClock"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -20,6 +20,8 @@ const scratchRoot = path.join(
   process.env.GOTMPDIR ?? path.join(worktreeRoot, ".scratch"),
   "oauth-refresh-tests",
 )
+
+afterAll(() => fs.rm(scratchRoot, { recursive: true, force: true }))
 
 it.live("shares one failure across Locations rather than retrying after file-lock serialization", () =>
   withTemporaryDirectory((directory) =>
