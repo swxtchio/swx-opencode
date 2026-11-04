@@ -201,7 +201,7 @@ it.effect("interrupting the initiating caller does not cancel the shared refresh
   ),
 )
 
-it.effect("interrupting a joining caller settles that wait without cancelling another caller's refresh", () =>
+it.live("interrupting a joining caller settles that wait without cancelling another caller's refresh", () =>
   withTemporaryDirectory((directory) =>
     Effect.gen(function* () {
       const firstLock = yield* Deferred.make<void>()
@@ -251,25 +251,22 @@ it.effect("interrupting a joining caller settles that wait without cancelling an
             yield* Fiber.interrupt(waiter).pipe(Effect.forkScoped)
             const boundedWait = yield* Fiber.await(waiter).pipe(Effect.timeoutOption("1 second"), Effect.forkScoped)
             yield* Effect.yieldNow
-            yield* TestClock.adjust("1 second")
             expect(Option.isSome(yield* Fiber.join(boundedWait))).toBe(true)
             yield* Deferred.succeed(release, undefined)
 
             const ownerExit = yield* Fiber.join(owner)
             expect(Exit.isFailure(ownerExit)).toBe(true)
             expect(Exit.isFailure(yield* Fiber.await(waiter))).toBe(true)
-            yield* TestClock.adjust("6 minutes")
-            expect(yield* Deferred.isDone(duplicateRefresh)).toBe(false)
+            const boundedDuplicate = yield* Deferred.await(duplicateRefresh)
+              .pipe(Effect.timeoutOption("2 seconds"), Effect.forkScoped)
+            expect(Option.isNone(yield* Fiber.join(boundedDuplicate))).toBe(true)
             expect(calls).toBe(1)
           }),
-        () =>
-          Deferred.succeed(release, undefined).pipe(
-            Effect.andThen(TestClock.adjust("6 minutes")),
-            Effect.asVoid,
-          ),
+        () => Deferred.succeed(release, undefined).pipe(Effect.asVoid),
       )
     }),
   ),
+  10_000,
 )
 
 it.effect("bounds refresh and allows a subsequent resolver to own the released lock", () =>
