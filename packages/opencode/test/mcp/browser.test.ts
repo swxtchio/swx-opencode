@@ -2,7 +2,7 @@ import { expect, mock, test } from "bun:test"
 import { spawn, type ChildProcess } from "node:child_process"
 import { once } from "node:events"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Effect } from "effect"
+import { Cause, Effect, Exit } from "effect"
 
 let captureLateLauncher:
   | ((value: { subprocess: ChildProcess; exitListenerReady: Promise<void> }) => void)
@@ -35,14 +35,15 @@ await mock.module("@opencode-ai/core/open", () => ({
 const { McpBrowser } = await import("../../src/mcp/browser")
 
 test("reports a browser launcher that exited before openUrl returned", async () => {
-  const error = await Effect.runPromise(
+  const result = await Effect.runPromise(
     Effect.gen(function* () {
       const browser = yield* McpBrowser.Service
-      return yield* Effect.flip(browser.open("https://example.com/authorize"))
+      return yield* Effect.exit(browser.open("https://example.com/authorize"))
     }).pipe(Effect.provide(LayerNode.compile(McpBrowser.node))),
   )
 
-  expect(error.message).toBe("Browser open failed with exit code 23")
+  const error = Exit.isFailure(result) ? Cause.prettyErrors(result.cause)[0] : undefined
+  expect(error?.message).toBe("Browser open failed with exit code 23")
 })
 
 test("accepts a browser launcher that exited successfully before openUrl returned", async () => {
