@@ -132,19 +132,40 @@ const make = (options: Config) =>
     })
 
     const semaphore = yield* Semaphore.make(1)
+    const withPermit = <A, E, R>(effect: Effect.Effect<A, E, R>) => semaphore.withPermit(effect)
+    const lockedConnection = identity<SqliteConnection>({
+      execute(query, params, transformRows) {
+        return withPermit(connection.execute(query, params, transformRows))
+      },
+      executeRaw(query, params) {
+        return withPermit(connection.executeRaw(query, params))
+      },
+      executeValues(query, params) {
+        return withPermit(connection.executeValues(query, params))
+      },
+      executeUnprepared(query, params, transformRows) {
+        return withPermit(connection.executeUnprepared(query, params, transformRows))
+      },
+      executeStream(query, params, transformRows) {
+        return connection.executeStream(query, params, transformRows)
+      },
+      loadExtension(path) {
+        return withPermit(connection.loadExtension(path))
+      },
+    })
+    const acquirer = Effect.succeed(lockedConnection)
     // Keep retries serialized on the native connection, including their backoff interval.
     // The scoped child owns the permit so cancellation can release it during acquisition.
-    const acquirer = Effect.uninterruptibleMask((restore) =>
+    const transactionAcquirer = Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
         const acquired = yield* Deferred.make<void>()
         yield* semaphore
           .withPermits(1)(Effect.andThen(Deferred.succeed(acquired, undefined), Effect.never))
-          .pipe(Effect.forkScoped)
+          .pipe(Effect.forkScoped({ startImmediately: true }))
         yield* restore(Deferred.await(acquired))
         return connection
       }),
     )
-    const transactionAcquirer = acquirer
 
     const client = Object.assign(
       (yield* Client.make({
