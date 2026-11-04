@@ -71,7 +71,7 @@ type ChildResult = {
   args: string[]
   elapsed: number
   status: number | null
-  signal: string | null
+  signal: string | number | null
   error: Error | undefined
   stdout: string
   stderr: string

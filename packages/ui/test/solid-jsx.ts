@@ -5,6 +5,7 @@ import { plugin } from "bun"
 // JSX against Solid's hyperscript runtime instead.
 const transpiler = new Bun.Transpiler({
   loader: "tsx",
+  autoImportJSX: true,
   trimUnusedImports: true,
   tsconfig: { compilerOptions: { jsx: "react-jsx", jsxImportSource: "solid-js/h" } },
 })
