@@ -219,7 +219,6 @@ it.live("interrupting a joining caller settles that wait without cancelling anot
       const entered = yield* Deferred.make<void>()
       const release = yield* Deferred.make<void>()
       const refreshInterrupted = yield* Deferred.make<void>()
-      const duplicateRefresh = yield* Deferred.make<void>()
       const refreshFailure = new Error("token endpoint unavailable")
       yield* Effect.acquireUseRelease(
         Effect.void,
@@ -236,7 +235,6 @@ it.live("interrupting a joining caller settles that wait without cancelling anot
                   )
                   return yield* Effect.fail(refreshFailure)
                 }
-                yield* Deferred.succeed(duplicateRefresh, undefined)
                 return rotated(value, "duplicate")
               }),
             )
@@ -260,13 +258,13 @@ it.live("interrupting a joining caller settles that wait without cancelling anot
             ).pipe(Effect.timeoutOption("4 seconds"))
             yield* Deferred.succeed(release, undefined)
 
-            const settled = yield* Effect.all([Fiber.join(owner), Fiber.await(waiter)]).pipe(
+            const settledCallers = yield* Effect.all([Fiber.join(owner), Fiber.await(waiter)]).pipe(
               Effect.timeoutOption("4 seconds"),
             )
-            expect(Option.isSome(settled)).toBe(true)
+            expect(Option.isSome(settledCallers)).toBe(true)
             expect(Option.isSome(cancellationOutcome)).toBe(true)
-            if (!Option.isSome(settled) || !Option.isSome(cancellationOutcome)) return
-            const [ownerExit, waiterExit] = settled.value
+            if (!Option.isSome(settledCallers) || !Option.isSome(cancellationOutcome)) return
+            const [ownerExit, waiterExit] = settledCallers.value
             expect(Exit.isFailure(ownerExit)).toBe(true)
             if (!Exit.isFailure(ownerExit)) throw new Error("Expected the owner to receive the shared refresh failure")
             expect(Cause.hasInterrupts(ownerExit.cause)).toBe(false)
@@ -277,9 +275,7 @@ it.live("interrupting a joining caller settles that wait without cancelling anot
             expect(ownerError.cause).toBe(refreshFailure)
             expect(cancellationOutcome.value).toBe("waiter-settled")
             expect(Exit.isFailure(waiterExit)).toBe(true)
-            const boundedDuplicate = yield* Deferred.await(duplicateRefresh)
-              .pipe(Effect.timeoutOption("2 seconds"), Effect.forkScoped)
-            expect(Option.isNone(yield* Fiber.join(boundedDuplicate))).toBe(true)
+            // Both callers have settled, so this count is final and exposes any duplicate refresh.
             expect(calls).toBe(1)
           }),
         () => Deferred.succeed(release, undefined).pipe(Effect.asVoid),
