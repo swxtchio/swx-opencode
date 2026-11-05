@@ -238,6 +238,14 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
         (unregister) => Effect.sync(unregister),
       )
       renderer.once("destroy", () => Deferred.doneUnsafe(shutdown, Effect.void))
+      const sighupReadyFile = process.env.SWX_TUI_SIGHUP_READY_FILE
+      if (
+        process.env.OPENCODE_TEST_HOME &&
+        process.env.SWX_TUI_GROUP_TUI_TEST === "1" &&
+        sighupReadyFile &&
+        (process.stdin.isTTY || process.stdout.isTTY)
+      )
+        void Bun.write(sighupReadyFile, String(process.pid)).catch(() => {})
       const pluginRuntime = createPluginRuntime()
 
       yield* Effect.tryPromise(async () => {

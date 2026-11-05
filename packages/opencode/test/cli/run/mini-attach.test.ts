@@ -202,5 +202,200 @@ cliIt.live(
         yield* Effect.promise(() => output).pipe(Effect.ignore)
       }
     }),
-    deadline(40_000),
+  deadline(40_000),
+)
+
+cliIt.live(
+  "runMini's successful interactive attach uses a no-timeout SDK client and preserves cancellation",
+  ({ home }) =>
+    Effect.gen(function* () {
+      if (process.platform !== "linux") return
+
+      const sessionID = "ses_mini_interactive"
+      const requestFile = path.join(home, "run-mini-interactive-requests.json")
+      const controlFile = path.join(home, "run-mini-interactive-control.json")
+      const resultFile = path.join(home, "run-mini-interactive-result.json")
+      const healthStarted = Promise.withResolvers<void>()
+      const healthCancelled = Promise.withResolvers<void>()
+      const controlExpired = Promise.withResolvers<void>()
+      const cancelHealthStarted = Promise.withResolvers<void>()
+      const cancelHealthCancelled = Promise.withResolvers<void>()
+      const releaseHealth = Promise.withResolvers<void>()
+      const encoder = new TextEncoder()
+      let healthRequests = 0
+      let healthWasCancelled = false
+      const server = Bun.serve({
+        port: 0,
+        idleTimeout: 30,
+        fetch: (request) => {
+          const url = new URL(request.url)
+          if (url.pathname === `/session/${sessionID}`)
+            return Response.json({ id: sessionID, title: "Attached session", directory: home })
+          if (url.pathname === "/config") return Response.json({ share: "manual" })
+          if (url.pathname === "/global/health") {
+            healthRequests += 1
+            if (healthRequests === 1) {
+              healthStarted.resolve()
+              return new Response(
+                new ReadableStream<Uint8Array>({
+                  start(controller) {
+                    controller.enqueue(encoder.encode('{"healthy":true,"version":"'))
+                  },
+                  pull(controller) {
+                    return releaseHealth.promise.then(() => {
+                      if (healthWasCancelled) return
+                      controller.enqueue(encoder.encode('test"}'))
+                      controller.close()
+                    })
+                  },
+                  cancel() {
+                    healthWasCancelled = true
+                    healthCancelled.resolve()
+                  },
+                }),
+                { headers: { "content-type": "application/json" } },
+              )
+            }
+            cancelHealthStarted.resolve()
+            return new Response(
+              new ReadableStream<Uint8Array>({
+                start(controller) {
+                  controller.enqueue(encoder.encode("cancel-ready:"))
+                },
+                pull: () => new Promise<void>(() => {}),
+                cancel() {
+                  cancelHealthCancelled.resolve()
+                },
+              }),
+              { headers: { "content-type": "text/plain" } },
+            )
+          }
+          if (url.pathname === "/control")
+            return new Response(
+              new ReadableStream<Uint8Array>({
+                start(controller) {
+                  controller.enqueue(encoder.encode("control-ready:"))
+                },
+                pull: () => new Promise<void>(() => {}),
+                cancel() {
+                  controlExpired.resolve()
+                },
+              }),
+              { headers: { "content-type": "text/plain" } },
+            )
+          return Response.json({ error: `unexpected path: ${url.pathname}` }, { status: 404 })
+        },
+      })
+      yield* Effect.addFinalizer(() =>
+        Effect.promise(async () => {
+          releaseHealth.resolve()
+          await server.stop(true)
+        }).pipe(Effect.asVoid),
+      )
+
+      const workerFile = path.join(import.meta.dir, "mini-attach-interactive-worker.test.ts")
+      const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
+      const command = `${quote(process.execPath)} test --timeout 35_000 ${quote(workerFile)} -t ${quote(
+        "runMini interactive attached runtime uses its no-timeout SDK for successful and cancellable calls",
+      )}`
+      const child = Bun.spawn(["script", "-q", "-e", "-c", command, "/dev/null"], {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          HOME: home,
+          OPENCODE_TEST_HOME: home,
+          XDG_CONFIG_HOME: path.join(home, ".config"),
+          XDG_DATA_HOME: path.join(home, ".local/share"),
+          XDG_STATE_HOME: path.join(home, ".local/state"),
+          XDG_CACHE_HOME: path.join(home, ".cache"),
+          OPENCODE_DB: ":memory:",
+          OPENCODE_CONFIG_CONTENT: "{}",
+          OPENCODE_DISABLE_PROJECT_CONFIG: "1",
+          OPENCODE_PURE: "1",
+          OPENCODE_DISABLE_AUTOUPDATE: "1",
+          OPENCODE_DISABLE_AUTOCOMPACT: "1",
+          OPENCODE_DISABLE_MODELS_FETCH: "1",
+          OPENCODE_AUTH_CONTENT: "{}",
+          BUN_CONFIG_HTTP_IDLE_TIMEOUT: "2",
+          SWX_MINI_INTERACTIVE_CHILD: "1",
+          SWX_MINI_INTERACTIVE_ATTACH_URL: server.url.toString(),
+          SWX_MINI_INTERACTIVE_SESSION: sessionID,
+          SWX_MINI_INTERACTIVE_REQUEST_FILE: requestFile,
+          SWX_MINI_INTERACTIVE_CONTROL_URL: new URL("/control", server.url).toString(),
+          SWX_MINI_INTERACTIVE_CONTROL_FILE: controlFile,
+          SWX_MINI_INTERACTIVE_RESULT_FILE: resultFile,
+        },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+        detached: true,
+      })
+      const childIdentity = EventWriter.readIdentity(child.pid)
+      if (!childIdentity?.bootID || !childIdentity.startTicks) {
+        child.kill("SIGKILL")
+        throw new Error("interactive Mini attach worker has no recorded start identity")
+      }
+      const output = Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()])
+      yield* Effect.addFinalizer(() =>
+        Effect.promise(async () => {
+          const current = EventWriter.readIdentity(childIdentity.pid)
+          if (current?.bootID === childIdentity.bootID && current.startTicks === childIdentity.startTicks) {
+            try {
+              process.kill(-childIdentity.pid, "SIGKILL")
+            } catch {}
+          }
+          await child.exited
+          await output
+        }).pipe(Effect.asVoid),
+      )
+
+      const ready = yield* Effect.race(
+        Effect.promise(() => healthStarted.promise).pipe(Effect.as("health" as const)),
+        Effect.promise(() => healthCancelled.promise).pipe(Effect.as("cancelled" as const)),
+      ).pipe(Effect.timeout("30 seconds"))
+      expect(ready).toBe("health")
+      const first = yield* Effect.race(
+        Effect.promise(() => controlExpired.promise).pipe(Effect.as("control-expired" as const)),
+        Effect.promise(() => healthCancelled.promise).pipe(Effect.as("health-cancelled" as const)),
+      ).pipe(Effect.timeout("10 seconds"))
+      expect(first).toBe("control-expired")
+      const control = yield* Effect.promise(async () => {
+        const deadline = Date.now() + 3_000
+        while (Date.now() < deadline) {
+          try {
+            const value: unknown = await Bun.file(controlFile).json()
+            if (typeof value === "object" && value !== null && "type" in value) return value
+          } catch {}
+          await Bun.sleep(20)
+        }
+        throw new Error("interactive Mini control fetch did not record its result")
+      }).pipe(Effect.timeout("5 seconds"))
+      if (
+        typeof control !== "object" ||
+        control === null ||
+        !("type" in control) ||
+        !("name" in control)
+      )
+        throw new Error("interactive Mini control result is malformed")
+      expect(control.type).toBe("failed")
+      expect(control.name).toBe("TimeoutError")
+      expect(healthRequests).toBe(1)
+      expect(healthWasCancelled).toBe(false)
+      releaseHealth.resolve()
+
+      yield* Effect.promise(() => cancelHealthStarted.promise).pipe(Effect.timeout("10 seconds"))
+      yield* Effect.promise(() => cancelHealthCancelled.promise).pipe(Effect.timeout("5 seconds"))
+      const exitCode = yield* Effect.promise(() => child.exited).pipe(Effect.timeout("15 seconds"))
+      const [stdout, stderr] = yield* Effect.promise(() => output)
+      if (exitCode !== 0) throw new Error(`interactive Mini worker exited ${exitCode}: ${stdout}\n${stderr}`)
+      expect(`${stdout}\n${stderr}`).toContain("pass")
+      const request: unknown = yield* Effect.promise(() => Bun.file(requestFile).json())
+      expect(request).toEqual([
+        { timeoutDisabled: true, hasSignal: false },
+        { timeoutDisabled: true, hasSignal: true },
+      ])
+      const result: unknown = yield* Effect.promise(() => Bun.file(resultFile).json())
+      expect(result).toMatchObject({ status: 200, healthy: true, cancellation: "AbortError" })
+    }),
+  deadline(60_000),
 )

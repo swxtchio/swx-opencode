@@ -3,7 +3,7 @@ import { expect, test } from "bun:test"
 import { EventWriter } from "@opencode-ai/core/event/writer"
 import { testRender } from "@opentui/solid"
 import path from "node:path"
-import { onCleanup, onMount } from "solid-js"
+import { onMount } from "solid-js"
 import { SDKProvider, useSDK } from "../../../src/context/sdk"
 import { TestTuiContexts } from "../../fixture/tui-environment"
 import { directory } from "../../fixture/tui-sdk"
@@ -62,45 +62,65 @@ test(
     }
 
     const eventStarted = Promise.withResolvers<void>()
-    const eventCancelled = Promise.withResolvers<void>()
-    const eventReceived = Promise.withResolvers<void>()
-    const releaseEvent = Promise.withResolvers<void>()
     const controlStarted = Promise.withResolvers<void>()
     const controlCancelled = Promise.withResolvers<void>()
+    const healthStarted = Promise.withResolvers<void>()
+    const healthCancelled = Promise.withResolvers<void>()
+    const releaseHealth = Promise.withResolvers<void>()
+    const cancelHealthStarted = Promise.withResolvers<void>()
+    const cancelHealthCancelled = Promise.withResolvers<void>()
     const encoder = new TextEncoder()
-    let eventWasCancelled = false
+    let healthWasCancelled = false
+    let cancelHealthWasCancelled = false
+    let healthRequests = 0
+    const events = {
+      async subscribe() {
+        eventStarted.resolve()
+        return () => {}
+      },
+    }
     const server = Bun.serve({
       port: 0,
       idleTimeout: 30,
       fetch: (request) => {
         const pathname = new URL(request.url).pathname
-        if (pathname === "/global/event") {
-          eventStarted.resolve()
+        if (pathname === "/global/health") {
+          healthRequests += 1
+          if (healthRequests === 1) {
+            healthStarted.resolve()
+            return new Response(
+              new ReadableStream<Uint8Array>({
+                start(controller) {
+                  controller.enqueue(encoder.encode('{"healthy":true,"version":"'))
+                },
+                pull(controller) {
+                  return releaseHealth.promise.then(() => {
+                    if (healthWasCancelled) return
+                    controller.enqueue(encoder.encode('test"}'))
+                    controller.close()
+                  })
+                },
+                cancel() {
+                  healthWasCancelled = true
+                  healthCancelled.resolve()
+                },
+              }),
+              { headers: { "content-type": "application/json" } },
+            )
+          }
+          cancelHealthStarted.resolve()
           return new Response(
             new ReadableStream<Uint8Array>({
               start(controller) {
-                controller.enqueue(encoder.encode(": ready\n\n"))
+                controller.enqueue(encoder.encode("cancel-ready:"))
               },
-              pull(controller) {
-                return releaseEvent.promise.then(() => {
-                  if (eventWasCancelled) return
-                  controller.enqueue(
-                    encoder.encode(
-                      `data: ${JSON.stringify({
-                        directory,
-                        payload: { id: "evt_long_call", type: "server.connected", properties: {} },
-                      })}\n\n`,
-                    ),
-                  )
-                  controller.close()
-                })
-              },
+              pull: () => new Promise<void>(() => {}),
               cancel() {
-                eventWasCancelled = true
-                eventCancelled.resolve()
+                cancelHealthWasCancelled = true
+                cancelHealthCancelled.resolve()
               },
             }),
-            { headers: { "content-type": "text/event-stream" } },
+            { headers: { "content-type": "text/plain" } },
           )
         }
         if (pathname === "/control") {
@@ -131,10 +151,6 @@ test(
     function Probe() {
       client = useSDK()
       onMount(() => {
-        const unsubscribe = client.event.on("event", (event) => {
-          if (event.payload.type === "server.connected") eventReceived.resolve()
-        })
-        onCleanup(unsubscribe)
         resolveMounted?.()
       })
       return <box />
@@ -143,7 +159,7 @@ test(
     try {
       app = await testRender(() => (
         <TestTuiContexts>
-          <SDKProvider url={server.url.toString()} directory={directory}>
+          <SDKProvider url={server.url.toString()} directory={directory} events={events}>
             <Probe />
           </SDKProvider>
         </TestTuiContexts>
@@ -153,6 +169,8 @@ test(
 
       // Stagger the default fetch control so the TUI requests have a clear idle-expiry lead.
       await Bun.sleep(4_000)
+      const healthRequest = client.client.global.health()
+      await healthStarted.promise
       const rawFetch = globalThis.fetch
       const controlRequest = rawFetch(new URL("/control", server.url))
         .then(async (response) => ({ type: "completed" as const, body: await response.text() }))
@@ -163,7 +181,7 @@ test(
       await controlStarted.promise
       const first = await Promise.race([
         controlCancelled.promise.then(() => ({ type: "control-expired" as const })),
-        eventCancelled.promise.then(() => ({ type: "event-cancelled" as const })),
+        healthCancelled.promise.then(() => ({ type: "health-cancelled" as const })),
         Bun.sleep(20_000).then(() => ({ type: "bounded-wait-expired" as const })),
       ])
       expect(first.type).toBe("control-expired")
@@ -172,18 +190,25 @@ test(
       expect(control.type).toBe("failed")
       if (control.type !== "failed") throw new Error("unmodified control fetch unexpectedly completed")
       expect(control.name).toBe("TimeoutError")
-      expect(eventWasCancelled).toBe(false)
+      await Bun.sleep(500)
+      expect(healthWasCancelled).toBe(false)
 
-      releaseEvent.resolve()
-      await Promise.race([
-        eventReceived.promise,
-        Bun.sleep(5_000).then(() => Promise.reject(new Error("TUI SDK did not receive the held event response"))),
+      releaseHealth.resolve()
+      const health = await Promise.race([
+        healthRequest,
+        Bun.sleep(5_000).then(() => Promise.reject(new Error("ordinary TUI SDK call did not finish after release"))),
       ])
-      expect(eventWasCancelled).toBe(false)
+      expect(health.response.ok).toBe(true)
+      expect(health.data?.healthy).toBe(true)
 
+      const cancelRequest = client.client.global.health().catch(() => undefined)
+      await cancelHealthStarted.promise
       app.renderer.destroy()
+      await cancelHealthCancelled.promise
+      await cancelRequest
+      expect(cancelHealthWasCancelled).toBe(true)
     } finally {
-      releaseEvent.resolve()
+      releaseHealth.resolve()
       if (app && !app.renderer.isDestroyed) app.renderer.destroy()
       await server.stop(true)
     }

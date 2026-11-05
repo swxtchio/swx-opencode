@@ -8,13 +8,14 @@ import { ServerAuth } from "@/server/auth"
 import { writeHeapSnapshot } from "node:v8"
 import { Heap } from "@/cli/heap"
 import { AppRuntime } from "@/effect/app-runtime"
-import { Effect, ManagedRuntime } from "effect"
+import { Cause, Effect, ManagedRuntime } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventWriter } from "@opencode-ai/core/event/writer"
+import { ProcessGroup } from "./process-group"
 
 Heap.start()
 
@@ -31,68 +32,93 @@ GlobalBus.on("event", (event) => {
 })
 
 let server: Awaited<ReturnType<typeof Server.listen>> | undefined
-const groupAcknowledgements = new Map<number, () => void>()
-const groupIdentities = new Map<number, EventWriter.ProcessIdentity>()
-let groupEventID = 0
 let testShutdownGate: Promise<void> | undefined
 const testSpawnerRuntimes = new Set<unknown>()
 
-CrossSpawnSpawner.setProcessGroupObserver(async (event) => {
-  const identity = EventWriter.readIdentity(event.pgid) ?? groupIdentities.get(event.pgid) ?? {
-    pid: event.pgid,
-    bootID: null,
-    startTicks: null,
-  }
-  groupIdentities.set(event.pgid, identity)
-  const eventID = groupEventID++
-  const acknowledgement = Promise.withResolvers<void>()
-  groupAcknowledgements.set(eventID, acknowledgement.resolve)
-  Rpc.emit("process.group", { ...event, eventID, identity })
-  await acknowledgement.promise
-})
+const groupTracker = ProcessGroup.makeWorkerTracker((event) => Rpc.emit("process.group", event))
+CrossSpawnSpawner.setProcessGroupObserver(groupTracker.observe)
 
 export const rpc = {
   ready() {
     return true
   },
-  async testSpawnProcessGroup(input: { resistTerm: boolean; blockShutdown: boolean }) {
-    const fixtureFile = process.env.SWX_TUI_GROUP_FIXTURE_FILE
-    if (!process.env.OPENCODE_TEST_HOME || !fixtureFile || !process.env.SWX_TUI_GROUP_RECORD_FILE)
+  async testSpawnProcessGroup(input: {
+    resistTerm: boolean
+    blockShutdown: boolean
+    exitMode?: "long" | "cleanup-owed" | "release"
+  }) {
+    // The private Worker probe exists only in isolated test homes to make group lifecycle cases deterministic.
+    const recordFile = process.env.SWX_TUI_GROUP_RECORD_FILE
+    if (!process.env.OPENCODE_TEST_HOME || !recordFile)
       throw new Error("test process-group fixture is not configured")
     if (input.blockShutdown) testShutdownGate = new Promise<void>(() => {})
-    const spawned = Promise.withResolvers<number>()
+    const spawned = Promise.withResolvers<{ pgid: number; identity: EventWriter.ProcessIdentity }>()
     const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
-    const command = `${input.resistTerm ? "trap '' TERM; " : ""}exec ${quote(process.execPath)} ${quote(fixtureFile)}`
+    const descendantFile = `${recordFile}.descendant`
+    const leaderExitFile = `${recordFile}.exit`
+    const descendantCode = input.resistTerm
+      ? 'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(10**6)'
+      : "import time; time.sleep(10**6)"
+    const launch = `nohup python3 -c ${quote(descendantCode)} >/dev/null 2>&1 & printf '%s' "$!" > ${quote(descendantFile)}`
+    const exitMode = input.exitMode ?? "long"
+    const finish =
+      exitMode === "long"
+        ? "wait"
+        : `while [ ! -e ${quote(leaderExitFile)} ]; do sleep 0.02; done; exit ${exitMode === "cleanup-owed" ? "1" : "0"}`
+    const command = `${input.resistTerm ? "trap '' TERM; " : ""}${launch}; ${finish}`
     const runtime = ManagedRuntime.make(LayerNode.compile(CrossSpawnSpawner.node))
     testSpawnerRuntimes.add(runtime)
-    void runtime.runFork(
-      Effect.scoped(
-        Effect.gen(function* () {
-          const spawner = yield* ChildProcessSpawner
-          const child = yield* spawner.spawn(
-            ChildProcess.make("bash", ["-lc", command], {
-              cwd: process.cwd(),
-              env: process.env,
-              stdin: "ignore",
-              stdout: "ignore",
-              stderr: "ignore",
-              detached: true,
-              forceKillAfter: "3 seconds",
-            }),
-          )
-          spawned.resolve(Number(child.pid))
-          yield* Effect.never
-        }),
+    const task = Effect.scoped(
+      Effect.gen(function* () {
+        const spawner = yield* ChildProcessSpawner
+        const child = yield* spawner.spawn(
+          ChildProcess.make("bash", ["--noprofile", "--norc", "-c", command], {
+            cwd: process.cwd(),
+            env: {
+              ...process.env,
+              SWX_TUI_GROUP_LEADER_EXIT_FILE: leaderExitFile,
+            },
+            stdin: "ignore",
+            stdout: "ignore",
+            stderr: "ignore",
+            detached: true,
+            forceKillAfter: "3 seconds",
+          }),
+        )
+        const pgid = Number(child.pid)
+        const identity = EventWriter.readIdentity(pgid)
+        if (!identity?.bootID || !identity.startTicks) throw new Error("Worker process group has no identity")
+        const descendantPID = yield* Effect.promise(async () => {
+          const deadline = Date.now() + 10_000
+          while (Date.now() < deadline) {
+            const value = await Bun.file(descendantFile).text().catch(() => "")
+            const pid = Number(value)
+            if (Number.isSafeInteger(pid) && pid > 0) return pid
+            await Bun.sleep(20)
+          }
+          throw new Error("Worker group leader did not publish its descendant PID")
+        })
+        const descendant = EventWriter.readIdentity(descendantPID)
+        if (!descendant?.bootID || !descendant.startTicks)
+          throw new Error("Worker process-group descendant has no identity")
+        yield* Effect.promise(() => Bun.write(recordFile, JSON.stringify({ leader: identity, descendant, pgid })))
+        spawned.resolve({ pgid, identity })
+        yield* Effect.never
+      }),
+    ).pipe(
+      Effect.catchCause((cause) =>
+        Effect.sync(() => spawned.reject(new Error(`Worker process-group spawn failed: ${Cause.pretty(cause)}`))),
       ),
     )
-    return { pgid: await spawned.promise }
+    void runtime.runFork(task)
+    return await spawned.promise
+  },
+  testProcessGroupIdentityCount() {
+    if (!process.env.OPENCODE_TEST_HOME) throw new Error("test process-group tracker is not enabled")
+    return groupTracker.identityCount
   },
   ackProcessGroup(input: { eventID: number }) {
-    const acknowledge = groupAcknowledgements.get(input.eventID)
-    if (!acknowledge) return false
-    groupAcknowledgements.delete(input.eventID)
-    acknowledge()
-    return true
+    return groupTracker.acknowledge(input.eventID)
   },
   async fetch(input: { url: string; method: string; headers: Record<string, string>; body?: string }) {
     const headers = { ...input.headers }

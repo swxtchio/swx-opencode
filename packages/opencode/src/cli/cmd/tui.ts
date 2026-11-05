@@ -5,7 +5,6 @@ import path from "path"
 import { fileURLToPath } from "url"
 import { UI } from "@/cli/ui"
 import { errorMessage } from "@opencode-ai/tui/util/error"
-import { withTimeout } from "@/util/timeout"
 import { withNetworkOptions, resolveNetworkOptionsNoConfig, hasArg } from "@/cli/network"
 import { Filesystem } from "@/util/filesystem"
 import type { GlobalEvent } from "@opencode-ai/sdk/v2"
@@ -195,6 +194,7 @@ export const TuiThreadCommand = cmd({
 
     const unguard = win32InstallCtrlCGuard()
     let stopWorker: (() => Promise<void>) | undefined
+    let runStarted = false
     try {
       const { TuiConfig } = await import("@/config/tui")
       if (args.fork && !args.continue && !args.session) {
@@ -221,41 +221,37 @@ export const TuiThreadCommand = cmd({
         ),
       })
       const client = Rpc.client<typeof rpc>(worker)
-      const ownedGroups = new Map<number, ProcessGroup.Event>()
-      const killOwnedGroups = () => ProcessGroup.signalOwned(ownedGroups.values())
-      const removeGroupListener = client.on<ProcessGroup.Event>("process.group", (event) => {
-        if (event.action === "acquire") {
-          ownedGroups.set(event.pgid, event)
-          return void client.call("ackProcessGroup", { eventID: event.eventID }).catch(() => {})
-        }
-        const current = ownedGroups.get(event.pgid)
-        if (current && ProcessGroup.sameIdentity(current.identity, event.identity)) ownedGroups.delete(event.pgid)
-        void client.call("ackProcessGroup", { eventID: event.eventID }).catch(() => {})
+      const owner = ProcessGroup.makeOwner({
+        client: {
+          subscribe: (handler) => client.on<ProcessGroup.Event>("process.group", handler),
+          acknowledge: async (eventID) => client.call("ackProcessGroup", { eventID }),
+          shutdown: async () => client.call("shutdown", undefined),
+        },
+        worker,
       })
-      const processExit = () => killOwnedGroups()
-      process.once("exit", processExit)
-      worker.onerror = () => killOwnedGroups()
       const reload = () => {
         client.call("reload", undefined).catch(() => {})
       }
       process.on("SIGUSR2", reload)
 
-      let stopped = false
-      const stop = async () => {
-        if (stopped) return
-        stopped = true
+      stopWorker = async () => {
         process.off("SIGUSR2", reload)
-        const shutdown = await withTimeout(client.call("shutdown", undefined), 5000).then(
-          () => true,
-          () => false,
-        )
-        if (!shutdown || ownedGroups.size > 0)
-          await ProcessGroup.killOwned(ownedGroups).catch(() => killOwnedGroups())
-        worker.terminate()
-        process.off("exit", processExit)
-        removeGroupListener()
+        await owner.stop()
+        const stoppedFile = process.env.SWX_TUI_GROUP_TUI_STOP_FILE
+        if (process.env.OPENCODE_TEST_HOME && process.env.SWX_TUI_GROUP_TUI_TEST === "1" && stoppedFile)
+          await Bun.write(stoppedFile, "stopped")
       }
-      stopWorker = stop
+
+      if (process.env.OPENCODE_TEST_HOME && process.env.SWX_TUI_GROUP_TUI_TEST === "1") {
+        const readyFile = process.env.SWX_TUI_GROUP_TUI_READY_FILE
+        if (!readyFile) throw new Error("TUI process-group test readiness file is missing")
+        const group = await client.call("testSpawnProcessGroup", {
+          resistTerm: true,
+          blockShutdown: false,
+          exitMode: "long",
+        })
+        await Bun.write(readyFile, JSON.stringify(group))
+      }
 
       const prompt = await input(args.prompt)
       const config = await TuiConfig.get()
@@ -300,6 +296,7 @@ export const TuiThreadCommand = cmd({
         const { Effect } = await import("effect")
         const { run } = await import("../tui/layer")
         const { createLegacyTuiPluginHost } = await import("@/plugin/tui/runtime")
+        runStarted = true
         await Effect.runPromise(
           run({
             url: transport.url,
@@ -327,16 +324,21 @@ export const TuiThreadCommand = cmd({
           }),
         )
       } finally {
-        await stop()
+        await stopWorker?.()
       }
     } finally {
       try {
-        if (stopWorker) await stopWorker()
+        if (stopWorker && !runStarted) await stopWorker()
       } finally {
         try {
           unguard?.()
         } catch {}
       }
+    }
+    const testExitGate = process.env.SWX_TUI_GROUP_TUI_EXIT_GATE_FILE
+    if (process.env.OPENCODE_TEST_HOME && process.env.SWX_TUI_GROUP_TUI_TEST === "1" && testExitGate) {
+      const deadline = Date.now() + 30_000
+      while (Date.now() < deadline && !(await Bun.file(testExitGate).exists())) await Bun.sleep(20)
     }
     process.exit()
   },
