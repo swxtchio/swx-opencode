@@ -51,9 +51,9 @@ async function runAudit(root: string) {
 }
 
 describe("the audit command line", () => {
-  // GOAL: establish the harness is faithful. If the copy did not reproduce the
-  // repository the failing case below would prove nothing.
-  test("exits 0 on the real tree", async () => {
+  // GOAL: the real workflow's draft-only audit selector must pass through the
+  // command-line owner, not only through an imported helper.
+  test("exits 0 for the actual draft-gated audit job", async () => {
     const root = fixture()
     try {
       const result = await runAudit(root)
@@ -87,20 +87,39 @@ describe("the audit command line", () => {
     }
   }, 60_000)
 
-  // GOAL: and that it fails for the audit-disabling edits too, through the real
-  // command line rather than through a helper call.
-  test("exits 1 when the audit's own job is made conditional", async () => {
+  // GOAL: the command-line owner must reject a ready transition that its own
+  // trigger no longer receives, even when every other audit control passes.
+  test("exits 1 when the audit workflow omits ready_for_review", async () => {
     const root = fixture()
     try {
       const path = join(root, ".github/workflows/test.yml")
       const before = readFileSync(path, "utf8")
-      const after = before.replace("  unit:\n", "  unit:\n    if: false\n")
+      const after = before.replace(", ready_for_review", "")
       expect(after).not.toBe(before)
       writeFileSync(path, after)
 
       const result = await runAudit(root)
       expect(result.exitCode).toBe(1)
-      expect(result.stderr).toContain("unconditional")
+      expect(result.stderr).toContain("ready_for_review")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  }, 60_000)
+
+  // GOAL: a selector that admits drafts and skips ready PRs is refused through
+  // the command-line owner, independently of the helper-level regression.
+  test("exits 1 when the audit's own selector admits drafts", async () => {
+    const root = fixture()
+    try {
+      const path = join(root, ".github/workflows/test.yml")
+      const before = readFileSync(path, "utf8")
+      const after = before.replace("!github.event.pull_request.draft", "github.event.pull_request.draft")
+      expect(after).not.toBe(before)
+      writeFileSync(path, after)
+
+      const result = await runAudit(root)
+      expect(result.exitCode).toBe(1)
+      expect(result.stderr).toContain("draft-only")
     } finally {
       rmSync(root, { recursive: true, force: true })
     }

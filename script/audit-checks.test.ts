@@ -10,6 +10,8 @@ import {
   swallowsFailure,
 } from "./check-workflow-guards"
 
+const DRAFT_ONLY_CONDITION = "github.event_name != 'pull_request' || !github.event.pull_request.draft"
+
 /**
  * GOAL: pin the checks that were previously exercised only against the live
  * tree, which passes vacuously.
@@ -153,26 +155,55 @@ describe("auditStepViolations", () => {
 })
 
 describe("auditWorkflowViolations", () => {
-  const on = { push: { branches: ["swxtch"] }, pull_request: null }
+  const on = {
+    push: { branches: ["swxtch"] },
+    pull_request: { types: ["opened", "synchronize", "reopened", "ready_for_review"] },
+  }
 
   test("passes triggers that cover every change to the default branch", () => {
     expect(auditWorkflowViolations("test.yml", on)).toEqual([])
   })
 
-  test.each([
-    ["no triggers at all", undefined],
-    ["push removed", { pull_request: null }],
-    ["pull_request removed", { push: { branches: ["swxtch"] } }],
-    ["a paths filter", { ...on, pull_request: { paths: ["packages/**"] } }],
-    ["a paths-ignore filter", { ...on, pull_request: { "paths-ignore": ["docs/**"] } }],
-    ["a branches-ignore filter", { ...on, pull_request: { "branches-ignore": ["x"] } }],
-    ["branches missing the default branch", { ...on, push: { branches: ["other"] } }],
+  const refusalCases = [
+    ["no triggers at all", undefined, "declares no triggers"],
+    ["push removed", { pull_request: on.pull_request }, "no longer runs on push"],
+    ["pull_request removed", { push: on.push }, "no longer runs on pull_request"],
+    [
+      "a paths filter",
+      { ...on, pull_request: { ...on.pull_request, paths: ["packages/**"] } },
+      "has a `paths` filter on `pull_request`",
+    ],
+    [
+      "a paths-ignore filter",
+      { ...on, pull_request: { ...on.pull_request, "paths-ignore": ["docs/**"] } },
+      "has a `paths-ignore` filter on `pull_request`",
+    ],
+    [
+      "a branches-ignore filter",
+      { ...on, pull_request: { ...on.pull_request, "branches-ignore": ["x"] } },
+      "has a `branches-ignore` filter on `pull_request`",
+    ],
+    [
+      "branches missing the default branch",
+      { ...on, push: { branches: ["other"] } },
+      "no longer runs on `push` for `swxtch`",
+    ],
     // The scalar form, which an Array.isArray gate skipped entirely.
-    ["a scalar branches filter naming another branch", { ...on, push: { branches: "dev" } }],
+    [
+      "a scalar branches filter naming another branch",
+      { ...on, push: { branches: "dev" } },
+      "no longer runs on `push` for `swxtch`",
+    ],
     // Ordered globs: the later negation wins.
-    ["a later negation of the default branch", { ...on, push: { branches: ["swxtch", "!swxtch"] } }],
-  ] as [string, unknown][])("reports %s", (_name, triggers) => {
-    expect(auditWorkflowViolations("test.yml", triggers).length).toBeGreaterThan(0)
+    [
+      "a later negation of the default branch",
+      { ...on, push: { branches: ["swxtch", "!swxtch"] } },
+      "no longer runs on `push` for `swxtch`",
+    ],
+  ] as [string, unknown, string][]
+  test.each(refusalCases)("reports %s", (_name, triggers, reason) => {
+    const violations = auditWorkflowViolations("test.yml", triggers)
+    expect(violations.some((violation) => violation.reason.includes(reason))).toBe(true)
   })
 
   // GOAL: the scalar form that DOES cover the default branch must pass, or the
@@ -183,16 +214,18 @@ describe("auditWorkflowViolations", () => {
 })
 
 describe("auditJobModeViolations", () => {
-  // GOAL: the audit's own job must run in this fork, which means allowlisted
-  // and NOT guarded. kimi-k3's E2 was the purest instance of this branch's
-  // recurring defect: guard the audit's own job and drop its allowlist row,
-  // and the check reports "33 guarded" and exits 0 while never running here.
-  test("passes an allowlisted, unguarded audit job", () => {
-    expect(auditJobModeViolations("test.yml", { steps: [] }, true)).toEqual([])
+  // GOAL: the audit must skip draft pull requests to avoid consuming runner
+  // work, while remaining eligible for ready PRs and non-PR events.
+  test("accepts the draft-only exclusion on the allowlisted audit job", () => {
+    expect(auditJobModeViolations("test.yml", { if: DRAFT_ONLY_CONDITION, steps: [] }, true)).toEqual([])
+  })
+
+  test("reports an audit job without the draft-only exclusion", () => {
+    expect(auditJobModeViolations("test.yml", { steps: [] }, true)).toHaveLength(1)
   })
 
   test("reports an audit job that is not allowlisted", () => {
-    expect(auditJobModeViolations("test.yml", { steps: [] }, false).length).toBe(1)
+    expect(auditJobModeViolations("test.yml", { if: DRAFT_ONLY_CONDITION, steps: [] }, false).length).toBe(1)
   })
 
   // GOAL: the exact E2 edit - both halves at once - must be reported, and by
@@ -203,17 +236,23 @@ describe("auditJobModeViolations", () => {
     expect(auditJobModeViolations("test.yml", job, false).length).toBe(2)
   })
 
-  // GOAL: the requirement is that this job is UNCONDITIONAL, not that its
-  // condition avoids one spelling. sol found that the first version asserted
-  // the spelling: `if: false`, an owner check, or an event check all skip the
-  // job, GitHub reports a job skipped by its own `if` as SUCCESS even when
-  // required, and every control in this file runs inside that job - so a skip
-  // takes the step attestation, the digests and these tests with it.
+  // GOAL: only the draft exclusion is allowed. Other conditions can skip the
+  // audit on ready PRs or non-PR events, and GitHub reports skipped jobs as
+  // success even when required.
   test.each([
     ["if: false", false],
     ["an owner check", "github.repository_owner == 'anomalyco'"],
     ["an event check", "github.event_name == 'schedule'"],
-    ["if: true, which is still a condition", true],
+    [
+      "an inverted draft check that admits drafts",
+      "github.event_name != 'pull_request' || github.event.pull_request.draft",
+    ],
+    [
+      "a check that skips non-PR events",
+      "github.event_name == 'pull_request' && !github.event.pull_request.draft",
+    ],
+    ["an additional top-level bypass", `${DRAFT_ONLY_CONDITION} || true`],
+    ["if: true", true],
     ["an empty condition", ""],
   ] as [string, unknown][])("reports %s on the audit's own job", (_name, condition) => {
     expect(auditJobModeViolations("test.yml", { if: condition, steps: [] }, true).length).toBeGreaterThan(0)
@@ -221,14 +260,17 @@ describe("auditJobModeViolations", () => {
 })
 
 describe("auditWorkflowViolations trigger shapes", () => {
-  const on = { push: { branches: ["swxtch"] }, pull_request: null }
+  const on = {
+    push: { branches: ["swxtch"] },
+    pull_request: { types: ["opened", "synchronize", "reopened", "ready_for_review"] },
+  }
 
-  // GOAL: `on: [push, pull_request]` is valid YAML shorthand. Treating it as a
-  // map made `"push" in on` test array INDICES, so the shorthand was reported
-  // as missing both triggers - a false positive, the direction that gets a
-  // check worked around rather than fixed.
-  test("accepts the array shorthand for triggers", () => {
-    expect(auditWorkflowViolations("test.yml", ["push", "pull_request"])).toEqual([])
+  // GOAL: the shorthand retains both triggers, but its implicit PR activity
+  // set omits ready_for_review, so that is the refusal this case should report.
+  test("recognises array shorthand and reports its missing ready activity", () => {
+    const violations = auditWorkflowViolations("test.yml", ["push", "pull_request"])
+    expect(violations).toHaveLength(1)
+    expect(violations[0]?.reason).toContain("ready_for_review")
   })
 
   // GOAL: a push trigger restricted to tags never fires for branch pushes, so
@@ -237,16 +279,40 @@ describe("auditWorkflowViolations trigger shapes", () => {
     expect(auditWorkflowViolations("test.yml", { ...on, push: { tags: ["**"] } }).length).toBeGreaterThan(0)
   })
 
-  // GOAL: narrowing `types` stops the trigger firing for the activity that
-  // matters - a pull request being opened or updated.
+  // GOAL: explicit activity types must preserve the old default events and add
+  // ready_for_review, or the audit itself misses the ready transition.
   test.each([[["labeled"]], [["opened"]], [["synchronize"]]])("reports pull_request types %p", (types) => {
     expect(auditWorkflowViolations("test.yml", { ...on, pull_request: { types } }).length).toBeGreaterThan(0)
   })
 
-  test("accepts pull_request types that still cover opened and synchronize", () => {
-    expect(auditWorkflowViolations("test.yml", { ...on, pull_request: { types: ["opened", "synchronize"] } })).toEqual(
-      [],
-    )
+  test("reports explicit types that omit reopened and ready_for_review", () => {
+    const violations = auditWorkflowViolations("test.yml", {
+      ...on,
+      pull_request: { types: ["opened", "synchronize"] },
+    })
+    expect(violations).toHaveLength(1)
+    expect(violations[0]?.reason).toContain("reopened or ready_for_review")
+  })
+
+  test("accepts types that retain the defaults and add ready_for_review", () => {
+    expect(
+      auditWorkflowViolations("test.yml", {
+        ...on,
+        pull_request: { types: ["opened", "synchronize", "reopened", "ready_for_review"] },
+      }),
+    ).toEqual([])
+  })
+
+  test("reports an implicit activity set that omits ready_for_review", () => {
+    const violations = auditWorkflowViolations("test.yml", { ...on, pull_request: null })
+    expect(violations).toHaveLength(1)
+    expect(violations[0]?.reason).toContain("ready_for_review")
+  })
+
+  test("reports object-form pull_request without types", () => {
+    const violations = auditWorkflowViolations("test.yml", { ...on, pull_request: { branches: ["swxtch"] } })
+    expect(violations).toHaveLength(1)
+    expect(violations[0]?.reason).toContain("ready_for_review")
   })
 })
 
@@ -257,22 +323,30 @@ describe("auditJobModeViolations skip vectors", () => {
   // job, and GitHub reports a job whose dependency was skipped as SUCCESS, so
   // the whole audit retires without its `if` ever being touched.
   test("reports a `needs` dependency", () => {
-    expect(auditJobModeViolations("test.yml", { needs: ["gate"], steps: [] }, true).length).toBe(1)
+    expect(
+      auditJobModeViolations("test.yml", { if: DRAFT_ONLY_CONDITION, needs: ["gate"], steps: [] }, true).length,
+    ).toBe(1)
   })
 
-  // GOAL: a matrix expanding to nothing skips the job too, with no `if` and no
-  // `needs`.
+  // GOAL: a matrix expanding to nothing skips the job even with its allowed
+  // draft-only condition and no `needs`.
   test.each([
     ["an empty dimension", { settings: [] }],
     ["a dynamically computed matrix", "${{ fromJSON(needs.x.outputs.m) }}"],
   ] as [string, unknown][])("reports %s", (_name, matrix) => {
-    expect(auditJobModeViolations("test.yml", { strategy: { matrix }, steps: [] }, true).length).toBe(1)
+    expect(
+      auditJobModeViolations("test.yml", { if: DRAFT_ONLY_CONDITION, strategy: { matrix }, steps: [] }, true).length,
+    ).toBe(1)
   })
 
   // GOAL: and the real matrix, which has one static entry, must still pass -
   // otherwise this is just a stricter false positive on the live tree.
   test("accepts a static non-empty matrix", () => {
-    const job = { strategy: { "fail-fast": false, matrix: { settings: [{ name: "linux" }] } }, steps: [] }
+    const job = {
+      if: DRAFT_ONLY_CONDITION,
+      strategy: { "fail-fast": false, matrix: { settings: [{ name: "linux" }] } },
+      steps: [],
+    }
     expect(auditJobModeViolations("test.yml", job, true)).toEqual([])
   })
 })

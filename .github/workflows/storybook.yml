@@ -11,6 +11,7 @@ on:
       - "packages/ui/**"
       - "packages/session-ui/**"
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [dev]
     paths:
       - ".github/workflows/storybook.yml"
@@ -27,7 +28,7 @@ concurrency:
 
 jobs:
   build:
-    if: github.repository == 'anomalyco/opencode'
+    if: github.repository == 'anomalyco/opencode' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     name: storybook build
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:

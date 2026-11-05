@@ -37,3 +37,42 @@ diff --git a/src/embedded.ts b/src/embedded.ts
 -export const embeddedLibPath: string | null = await resolveEmbeddedLibPath();
 +export const embeddedLibPath: string | null =
 +  typeof FFF_BUN_EXTERNAL_LIBRARY === "string" ? null : await resolveEmbeddedLibPath();
+diff --git a/src/ffi.ts b/src/ffi.ts
+--- a/src/ffi.ts
++++ b/src/ffi.ts
+@@ -388,3 +388,3 @@ function readResultEnvelope(
+ function readResultEnvelope(
+-  resultPtr: Pointer | null,
++  resultPtr: Pointer | bigint | null,
+ ): { success: true; handlePtr: number; intValue: number } | Result<never> {
+@@ -412 +412 @@
+-function parseBoolResult(resultPtr: Pointer | null): Result<boolean> {
++function parseBoolResult(resultPtr: Pointer | bigint | null): Result<boolean> {
+@@ -419 +419 @@
+-function parseIntResult(resultPtr: Pointer | null): Result<number> {
++function parseIntResult(resultPtr: Pointer | bigint | null): Result<number> {
+@@ -426 +426 @@
+-function parseStringResult(resultPtr: Pointer | null): Result<string | null> {
++function parseStringResult(resultPtr: Pointer | bigint | null): Result<string | null> {
+@@ -439 +439 @@
+-function parseJsonResult<T>(resultPtr: Pointer | null): Result<T> {
++function parseJsonResult<T>(resultPtr: Pointer | bigint | null): Result<T> {
+@@ -460 +460 @@
+-function parseVoidResult(resultPtr: Pointer | null): Result<void> {
++function parseVoidResult(resultPtr: Pointer | bigint | null): Result<void> {
+@@ -663 +663 @@
+-function parseSearchResult(resultPtr: Pointer | null): Result<SearchResult> {
++function parseSearchResult(resultPtr: Pointer | bigint | null): Result<SearchResult> {
+@@ -751,3 +751,3 @@
+ function parseDirSearchResult(
+-  resultPtr: Pointer | null,
++  resultPtr: Pointer | bigint | null,
+ ): Result<DirSearchResult> {
+@@ -856,3 +856,3 @@
+ function parseMixedSearchResult(
+-  resultPtr: Pointer | null,
++  resultPtr: Pointer | bigint | null,
+ ): Result<MixedSearchResult> {
+@@ -1060 +1060 @@
+-function parseGrepResult(resultPtr: Pointer | null): Result<GrepResult> {
++function parseGrepResult(resultPtr: Pointer | bigint | null): Result<GrepResult> {

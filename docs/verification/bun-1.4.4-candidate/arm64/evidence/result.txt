@@ -1,0 +1,1 @@
+QUALIFICATION_READY target=linux-arm64 source=ad3fde78c5a9ffeea37bd95519004b24ebd4cf03 archive=/tmp/fm-oc-bun-update-392-ad3fde78c5-arm64-full1/assets/opencode-linux-arm64.tar.gz
