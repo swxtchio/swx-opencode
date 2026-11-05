@@ -256,7 +256,10 @@ const layer = Layer.effect(
       let refused = 0
       let reportAt = 4
       // Update-only: if the assistant was removed while the lock was held, the retry must not recreate it.
-      yield* Effect.suspend(() => Sqlite.withFreshRetryWindow(session.updateExistingMessage(message))).pipe(
+      // Retain the generic 10s attempt window so the 4th and 8th progress reports stay timely.
+      yield* Effect.suspend(() =>
+        Sqlite.withFreshRetryWindow(session.updateExistingMessage(message), Duration.seconds(10)),
+      ).pipe(
         Effect.catchDefect((defect) => (sqliteLockMessage(defect) ? Effect.fail(defect) : Effect.die(defect))),
         Effect.tapError(() => {
           refused++
