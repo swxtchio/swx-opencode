@@ -453,17 +453,21 @@ const layer = Layer.effect(
     // The write lock is taken at BEGIN. A deferred transaction would pin a read
     // snapshot in assertWritableIn, and a commit by another writer while its
     // write waits on the lock would leave that snapshot stale.
-    const writable = <A, E>(sessionID: SessionID, effect: (tx: DatabaseTransaction) => Effect.Effect<A, E>) =>
-      Sqlite.withRetryWindow(
-        db.transaction(
-          (tx) =>
-            Effect.gen(function* () {
-              yield* EventV2.assertWritableIn(tx, sessionID)
-              return yield* effect(tx)
-            }),
-          { behavior: "immediate" },
-        ),
+    const writable = <A, E>(
+      sessionID: SessionID,
+      effect: (tx: DatabaseTransaction) => Effect.Effect<A, E>,
+      inheritRetryWindow = false,
+    ) => {
+      const transaction = db.transaction(
+        (tx) =>
+          Effect.gen(function* () {
+            yield* EventV2.assertWritableIn(tx, sessionID)
+            return yield* effect(tx)
+          }),
+        { behavior: "immediate" },
       )
+      return inheritRetryWindow ? transaction : Sqlite.withRetryWindow(transaction)
+    }
 
     const exclusive: Interface["exclusive"] = (sessionID, effect) => semaphore(locks, sessionID).withPermit(effect)
 
@@ -755,6 +759,7 @@ const layer = Layer.effect(
       // A sender that has not classified its prompt yet (#249) cannot be held to
       // a delivery here; it reconciles again with one once it has.
       deferred = false,
+      inheritRetryWindow = false,
     ) {
       const now = Date.now()
       if (input.parts.some((part) => part.type === "text" && part.metadata?.sessionQueuePendingOriginal))
@@ -977,6 +982,7 @@ const layer = Layer.effect(
                 ),
           ),
         ),
+        inheritRetryWindow,
       ).pipe(Effect.orDie)
       if (result.kind === "absent") return undefined
       if (result.kind === "delivered") return result.item
@@ -992,8 +998,13 @@ const layer = Layer.effect(
       return item
     })
 
-    const admitLocked = (input: AdmitInput, markers?: ConfigV1.Info["machine_message_markers"], deferred = false) =>
-      reconcileAdmission(input, false, markers, deferred).pipe(
+    const admitLocked = (
+      input: AdmitInput,
+      markers?: ConfigV1.Info["machine_message_markers"],
+      deferred = false,
+      inheritRetryWindow = false,
+    ) =>
+      reconcileAdmission(input, false, markers, deferred, inheritRetryWindow).pipe(
         Effect.flatMap((item) =>
           item ? Effect.succeed(item) : Effect.die(new Error("admission did not allocate an original")),
         ),
@@ -1165,7 +1176,8 @@ const layer = Layer.effect(
                   // Handoff to durable custody is serialized, but shell and hook IO never hold the session permit.
                   yield* release(owner)
                   yield* assertFreshIdentityLocked(input.sessionID, input.messageID)
-                  const own = yield* admitLocked(prepared)
+                  // Admission shares this preparation's retry budget; don't renew it in writable.
+                  const own = yield* admitLocked(prepared, undefined, false, true)
                   return { input: prepared, own }
                 }),
               )
