@@ -1,0 +1,4 @@
+The local transfer-complete marker matched the SHA-256 values for the archive, provenance.json, and native-probe.json.
+The remote task root /tmp/fm-oc-bun-update-392-be97d389ea-arm64-final3 was removed after transfer.
+lease-reclaim.json records reclamation after the suite cgroup ended; fm-buildbox-build reported lease release and exited successfully.
+The full local build/helper output remains at /tmp/fm-oc-bun-update-392.U7fONsHZ/gotmp/fm-buildbox-build-log.7XSbaC.

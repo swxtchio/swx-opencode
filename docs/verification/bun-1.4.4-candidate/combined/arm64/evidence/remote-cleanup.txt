@@ -1,0 +1,4 @@
+The local transfer-complete marker matched the SHA-256 values for the archive, provenance.json, and native-probe.json.
+The remote task root /tmp/fm-oc-bun-update-392-897ac196f5-arm64-final1 was removed after transfer.
+fm-buildbox-build reported a matching lease release for adhoc-build-3292288-13248 on vm14-001; lease-release.json is the receipt.
+The helper exited successfully. Full local build/helper output remains at /tmp/fm-oc-bun-update-392.U7fONsHZ/gotmp/fm-buildbox-build-log.cceQfc.

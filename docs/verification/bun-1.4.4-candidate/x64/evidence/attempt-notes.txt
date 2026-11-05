@@ -1,0 +1,1 @@
+BUN_BE_BUN=1 reported Bun 1.4.4 and revision `1.4.4+38afee6c8` from the extracted candidate. The revision output is Bun's abbreviated revision; the independent binary-string check found the `Bun v1.4.4` runtime banner and full matching revision `38afee6c84fcf48c0edb2466aa4b27d287a59c30`. Raw command output and matches are in embedded-bun-proof.json.

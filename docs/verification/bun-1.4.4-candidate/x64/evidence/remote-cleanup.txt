@@ -1,0 +1,5 @@
+Host: abbe-build-001
+Remote task directory: /tmp/fm-oc-bun-update-392-ad3fde78c5-x64-full1
+Result: removed by the leased qualification command after archive, provenance and native-probe evidence were copied and their hashes acknowledged.
+Read-back: the remote task directory was absent after the helper completed.
+Lease terminal evidence: lease-reclaim.json records the matching holder reclaimed after its suite cgroup was gone; fm-buildbox-build accepted the late release and exited successfully.
