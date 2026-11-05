@@ -155,26 +155,55 @@ describe("auditStepViolations", () => {
 })
 
 describe("auditWorkflowViolations", () => {
-  const on = { push: { branches: ["swxtch"] }, pull_request: null }
+  const on = {
+    push: { branches: ["swxtch"] },
+    pull_request: { types: ["opened", "synchronize", "reopened", "ready_for_review"] },
+  }
 
   test("passes triggers that cover every change to the default branch", () => {
     expect(auditWorkflowViolations("test.yml", on)).toEqual([])
   })
 
-  test.each([
-    ["no triggers at all", undefined],
-    ["push removed", { pull_request: null }],
-    ["pull_request removed", { push: { branches: ["swxtch"] } }],
-    ["a paths filter", { ...on, pull_request: { paths: ["packages/**"] } }],
-    ["a paths-ignore filter", { ...on, pull_request: { "paths-ignore": ["docs/**"] } }],
-    ["a branches-ignore filter", { ...on, pull_request: { "branches-ignore": ["x"] } }],
-    ["branches missing the default branch", { ...on, push: { branches: ["other"] } }],
+  const refusalCases = [
+    ["no triggers at all", undefined, "declares no triggers"],
+    ["push removed", { pull_request: on.pull_request }, "no longer runs on push"],
+    ["pull_request removed", { push: on.push }, "no longer runs on pull_request"],
+    [
+      "a paths filter",
+      { ...on, pull_request: { ...on.pull_request, paths: ["packages/**"] } },
+      "has a `paths` filter on `pull_request`",
+    ],
+    [
+      "a paths-ignore filter",
+      { ...on, pull_request: { ...on.pull_request, "paths-ignore": ["docs/**"] } },
+      "has a `paths-ignore` filter on `pull_request`",
+    ],
+    [
+      "a branches-ignore filter",
+      { ...on, pull_request: { ...on.pull_request, "branches-ignore": ["x"] } },
+      "has a `branches-ignore` filter on `pull_request`",
+    ],
+    [
+      "branches missing the default branch",
+      { ...on, push: { branches: ["other"] } },
+      "no longer runs on `push` for `swxtch`",
+    ],
     // The scalar form, which an Array.isArray gate skipped entirely.
-    ["a scalar branches filter naming another branch", { ...on, push: { branches: "dev" } }],
+    [
+      "a scalar branches filter naming another branch",
+      { ...on, push: { branches: "dev" } },
+      "no longer runs on `push` for `swxtch`",
+    ],
     // Ordered globs: the later negation wins.
-    ["a later negation of the default branch", { ...on, push: { branches: ["swxtch", "!swxtch"] } }],
-  ] as [string, unknown][])("reports %s", (_name, triggers) => {
-    expect(auditWorkflowViolations("test.yml", triggers).length).toBeGreaterThan(0)
+    [
+      "a later negation of the default branch",
+      { ...on, push: { branches: ["swxtch", "!swxtch"] } },
+      "no longer runs on `push` for `swxtch`",
+    ],
+  ] as [string, unknown, string][]
+  test.each(refusalCases)("reports %s", (_name, triggers, reason) => {
+    const violations = auditWorkflowViolations("test.yml", triggers)
+    expect(violations.some((violation) => violation.reason.includes(reason))).toBe(true)
   })
 
   // GOAL: the scalar form that DOES cover the default branch must pass, or the
@@ -236,10 +265,8 @@ describe("auditWorkflowViolations trigger shapes", () => {
     pull_request: { types: ["opened", "synchronize", "reopened", "ready_for_review"] },
   }
 
-  // GOAL: `on: [push, pull_request]` is valid YAML shorthand. Treating it as a
-  // map made `"push" in on` test array INDICES, so the shorthand was reported
-  // as missing both triggers - a false positive, the direction that gets a
-  // check worked around rather than fixed.
+  // GOAL: the shorthand retains both triggers, but its implicit PR activity
+  // set omits ready_for_review, so that is the refusal this case should report.
   test("recognises array shorthand and reports its missing ready activity", () => {
     const violations = auditWorkflowViolations("test.yml", ["push", "pull_request"])
     expect(violations).toHaveLength(1)
@@ -278,6 +305,12 @@ describe("auditWorkflowViolations trigger shapes", () => {
 
   test("reports an implicit activity set that omits ready_for_review", () => {
     const violations = auditWorkflowViolations("test.yml", { ...on, pull_request: null })
+    expect(violations).toHaveLength(1)
+    expect(violations[0]?.reason).toContain("ready_for_review")
+  })
+
+  test("reports object-form pull_request without types", () => {
+    const violations = auditWorkflowViolations("test.yml", { ...on, pull_request: { branches: ["swxtch"] } })
     expect(violations).toHaveLength(1)
     expect(violations[0]?.reason).toContain("ready_for_review")
   })
