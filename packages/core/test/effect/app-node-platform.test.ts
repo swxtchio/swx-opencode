@@ -1,20 +1,63 @@
 import { expect } from "bun:test"
 import { RequestExecutor } from "@opencode-ai/llm/route"
-import { Effect, Fiber, Exit } from "effect"
+import { EventWriter } from "@opencode-ai/core/event/writer"
+import { Effect, Fiber, Exit, Option } from "effect"
 import { FetchHttpClient, HttpClientRequest } from "effect/unstable/http"
 import { createServer } from "node:http"
+import path from "node:path"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { LayerNodePlatform } from "@opencode-ai/core/effect/app-node-platform"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(LayerNode.compile(LayerNodePlatform.requestExecutor))
+const nativeIdleTestName = "native provider requests survive a short Bun idle timeout while its control expires"
 
 it.live(
-  "native provider requests survive Bun's default idle timeout while its control expires",
+  nativeIdleTestName,
   Effect.gen(function* () {
     if (process.platform === "win32") return
-    if (process.env.BUN_CONFIG_HTTP_IDLE_TIMEOUT !== undefined)
-      throw new Error("native fetch acceptance requires Bun's unmodified HTTP idle-timeout default")
+    if (process.env.SWX_CORE_IDLE_TEST_CHILD !== "1") {
+      const child = Bun.spawn(
+        [process.execPath, "test", "--timeout", "35_000", path.join(import.meta.dir, "app-node-platform.test.ts"), "-t", nativeIdleTestName],
+        {
+          cwd: process.cwd(),
+          env: {
+            ...process.env,
+            BUN_CONFIG_HTTP_IDLE_TIMEOUT: "2",
+            SWX_CORE_IDLE_TEST_CHILD: "1",
+          },
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "pipe",
+          detached: true,
+        },
+      )
+      const identity = EventWriter.readIdentity(child.pid)
+      if (!identity?.bootID || !identity.startTicks) {
+        child.kill("SIGKILL")
+        throw new Error("native idle-timeout test child has no recorded process identity")
+      }
+      const output = Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()])
+      try {
+        const exitCode = yield* Effect.promise(() => child.exited).pipe(Effect.timeout("40 seconds"))
+        const [stdout, stderr] = yield* Effect.promise(() => output)
+        expect(exitCode).toBe(0)
+        if (exitCode !== 0) throw new Error(`${stdout}\n${stderr}`)
+      } finally {
+        const current = EventWriter.readIdentity(identity.pid)
+        if (current?.bootID === identity.bootID && current.startTicks === identity.startTicks) {
+          try {
+            process.kill(-identity.pid, "SIGKILL")
+          } catch {}
+        }
+        const stopped = yield* Effect.promise(() => child.exited).pipe(Effect.timeoutOption("5 seconds"))
+        if (Option.isNone(stopped)) throw new Error("native idle-timeout test child survived cleanup")
+        yield* Effect.promise(() => output).pipe(Effect.ignore)
+      }
+      return
+    }
+    if (process.env.BUN_CONFIG_HTTP_IDLE_TIMEOUT !== "2")
+      throw new Error("native fetch witness must inject Bun's short HTTP idle-timeout value before process start")
 
     const providerStarted = Promise.withResolvers<void>()
     const controlStarted = Promise.withResolvers<void>()
@@ -63,7 +106,7 @@ it.live(
       const response = yield* executor.execute(HttpClientRequest.get(`${url}/provider`))
       return yield* response.text
     }).pipe(
-      Effect.timeout("10 minutes"),
+      Effect.timeout("45 seconds"),
       Effect.provideService(FetchHttpClient.Fetch, observeFetch),
       Effect.provideService(FetchHttpClient.RequestInit, configuredTimeout),
       Effect.forkChild,
@@ -86,19 +129,19 @@ it.live(
     if (controlOutcome.type !== "failed") throw new Error("default Bun fetch unexpectedly completed the held control")
     expect(controlOutcome.error).toBeInstanceOf(Error)
     if (controlOutcome.error instanceof Error) expect(controlOutcome.error.name).toBe("TimeoutError")
-    expect(controlOutcome.elapsed).toBeGreaterThanOrEqual(300_000)
-    expect(controlOutcome.elapsed).toBeLessThan(390_000)
+    expect(controlOutcome.elapsed).toBeGreaterThanOrEqual(4_000)
+    expect(controlOutcome.elapsed).toBeLessThan(15_000)
     expect(released).toBe(false)
     expect(server.listening).toBe(true)
 
-    yield* Effect.sleep("10 seconds")
+    yield* Effect.sleep("2 seconds")
     expect(released).toBe(false)
     released = true
     release.resolve()
     const response = yield* Fiber.join(provider).pipe(Effect.timeout("10 seconds"))
     expect(response).toBe("ready:native provider completed")
   }),
-  480_000,
+  45_000,
 )
 
 it.live(

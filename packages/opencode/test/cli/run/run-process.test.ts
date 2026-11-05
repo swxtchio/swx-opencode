@@ -134,11 +134,12 @@ describe("opencode run (non-interactive subprocess)", () => {
   )
 
   cliIt.live(
-    "attached run survives Bun's default fetch timeout while the provider permits the request",
+    "attached run survives an injected short Bun idle timeout while the provider permits the request",
     ({ home, llm, opencode }) =>
       Effect.gen(function* () {
         const release = Promise.withResolvers<void>()
         yield* Effect.addFinalizer(() => Effect.sync(() => release.resolve()))
+        const idleTimeoutEnv = { BUN_CONFIG_HTTP_IDLE_TIMEOUT: "2" }
         const config = testProviderConfig(llm.url)
         Object.assign(config.provider.test.options, {
           chunkTimeout: 600_000,
@@ -155,11 +156,17 @@ describe("opencode run (non-interactive subprocess)", () => {
         yield* llm.hold("attached response after long idle", release.promise)
         const run = yield* opencode.startRun("wait for the attached provider", {
           extraArgs: ["--attach", server.url, "--session", sessionID, "--"],
+          env: idleTimeoutEnv,
         })
         const resultFiber = yield* run.result.pipe(Effect.forkChild)
         let hits = yield* llm.hits
         while (!hits.some((hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation"))) {
-          yield* llm.wait(hits.length + 1)
+          const progress = yield* Effect.race(
+            llm.wait(hits.length + 1).pipe(Effect.as({ type: "hit" as const })),
+            Fiber.join(resultFiber).pipe(Effect.map((result) => ({ type: "completed" as const, result }))),
+          ).pipe(Effect.timeout("20 seconds"))
+          if (progress.type === "completed")
+            return yield* Effect.fail(new Error(`attached run ended before the provider request: ${progress.result.stderr}`))
           hits = yield* llm.hits
         }
 
@@ -167,7 +174,7 @@ describe("opencode run (non-interactive subprocess)", () => {
           Fiber.join(resultFiber).pipe(
             Effect.map((result) => ({ type: "completed" as const, result })),
           ),
-          Effect.sleep("390 seconds").pipe(Effect.as({ type: "waited" as const })),
+          Effect.sleep("12 seconds").pipe(Effect.as({ type: "waited" as const })),
         )
         if (outcome.type === "completed")
           return yield* Effect.fail(new Error(`attached run ended before the held provider response: ${outcome.result.stderr}`))
@@ -191,7 +198,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         })
         expect(response).toContain("attached response after long idle")
       }),
-    deadline(540_000),
+    deadline(60_000),
   )
 
   // GOAL: in json mode the one error record is the published error, not the 500 body.
