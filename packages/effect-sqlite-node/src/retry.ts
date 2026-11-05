@@ -271,7 +271,7 @@ export const makeStatementGate = Effect.sync(() => {
               exclusive = true
               return true
             })
-          if (admitted) break
+            if (admitted) break
             if (operation) operation.sawContention = true
             const remainingMs = yield* permitWaitBudget
             const wait =
@@ -286,24 +286,24 @@ export const makeStatementGate = Effect.sync(() => {
             yield* Effect.yieldNow
           }
 
-        const preempt = preemptible ? yield* Deferred.make<void>() : undefined
-        if (preempt) {
-          const retryPending = yield* Effect.sync(() => {
-            preemptibleWaiters.add(preempt)
-            return retrying > 0
-          })
-          if (retryPending) yield* Deferred.succeed(preempt, undefined)
-        }
-        const result = yield* Effect.exit(
-          preempt
-            ? restore(
-                Effect.raceFirst(
-                  effect.pipe(Effect.map((value) => ({ _tag: "acquired" as const, value }))),
-                  Deferred.await(preempt).pipe(Effect.as({ _tag: "preempted" as const })),
-                ),
-              )
-            : restore(effect).pipe(Effect.map((value) => ({ _tag: "acquired" as const, value }))),
-        )
+          const preempt = preemptible ? yield* Deferred.make<void>() : undefined
+          if (preempt) {
+            const retryPending = yield* Effect.sync(() => {
+              preemptibleWaiters.add(preempt)
+              return retrying > 0
+            })
+            if (retryPending) yield* Deferred.succeed(preempt, undefined)
+          }
+          const result = yield* Effect.exit(
+            preempt
+              ? restore(
+                  Effect.raceFirst(
+                    effect.pipe(Effect.map((value) => ({ _tag: "acquired" as const, value }))),
+                    Deferred.await(preempt).pipe(Effect.as({ _tag: "preempted" as const })),
+                  ),
+                )
+              : restore(effect).pipe(Effect.map((value) => ({ _tag: "acquired" as const, value }))),
+          )
           if (preempt) yield* Effect.sync(() => preemptibleWaiters.delete(preempt))
           yield* Effect.sync(() => (exclusive = false))
           yield* wake
@@ -436,3 +436,112 @@ export const isBeginStatement = (sql: string) => {
   const operation = statementOperation(sql)
   return operation === "begin" || operation.startsWith("begin ")
 }
+
+// Keep statement, reservation and transaction ownership in one place so every adapter follows the same retry boundary.
+export const makeRetryOwnership = (semaphore: Semaphore.Semaphore) =>
+  Effect.gen(function* () {
+    const statementGate = yield* makeStatementGate
+    const withStatement = <A, E, R>(
+      operation: RetryOperationState,
+      effect: Effect.Effect<A, E, R>,
+      retryPriority = false,
+    ) => statementGate.withStatement(effect, operation, retryPriority)
+    const registerLease = (scope: Scope.Scope, lease: Scope.Closeable) =>
+      Effect.gen(function* () {
+        const registered = yield* Effect.exit(Scope.addFinalizer(scope, Scope.close(lease, Exit.void)))
+        if (Exit.isFailure(registered)) {
+          yield* Scope.close(lease, registered)
+          return yield* Effect.failCause(registered.cause)
+        }
+      })
+    const acquireRegisteredLease = (scope: Scope.Scope, operation: RetryOperationState) =>
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const lease = yield* restore(acquirePermitLease(semaphore, 1, operation))
+          yield* registerLease(scope, lease)
+          return lease
+        }),
+      )
+    const oneShot = <A, E, R>(operation: RetryOperationState, effect: Effect.Effect<A, E, R>) =>
+      withStatement(operation, withPermit(semaphore, effect))
+    const statement = <A>(sql: string, effect: Effect.Effect<A, SqlError>, operation: RetryOperationState) =>
+      retryLocked(withPermit(semaphore, effect), sql, true, operation, {
+        wrapAttempt: (attempt, attemptNumber) => withStatement(operation, attempt, attemptNumber > 1),
+      })
+    const acquireTransactionLease = (scope: Scope.Scope, operation: RetryOperationState) =>
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const lease = yield* restore(
+            statementGate.withExclusive(acquirePermitLease(semaphore, 1, operation), operation, true),
+          )
+          yield* registerLease(scope, lease)
+          return lease
+        }),
+      )
+    const transaction = (scope: Scope.Scope, initialLease: Scope.Closeable, operation: RetryOperationState) => {
+      const state: { lease?: Scope.Closeable; transaction: boolean } = { lease: initialLease, transaction: false }
+      const acquireLease = () =>
+        Effect.gen(function* () {
+          state.lease = yield* acquireRegisteredLease(scope, operation)
+        })
+      const run = <A>(sql: string, effect: Effect.Effect<A, SqlError>) =>
+        Effect.suspend(() => {
+          if (state.transaction) return retryLocked(effect, sql, isCommitStatement(sql), operation)
+          if (!isBeginStatement(sql)) {
+            return retryLocked(effect, sql, true, operation, {
+              wrapAttempt: (attempt, attemptNumber) =>
+                withStatement(
+                  operation,
+                  Effect.suspend(() => (state.lease ? Effect.void : acquireLease()).pipe(Effect.andThen(attempt))),
+                  attemptNumber > 1,
+                ),
+              beforeRetry: () => {
+                if (!state.lease) return Effect.void
+                const lease = state.lease
+                state.lease = undefined
+                return Scope.close(lease, Exit.void)
+              },
+            })
+          }
+          return retryLocked(
+            Effect.gen(function* () {
+              if (state.lease) {
+                const lease = state.lease
+                state.lease = undefined
+                yield* Scope.close(lease, Exit.void)
+              }
+              return yield* statementGate.withExclusive(
+                Effect.uninterruptibleMask((restore) =>
+                  Effect.gen(function* () {
+                    const lease = yield* restore(acquirePermitLease(semaphore, 1, operation))
+                    yield* registerLease(scope, lease)
+                    const result = yield* Effect.exit(restore(effect))
+                    if (Exit.isFailure(result)) {
+                      yield* Scope.close(lease, result)
+                      return yield* Effect.failCause(result.cause)
+                    }
+                    state.lease = lease
+                    state.transaction = true
+                    return result.value
+                  }),
+                ),
+                operation,
+              )
+            }),
+            sql,
+            false,
+            operation,
+          )
+        })
+      const withLease = <A>(leased: Effect.Effect<A, SqlError>, fallback: () => Effect.Effect<A, SqlError>) =>
+        Effect.suspend(() => (state.lease ? leased : fallback()))
+      return { run, withLease }
+    }
+    return {
+      createOperation: (): RetryOperationState => ({ sawContention: false }),
+      oneShot,
+      statement,
+      acquireTransactionLease,
+      transaction,
+    }
+  })

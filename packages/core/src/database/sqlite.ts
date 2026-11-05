@@ -11,6 +11,7 @@ export {
   acquirePermitLease,
   isCommitStatement,
   isBeginStatement,
+  makeRetryOwnership,
   makeStatementGate,
   lockWaitMs,
   resetRetryWindow,
