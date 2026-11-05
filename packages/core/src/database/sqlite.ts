@@ -8,9 +8,12 @@ export class Native extends Context.Service<Native, unknown>()("@opencode-ai/cor
 export class Drizzle extends Context.Service<Drizzle, DrizzleClient>()("@opencode-ai/core/database/SqliteDrizzle") {}
 
 export {
+  acquirePermitLease,
+  isBeginStatement,
   lockWaitMs,
   resetRetryWindow,
   retryWindowStatus,
+  withPermit,
   withFreshRetryWindow,
   withRetryWindow,
 } from "@opencode-ai/effect-sqlite-node/retry"

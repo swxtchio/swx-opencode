@@ -1,5 +1,5 @@
-import { Context, Duration, Effect, Option, Schedule } from "effect"
-import { isSqlError, type SqlError } from "effect/unstable/sql/SqlError"
+import { Context, Deferred, Duration, Effect, Exit, Option, Schedule, Scope, Semaphore } from "effect"
+import { isSqlError, LockTimeoutError, SqlError } from "effect/unstable/sql/SqlError"
 
 const sqliteBusySnapshot = 517
 const defaultRetryWindow = Duration.seconds(10)
@@ -10,6 +10,7 @@ type RetryWindowState = {
   readonly windowMs: number
   startedAt: number | undefined
   sawLock: boolean
+  sawPermit: boolean
 }
 
 export class RetryWindow extends Context.Service<RetryWindow, RetryWindowState>()(
@@ -24,6 +25,7 @@ export const withRetryWindow = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
         windowMs: Duration.toMillis(sessionRetryWindow),
         startedAt: undefined,
         sawLock: false,
+        sawPermit: false,
       }),
     )
   })
@@ -34,6 +36,7 @@ export const withFreshRetryWindow = <A, E, R>(effect: Effect.Effect<A, E, R>, wi
       windowMs: Duration.toMillis(window),
       startedAt: undefined,
       sawLock: false,
+      sawPermit: false,
     }),
   )
 
@@ -42,14 +45,107 @@ export const resetRetryWindow = Effect.gen(function* () {
   if (Option.isNone(window)) return
   window.value.startedAt = undefined
   window.value.sawLock = false
+  window.value.sawPermit = false
 })
+
+const permitWaitBudget = Effect.withFiber((fiber) => {
+  const window = Context.getOption(fiber.context, RetryWindow)
+  if (Option.isNone(window)) return Effect.succeed(undefined)
+  return Effect.sync(() => {
+    window.value.startedAt ??= performance.now()
+    window.value.sawPermit = true
+    return Math.max(0, window.value.windowMs - (performance.now() - window.value.startedAt))
+  })
+})
+
+const permitWaitTimeout = Effect.withFiber((fiber) =>
+  Effect.sync(() => {
+    const window = Context.getOption(fiber.context, RetryWindow)
+    const elapsedMs =
+      Option.isSome(window) && window.value.startedAt !== undefined
+        ? Math.round(performance.now() - window.value.startedAt)
+        : 0
+    const cause = Object.assign(new Error("SQLite connection permit wait exceeded the session retry window"), {
+      code: "SQLITE_BUSY",
+      sqlitePermitWait: true,
+    })
+    const error = new SqlError({
+      reason: new LockTimeoutError({
+        cause,
+        message: "Failed to execute statement: database is locked (SQLITE_BUSY)",
+        operation: "execute",
+      }),
+    })
+    lockWaits.set(error, elapsedMs)
+    return error
+  }),
+)
+
+// The caller owns the returned scope and closes it after one statement attempt or transfers it to a transaction.
+export const acquirePermitLease = (semaphore: Semaphore.Semaphore) =>
+  Effect.uninterruptibleMask((restore) =>
+    Effect.gen(function* () {
+      const lease = yield* Scope.make()
+      const acquired = yield* Deferred.make<void>()
+      const hold = semaphore
+        .withPermits(1)(Effect.andThen(Deferred.succeed(acquired, undefined), Effect.never))
+        .pipe(Effect.forkScoped({ startImmediately: true }), Effect.asVoid)
+      const forked = yield* Effect.exit(Scope.provide(hold, lease))
+      if (Exit.isFailure(forked)) {
+        yield* Scope.close(lease, forked)
+        return yield* Effect.failCause(forked.cause)
+      }
+      if (Deferred.isDoneUnsafe(acquired)) return lease
+
+      const remainingMs = yield* permitWaitBudget
+      if (remainingMs === undefined) {
+        const waited = yield* restore(Deferred.await(acquired)).pipe(Effect.exit)
+        if (Exit.isFailure(waited)) {
+          yield* Scope.close(lease, waited)
+          return yield* Effect.failCause(waited.cause)
+        }
+        return lease
+      }
+
+      const waited = yield* restore(
+        Deferred.await(acquired).pipe(Effect.timeoutOption(Duration.millis(remainingMs))),
+      ).pipe(Effect.exit)
+      if (Exit.isFailure(waited)) {
+        yield* Scope.close(lease, waited)
+        return yield* Effect.failCause(waited.cause)
+      }
+      if (Option.isNone(waited.value)) {
+        yield* Scope.close(lease, Exit.void)
+        return yield* Effect.fail(yield* permitWaitTimeout)
+      }
+      return lease
+    }),
+  )
+
+// Retry gates wrap one permit lease per native statement, so the backoff never monopolizes the shared connection.
+export const withPermit = <A, E, R>(
+  semaphore: Semaphore.Semaphore,
+  effect: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E | SqlError, R> =>
+  Effect.scoped(
+    Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const immediate = yield* semaphore.withPermitsIfAvailable(1)(restore(effect))
+        if (immediate._tag === "Some") return immediate.value
+        const lease = yield* restore(acquirePermitLease(semaphore))
+        const result = yield* Effect.exit(restore(effect))
+        yield* Scope.close(lease, result)
+        return yield* result
+      }),
+    ),
+  )
 
 export const retryWindowStatus = Effect.withFiber((fiber) =>
   Effect.sync(() => {
     const window = Context.getOption(fiber.context, RetryWindow)
     if (Option.isNone(window)) {
       const windowMs = Duration.toMillis(sessionRetryWindow)
-      return { windowMs, elapsedMs: 0, remainingMs: windowMs, sawLock: false }
+      return { windowMs, elapsedMs: 0, remainingMs: windowMs, sawLock: false, sawPermit: false }
     }
     const elapsedMs = window.value.startedAt === undefined ? 0 : performance.now() - window.value.startedAt
     return {
@@ -57,6 +153,7 @@ export const retryWindowStatus = Effect.withFiber((fiber) =>
       elapsedMs: Math.round(elapsedMs),
       remainingMs: Math.max(0, window.value.windowMs - elapsedMs),
       sawLock: window.value.sawLock,
+      sawPermit: window.value.sawPermit,
     }
   }),
 )
@@ -99,7 +196,8 @@ export const retryLocked = <A>(execute: Effect.Effect<A, SqlError>, sql: string)
       const withinWindow = (error: SqlError) => {
         if (!retryable(error)) return false
         if (error.reason._tag !== "LockTimeoutError" || !window) return true
-        window.sawLock = true
+        if (isPermitWait(error.reason.cause)) window.sawPermit = true
+        else window.sawLock = true
         window.startedAt ??= performance.now()
         episodeStartedAt ??= window.startedAt
         return performance.now() - window.startedAt < window.windowMs
@@ -121,7 +219,8 @@ export const retryLocked = <A>(execute: Effect.Effect<A, SqlError>, sql: string)
           const cause: { code?: unknown; errcode?: unknown; errno?: unknown } =
             typeof error.reason.cause === "object" && error.reason.cause !== null ? error.reason.cause : {}
           const elapsedMs = Math.round(performance.now() - (episodeStartedAt ?? startedAt))
-          if (!isStaleSnapshot(error.reason.cause) && (attempts > 1 || window?.sawLock)) lockWaits.set(error, elapsedMs)
+          if (!isStaleSnapshot(error.reason.cause) && (attempts > 1 || window?.sawLock || window?.sawPermit))
+            lockWaits.set(error, elapsedMs)
           return Effect.logWarning(attempts > 1 ? "sqlite lock retries exhausted" : "sqlite lock failed without retry", {
             pid: process.pid,
             statement: statementOperation(sql),
@@ -145,4 +244,12 @@ const statementOperation = (sql: string) => {
   if (operation !== "begin") return operation ?? "unknown"
   const behavior = statement.match(/^begin\s+(deferred|immediate|exclusive)\b/i)?.[1]
   return behavior ? `begin ${behavior.toLowerCase()}` : "begin"
+}
+
+const isPermitWait = (cause: unknown) =>
+  typeof cause === "object" && cause !== null && "sqlitePermitWait" in cause && cause.sqlitePermitWait === true
+
+export const isBeginStatement = (sql: string) => {
+  const operation = statementOperation(sql)
+  return operation === "begin" || operation.startsWith("begin ")
 }

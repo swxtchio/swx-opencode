@@ -1,10 +1,10 @@
 export * as NodeSqliteClient from "./index"
 
 import { DatabaseSync, type SQLInputValue } from "node:sqlite"
-import { Deferred } from "effect"
 import { identity } from "effect/Function"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
 import * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
@@ -14,7 +14,7 @@ import * as Client from "effect/unstable/sql/SqlClient"
 import type { Connection } from "effect/unstable/sql/SqlConnection"
 import { classifySqliteError, LockTimeoutError, SqlError } from "effect/unstable/sql/SqlError"
 import * as Statement from "effect/unstable/sql/Statement"
-import { retryLocked } from "./retry"
+import { acquirePermitLease, isBeginStatement, retryLocked, withPermit } from "./retry"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
 const nativeBusyTimeoutMs = 5
@@ -107,7 +107,7 @@ export const make = (
             try: () => statement.all(...(params as SQLInputValue[])) as Array<Record<string, unknown>>,
             catch: statementError,
           })
-          return retryLocked(execute, sql)
+          return execute
         })
 
       const runValues = (sql: string, params: ReadonlyArray<unknown> = []) =>
@@ -120,7 +120,7 @@ export const make = (
               statement.all(...(params as SQLInputValue[])) as unknown as ReadonlyArray<ReadonlyArray<unknown>>,
             catch: statementError,
           })
-          return retryLocked(execute, sql)
+          return execute
         })
 
       return identity<SqliteConnection>({
@@ -152,54 +152,88 @@ export const make = (
 
     const semaphore = yield* Semaphore.make(1)
     const connection = yield* makeConnection
-    const withPermit = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-      Effect.scoped(
-        Effect.uninterruptibleMask((restore) =>
-          Effect.gen(function* () {
-            const immediate = yield* semaphore.withPermitsIfAvailable(1)(restore(effect))
-            if (immediate._tag === "Some") return immediate.value
-            const acquired = yield* Deferred.make<void>()
-            yield* semaphore
-              .withPermits(1)(Effect.andThen(Deferred.succeed(acquired, undefined), Effect.never))
-              .pipe(Effect.forkScoped({ startImmediately: true }))
-            yield* restore(Deferred.await(acquired))
-            return yield* restore(effect)
-          }),
-        ),
-      )
+    const transactionConnection = (scope: Scope.Scope) => {
+      const state: { lease?: Scope.Closeable } = {}
+      const retry = <A>(sql: string, effect: Effect.Effect<A, SqlError>) =>
+        Effect.suspend(() => {
+          if (state.lease) return retryLocked(effect, sql)
+          if (!isBeginStatement(sql)) return retryLocked(withPermit(semaphore, effect), sql)
+          return retryLocked(
+            Effect.gen(function* () {
+              const lease = yield* acquirePermitLease(semaphore)
+              const result = yield* Effect.exit(effect)
+              if (Exit.isFailure(result)) {
+                yield* Scope.close(lease, result)
+                return yield* Effect.failCause(result.cause)
+              }
+              const registered = yield* Effect.exit(Scope.addFinalizer(scope, Scope.close(lease, Exit.void)))
+              if (Exit.isFailure(registered)) {
+                yield* Scope.close(lease, registered)
+                return yield* Effect.failCause(registered.cause)
+              }
+              state.lease = lease
+              return result.value
+            }),
+            sql,
+          )
+        })
+
+      return identity<SqliteConnection>({
+        execute(sql, params, transformRows) {
+          const result = retry(sql, connection.execute(sql, params, undefined))
+          return transformRows ? Effect.map(result, transformRows) : result
+        },
+        executeRaw(sql, params) {
+          return retry(sql, connection.executeRaw(sql, params))
+        },
+        executeValues(sql, params) {
+          return retry(sql, connection.executeValues(sql, params))
+        },
+        executeUnprepared(sql, params, transformRows) {
+          return this.execute(sql, params, transformRows)
+        },
+        executeStream() {
+          return Stream.die("executeStream not implemented")
+        },
+        loadExtension(path) {
+          return Effect.suspend(() =>
+            state.lease
+              ? connection.loadExtension(path)
+              : withPermit(semaphore, connection.loadExtension(path)),
+          )
+        },
+      })
+    }
+    const runWithPermit = <A>(sql: string, effect: Effect.Effect<A, SqlError>) =>
+      retryLocked(withPermit(semaphore, effect), sql)
     const lockedConnection = identity<SqliteConnection>({
       execute(sql, params, transformRows) {
-        return withPermit(connection.execute(sql, params, transformRows))
+        const result = runWithPermit(sql, connection.execute(sql, params, undefined))
+        return transformRows ? Effect.map(result, transformRows) : result
       },
       executeRaw(sql, params) {
-        return withPermit(connection.executeRaw(sql, params))
+        return runWithPermit(sql, connection.executeRaw(sql, params))
       },
       executeValues(sql, params) {
-        return withPermit(connection.executeValues(sql, params))
+        return runWithPermit(sql, connection.executeValues(sql, params))
       },
       executeUnprepared(sql, params, transformRows) {
-        return withPermit(connection.executeUnprepared(sql, params, transformRows))
+        return this.execute(sql, params, transformRows)
       },
       executeStream(sql, params, transformRows) {
         return connection.executeStream(sql, params, transformRows)
       },
       loadExtension(path) {
-        return withPermit(connection.loadExtension(path))
+        return withPermit(semaphore, connection.loadExtension(path))
       },
     })
     const acquirer = Effect.succeed(lockedConnection)
-    // Keep retries serialized on the native connection, including their backoff interval.
-    // The scoped child owns the permit so cancellation can release it during acquisition.
-    const transactionAcquirer = Effect.uninterruptibleMask((restore) =>
-      Effect.gen(function* () {
-        const acquired = yield* Deferred.make<void>()
-        yield* semaphore
-          .withPermits(1)(Effect.andThen(Deferred.succeed(acquired, undefined), Effect.never))
-          .pipe(Effect.forkScoped({ startImmediately: true }))
-        yield* restore(Deferred.await(acquired))
-        return connection
-      }),
-    )
+    // A failed BEGIN releases the native connection before retry backoff. Once BEGIN succeeds, its lease stays with the
+    // reservation scope so other statements cannot join that transaction.
+    const transactionAcquirer = Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      return transactionConnection(scope)
+    })
 
     return Object.assign(
       (yield* Client.make({
