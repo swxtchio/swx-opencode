@@ -160,23 +160,49 @@ export const make = (
     const semaphore = yield* Semaphore.make(1)
     const statementGate = yield* makeStatementGate
     const connection = yield* makeConnection
-    const withStatement = <A, E>(operation: { sawContention: boolean }, effect: Effect.Effect<A, E>) =>
-      statementGate.withStatement(effect, operation)
+    const withStatement = <A, E>(
+      operation: { sawContention: boolean },
+      effect: Effect.Effect<A, E>,
+      retryPriority = false,
+    ) => statementGate.withStatement(effect, operation, retryPriority)
     const transactionConnection = (
       scope: Scope.Scope,
       initialLease: Scope.Closeable,
       operation: { sawContention: boolean },
     ) => {
       const state: { lease?: Scope.Closeable; transaction: boolean } = { lease: initialLease, transaction: false }
+      const acquireLease = () =>
+        Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const lease = yield* restore(acquirePermitLease(semaphore, 1, operation))
+            const registered = yield* Effect.exit(Scope.addFinalizer(scope, Scope.close(lease, Exit.void)))
+            if (Exit.isFailure(registered)) {
+              yield* Scope.close(lease, registered)
+              return yield* Effect.failCause(registered.cause)
+            }
+            state.lease = lease
+          }),
+        )
       const retry = <A>(sql: string, effect: Effect.Effect<A, SqlError>) =>
         Effect.suspend(() => {
           if (state.transaction) return retryLocked(effect, sql, isCommitStatement(sql), operation)
           if (!isBeginStatement(sql)) {
-            if (state.lease) return retryLocked(effect, sql, true, operation)
-            return withStatement(
-              operation,
-              retryLocked(withPermit(semaphore, effect), sql, true, operation),
-            )
+            return retryLocked(effect, sql, true, operation, {
+              wrapAttempt: (attempt, attemptNumber) =>
+                withStatement(
+                  operation,
+                  Effect.suspend(() =>
+                    (state.lease ? Effect.void : acquireLease()).pipe(Effect.andThen(attempt)),
+                  ),
+                  attemptNumber > 1,
+                ),
+              beforeRetry: () => {
+                if (!state.lease) return Effect.void
+                const lease = state.lease
+                state.lease = undefined
+                return Scope.close(lease, Exit.void)
+              },
+            })
           }
           return retryLocked(
             Effect.gen(function* () {
@@ -242,7 +268,9 @@ export const make = (
       })
     }
     const runWithPermit = <A>(sql: string, effect: Effect.Effect<A, SqlError>, operation: { sawContention: boolean }) =>
-      withStatement(operation, retryLocked(withPermit(semaphore, effect), sql, true, operation))
+      retryLocked(withPermit(semaphore, effect), sql, true, operation, {
+        wrapAttempt: (attempt, attemptNumber) => withStatement(operation, attempt, attemptNumber > 1),
+      })
     const lockedConnection = (operation: { sawContention: boolean }) => identity<SqliteConnection>({
       execute(sql, params, transformRows) {
         const result = runWithPermit(sql, connection.execute(sql, params, undefined), operation)
@@ -272,7 +300,9 @@ export const make = (
       const operation = { sawContention: false }
       const connectionLease = yield* Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
-          const lease = yield* restore(statementGate.withExclusive(acquirePermitLease(semaphore, 1, operation), operation))
+          const lease = yield* restore(
+            statementGate.withExclusive(acquirePermitLease(semaphore, 1, operation), operation, true),
+          )
           const registered = yield* Effect.exit(Scope.addFinalizer(scope, Scope.close(lease, Exit.void)))
           if (Exit.isFailure(registered)) {
             yield* Scope.close(lease, registered)
