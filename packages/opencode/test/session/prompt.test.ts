@@ -8495,6 +8495,80 @@ const seedLoopUser = Effect.fn("test.seedLoopUser")(function* (sessionID: Sessio
 })
 
 consumeLock.instance(
+  "a command admission under a real SQLite lock hands off custody and runs once after recovery",
+  () =>
+    Effect.gen(function* () {
+      const instance = yield* TestInstance
+      const marker = path.join(instance.directory, "command-expansions.txt")
+      const ready = path.join(instance.directory, "command-expansion-ready")
+      const release = path.join(instance.directory, "release-command-expansion")
+      yield* Effect.addFinalizer(() => writeText(release, "released").pipe(Effect.orDie))
+      const { llm } = yield* useServerConfig((url) => ({
+        ...providerCfg(url),
+        command: {
+          probe: {
+            template: `!\`printf 'expanded\\n' >> '${marker}'; touch '${ready}'; while [ ! -f '${release}' ]; do sleep 0.01; done; printf 'prepared once'\``,
+          },
+        },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const chat = yield* sessions.create({ title: "Command admission under a real lock" })
+      yield* llm.text("command finished")
+
+      const attempts = newStatementAttempts()
+      yield* patchBunQuery((sql) => sql === "begin immediate", attempts)
+      const input = {
+        sessionID: chat.id,
+        messageID: MessageID.ascending(),
+        command: "probe",
+        arguments: "",
+      }
+      const command = yield* prompt.command(input).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* pollWithTimeout(
+        Effect.promise(async () =>
+          (await Bun.file(marker).exists()) && (await Bun.file(marker).text()) === "expanded\n" ? true : undefined,
+        ),
+        "command expansion did not run",
+        "10 seconds",
+      )
+
+      const lock = yield* writeLockHold()
+      yield* lock.take(chat.id)
+      yield* Effect.addFinalizer(() => lock.release)
+      yield* Effect.promise(() => writeFile(release, "released"))
+      yield* pollWithTimeout(
+        Effect.sync(() => (attempts.busy.length > 0 ? true : undefined)),
+        "command admission never met the held SQLite lock",
+        "10 seconds",
+      )
+      const firstBusy = attempts.busy.length
+      yield* Effect.sleep("12 seconds")
+      expect(yield* lock.isHeld).toBe(true)
+      expect(attempts.busy.length).toBeGreaterThan(firstBusy)
+      expect(command.pollUnsafe()).toBeUndefined()
+
+      yield* lock.releaseAndProbe
+      const result = yield* awaitWithTimeout(
+        Fiber.join(command),
+        "command did not complete after its admission lock was released",
+        "30 seconds",
+      )
+      expect(result.info.role).toBe("assistant")
+      expect(result.parts.some((part) => part.type === "text" && part.text === "command finished")).toBe(true)
+      expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("expanded\n")
+      expect(yield* llm.calls).toBe(1)
+      const users = (yield* sessions.messages({ sessionID: chat.id })).filter((message) => message.info.role === "user")
+      expect(users).toHaveLength(1)
+      expect(users[0]?.info.id).toBe(input.messageID)
+      expect(users[0]?.parts.some((part) => part.type === "text" && part.text.includes("prepared once"))).toBe(true)
+      expect(yield* queue.list(chat.id)).toEqual([])
+    }),
+  180_000,
+)
+
+consumeLock.instance(
   "a tool result write that meets a held lock continues with its result and queued prompt once",
   () =>
     Effect.gen(function* () {
