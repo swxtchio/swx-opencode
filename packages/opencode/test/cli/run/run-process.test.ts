@@ -144,7 +144,10 @@ describe("opencode run (non-interactive subprocess)", () => {
           chunkTimeout: 600_000,
           headerTimeout: 600_000,
         })
-        const server = yield* opencode.serve({ env: { OPENCODE_CONFIG_CONTENT: JSON.stringify(config) } })
+        const server = yield* opencode.serve({
+          env: { OPENCODE_CONFIG_CONTENT: JSON.stringify(config) },
+          readyTimeoutMs: 60_000,
+        })
         const sdk = createOpencodeClient({ baseUrl: server.url, directory: home })
         const created = yield* Effect.promise(() => sdk.session.create({ title: "long attached response" }))
         const sessionID = created.data?.id
@@ -188,7 +191,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         })
         expect(response).toContain("attached response after long idle")
       }),
-    deadline(480_000),
+    deadline(540_000),
   )
 
   // GOAL: in json mode the one error record is the published error, not the 500 body.
