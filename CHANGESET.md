@@ -95,7 +95,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Database maintenance
 
-- **#411** Recover V1 `SessionPrompt` tool-result and queued-prompt delivery through transient SQLite writer contention. Extend lock retries to one bounded 60-second SessionPrompt window; exclude stale snapshots and never replay transaction bodies. `SessionQueue.consume` retries only pre-body acquisition failures, stops with elapsed lock diagnostics at its own bound, and keeps queued prompts pending. Real-lock coverage spans Bun, Core Node, standalone Node, processor error persistence, and a tool result followed by its queued continuation. _Fork-only._
+- **#411** Fix swxtchio/swx-opencode#370 by extending the shared SQLite retry owner across V1 turn-dependent writes. Preserve completed tool results and admitted queued prompts; retry statements rather than replaying transaction callbacks, and exclude stale snapshots. `SessionQueue.consume` keeps a bounded, visible failure with elapsed lock wait when acquisition never succeeds. Real-lock coverage is in `packages/core/test/sqlite-busy.test.ts`, `packages/opencode/test/session/prompt.test.ts`, and `packages/opencode/test/session/processor-effect.test.ts`. Related upstream proposals (`anomalyco/opencode#53704`, `#59521`, and `#42539`) were not compatible drop-ins; no commit was cherry-picked. _Fork-only._
 - **#395** Partially port the atomic SQLite acquisition behavior from `anomalyco/opencode#60651`
   (`c6056f39312748c633de00ad2c2576b7e042b97d`, downstream `79aafa2f82e7293ba7f2c1222e35b2f58dc5c5ea`; review correction `9f7cc80702fee80e82dd811a35f9b8d16e97ae29`)
   into `packages/core/src/database/sqlite.bun.ts`, `packages/core/src/database/sqlite.node.ts`, and
