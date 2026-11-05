@@ -2976,7 +2976,7 @@ const layer = Layer.effect(
         const backstopMs = Math.max(
           1,
           Math.min(
-            Duration.toMillis(consumeAcquireBackstop),
+            Duration.toMillis(consumeAcquireBackstop) + Duration.toMillis(consumeAcquireBackstopSlack),
             Math.ceil(remainingMs + Duration.toMillis(consumeAcquireBackstopSlack)),
           ),
         )
@@ -3003,10 +3003,8 @@ const layer = Layer.effect(
       }
     })
 
-    // The driver waits for its connection and retries BEGIN uninterruptibly, so
-    // the attempt runs in its own fiber and the backstop stops waiting for it
-    // rather than interrupting it. An abandoned attempt that later reaches its
-    // body rolls back without deleting anything.
+    // The backstop abandons only the waiter: a cleanup BEGIN may acquire the connection later, but the body guard then
+    // rolls it back before the queue delete. Permit wait stays asynchronous and never pins the connection.
     const consumeAttempt = Effect.fnUntraced(function* (sessionID: SessionID, backstop: Duration.Input) {
       const state = { began: false, abandoned: false }
       // Whether the abandon won: a body that began first is waited for instead,
@@ -3017,23 +3015,25 @@ const layer = Layer.effect(
           state.abandoned = true
           return Fiber.interrupt(fiber).pipe(Effect.forkIn(scope), Effect.as(true))
         })
-      const fiber = yield* exclusive(
-        sessionID,
-        writable(sessionID, (tx) =>
-          Effect.suspend(() => {
-            if (state.abandoned) return Effect.interrupt
-            state.began = true
-            return tx
-              .delete(SessionPromptQueueTable)
-              .where(
-                and(
-                  eq(SessionPromptQueueTable.session_id, sessionID),
-                  isNotNull(SessionPromptQueueTable.time_promoted),
-                ),
-              )
-              .run()
-              .pipe(Effect.map(() => wakes.get(sessionID) ?? 0))
-          }),
+      const fiber = yield* Sqlite.withUnboundedPermitWait(
+        exclusive(
+          sessionID,
+          writable(sessionID, (tx) =>
+            Effect.suspend(() => {
+              if (state.abandoned) return Effect.interrupt
+              state.began = true
+              return tx
+                .delete(SessionPromptQueueTable)
+                .where(
+                  and(
+                    eq(SessionPromptQueueTable.session_id, sessionID),
+                    isNotNull(SessionPromptQueueTable.time_promoted),
+                  ),
+                )
+                .run()
+                .pipe(Effect.map(() => wakes.get(sessionID) ?? 0))
+            }),
+          ),
         ),
       ).pipe(Effect.forkIn(scope, { startImmediately: true }))
       const waited = yield* Fiber.await(fiber).pipe(

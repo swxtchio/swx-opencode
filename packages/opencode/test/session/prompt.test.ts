@@ -8446,6 +8446,54 @@ const writeLockHold = Effect.fn("test.writeLockHold")(function* () {
   }
 })
 
+const seedLoopUser = Effect.fn("test.seedLoopUser")(function* (sessionID: SessionID, text: string) {
+  const sessions = yield* Session.Service
+  const queue = yield* SessionQueue.Service
+  const messageID = MessageID.ascending()
+  const original = yield* queue.admit({
+    sessionID,
+    messageID,
+    delivery: "queue",
+    agent: "build",
+    model: ref,
+    parts: said(text),
+  })
+  yield* queue.promote({
+    sessionID,
+    delivery: "queue",
+    prepare: (input) => Effect.succeed(input),
+    write: (input) =>
+      Effect.gen(function* () {
+        yield* sessions.updateMessage({
+          id: input.messageID,
+          sessionID,
+          role: "user",
+          agent: "build",
+          model: ref,
+          time: { created: original.time.created },
+        })
+        yield* Effect.forEach(
+          input.parts,
+          (part) =>
+            part.type === "text"
+              ? sessions.updatePart({
+                  ...part,
+                  id: part.id ?? PartID.ascending(),
+                  sessionID,
+                  messageID: input.messageID,
+                })
+              : Effect.void,
+          { discard: true },
+        )
+      }),
+    rejected: (cause) => Effect.failCause(cause),
+  })
+  yield* queue.consume(sessionID)
+  const root = (yield* sessions.messages({ sessionID })).find((message) => message.info.id === messageID)
+  if (!root || root.info.role !== "user") throw new Error("explicit loop root was not persisted")
+  return root
+})
+
 consumeLock.instance(
   "a tool result write that meets a held lock continues with its result and queued prompt once",
   () =>
@@ -8566,6 +8614,88 @@ consumeLock.instance(
 )
 
 consumeLock.instance(
+  "a loop-started tool result continues through a transient held SQLite lock",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const runState = yield* SessionRunState.Service
+      const chat = yield* sessions.create({
+        title: "Transient loop tool result lock",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const root = yield* seedLoopUser(chat.id, "run the tool from an explicit loop")
+      expect(yield* llm.calls).toBe(0)
+      expect(Exit.isSuccess(yield* runState.assertNotBusy(chat.id).pipe(Effect.exit))).toBe(true)
+      const marker = path.join(dir, "tool-runs.txt")
+      const ready = path.join(dir, "tool-ready")
+      const release = path.join(dir, "tool-release")
+      yield* Effect.addFinalizer(() => Effect.promise(() => writeFile(release, "release")))
+      const reader = new Sqlite(consumeLockDbPath, { readonly: true })
+      yield* Effect.addFinalizer(() => Effect.sync(() => reader.close()))
+
+      const attempts = newStatementAttempts()
+      yield* patchBunQuery((sql) => sql === "begin immediate", attempts)
+      yield* llm.push(
+        reply().tool("bash", {
+          command: `printf 'ran\\n' >> "${marker}"; touch "${ready}"; while [ ! -e "${release}" ]; do sleep 0.01; done; printf 'tool-output-ok'`,
+          description: "Hold the loop tool result until the test releases it",
+        }),
+      )
+      yield* llm.text("loop task done")
+
+      const loop = yield* prompt.loop({ sessionID: chat.id, messageID: root.info.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "the loop-started provider call never started", "75 seconds")
+      yield* pollWithTimeout(
+        Effect.promise(() => Bun.file(ready).exists()).pipe(Effect.map((exists) => (exists ? (true as const) : undefined))),
+        "the loop tool side effect never reached its hold point",
+        "10 seconds",
+      )
+
+      const lock = yield* writeLockHold()
+      yield* lock.take(chat.id)
+      yield* Effect.addFinalizer(() => lock.release)
+      yield* Effect.promise(() => writeFile(release, "release"))
+      yield* pollWithTimeout(
+        Effect.sync(() => (attempts.busy.length > 0 ? true : undefined)),
+        "the loop tool-result transaction never met the held SQLite lock",
+        "10 seconds",
+      )
+      const firstBusy = attempts.busy.length
+      yield* Effect.sleep("12 seconds")
+      const lockHeldAtBoundary = yield* lock.isHeld
+      const attemptsAtBoundary = attempts.busy.length
+      const statusAtBoundary = yield* status.get(chat.id)
+      const blockedTool = reader
+        .query<{ status: string }, [string]>(
+          "select json_extract(data, '$.state.status') as status from part where session_id = ? and json_extract(data, '$.tool') = 'bash'",
+        )
+        .get(chat.id)
+
+      yield* lock.releaseAndProbe
+      expect(lockHeldAtBoundary).toBe(true)
+      expect(attemptsAtBoundary).toBeGreaterThan(firstBusy)
+      expect(statusAtBoundary.type).toBe("busy")
+      expect(blockedTool?.status).toBe("running")
+      const loopExit = yield* awaitWithTimeout(Fiber.await(loop), "the loop did not finish after lock release", "30 seconds")
+      expect(Exit.isSuccess(loopExit)).toBe(true)
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(2)
+      expect(mentions(inputs[1], "tool-output-ok")).toBe(true)
+      expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("ran\n")
+      const history = yield* sessions.messages({ sessionID: chat.id })
+      const tool = toolPart(history.flatMap((message) => message.parts))
+      expect(tool?.state.status).toBe("completed")
+      if (tool?.state.status === "completed") expect(tool.state.output).toContain("tool-output-ok")
+      expect((yield* status.get(chat.id)).type).toBe("idle")
+      expect(Exit.isSuccess(yield* runState.assertNotBusy(chat.id).pipe(Effect.exit))).toBe(true)
+    }),
+  180_000,
+)
+
+consumeLock.instance(
   "a loop-started tool result that outlasts its SQLite window fails visibly and keeps queued work",
   () =>
     Effect.gen(function* () {
@@ -8579,14 +8709,9 @@ consumeLock.instance(
         title: "Persistent loop tool result lock",
         permission: [{ permission: "*", pattern: "*", action: "allow" }],
       })
+      const root = yield* seedLoopUser(chat.id, "run the tool from an explicit loop")
       yield* queue.hold(chat.id, "persistent-test")
       yield* Effect.addFinalizer(() => queue.release(chat.id, "persistent-test").pipe(Effect.asVoid))
-      const root = yield* seedUser({
-        sessionID: chat.id,
-        agent: "build",
-        model: ref,
-        parts: said("run the tool from an explicit loop"),
-      })
       const marker = path.join(dir, "tool-runs.txt")
       const ready = path.join(dir, "tool-ready")
       const release = path.join(dir, "tool-release")
@@ -8637,12 +8762,11 @@ consumeLock.instance(
         "75 seconds",
       )
       const elapsedMs = performance.now() - startedAt
-      expect(elapsedMs).toBeGreaterThanOrEqual(55_000)
+      expect(elapsedMs).toBeGreaterThanOrEqual(45_000)
       expect(elapsedMs).toBeLessThan(75_000)
       expect(yield* lock.isHeld).toBe(true)
       expect(attempts.busy.length).toBeGreaterThan(firstBusy)
       expect((yield* status.get(chat.id)).type).toBe("idle")
-      expect(Exit.isSuccess(yield* runState.assertNotBusy(chat.id).pipe(Effect.exit))).toBe(true)
       expect(
         reader
           .query<{ id: string; time_promoted: number | null; message_id: string | null }, [string]>(
@@ -8659,6 +8783,7 @@ consumeLock.instance(
       ).toBe("running")
       expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("ran\n")
       expect(yield* llm.calls).toBe(1)
+      expect(Exit.isSuccess(yield* runState.assertNotBusy(chat.id).pipe(Effect.exit))).toBe(true)
 
       yield* lock.releaseAndProbe
       const terminal = yield* pollWithTimeout(
@@ -8672,7 +8797,11 @@ consumeLock.instance(
       )
       if (terminal.info.role !== "assistant" || terminal.info.error?.name !== "UnknownError")
         throw new Error("persistent turn lock did not leave a named assistant error")
-      expect(terminal.info.error.data.message).toMatch(/^Database is locked \(SQLITE_BUSY\) after \d+ ms$/)
+      const lockMessage = terminal.info.error.data.message
+      expect(lockMessage).toMatch(/^Database is locked \(SQLITE_BUSY\) after (\d+) ms$/)
+      const waitedMs = Number(/^Database is locked \(SQLITE_BUSY\) after (\d+) ms$/.exec(lockMessage)?.[1])
+      expect(waitedMs).toBeGreaterThanOrEqual(55_000)
+      expect(waitedMs).toBeLessThan(75_000)
     }),
   240_000,
 )
@@ -8757,7 +8886,8 @@ consumeLock.instance(
         yield* lock.release
         const [taskReply, continuationReply] = yield* finish(task, continuation)
 
-        expect(capture.backstop.length).toBeGreaterThan(0)
+        expect(capture.locked).toEqual([])
+        expect(capture.backstop).toEqual([1, 2].map((attempts) => ({ "session.id": chat.id, attempts })))
         // The failed attempt changed nothing: the continuation is still pending and the tool result kept.
         expect(failed).toEqual(before)
         const inputs = yield* llm.inputs
@@ -8826,14 +8956,15 @@ consumeLock.instance(
           expect(refusal).toBeInstanceOf(SessionQueue.ConsumeLockedError)
           if (!(refusal instanceof SessionQueue.ConsumeLockedError)) return
           expect(refusal.sessionID).toBe(chat.id)
-          expect(refusal.attempts).toBeGreaterThan(0)
+          expect(refusal.attempts).toBe(3)
           expect(refusal.message).toContain("SQLite lock contention")
           expect(refusal.message).toMatch(/persisted for \d+ ms/)
         })
         expect(elapsedMs).toBeGreaterThanOrEqual(55_000)
         expect(elapsedMs).toBeLessThan(75_000)
         expect(yield* lock.isHeld).toBe(true)
-        expect(capture.locked.length + capture.backstop.length).toBeGreaterThan(0)
+        expect(capture.locked).toEqual([{ "session.id": chat.id, attempts: 3 }])
+        expect(capture.backstop).toEqual([1, 2].map((attempts) => ({ "session.id": chat.id, attempts })))
         // The refusal kept the continuation pending and the tool result, and left nothing running to retry it.
         expect(records()).toEqual(before)
         expect(yield* llm.calls).toBe(1)
@@ -8885,13 +9016,15 @@ consumeLock.instance(
           expect(refusal).toBeInstanceOf(SessionQueue.ConsumeLockedError)
           if (!(refusal instanceof SessionQueue.ConsumeLockedError)) return
           expect(refusal.sessionID).toBe(chat.id)
-          expect(refusal.attempts).toBeGreaterThan(0)
+          expect(refusal.attempts).toBe(3)
           expect(refusal.message).toContain("SQLite write acquisition")
           expect(refusal.message).toMatch(/persisted for \d+ ms/)
         })
         expect(elapsedMs).toBeGreaterThanOrEqual(55_000)
         expect(elapsedMs).toBeLessThan(75_000)
-        expect(capture.backstop.length).toBeGreaterThan(0)
+        expect(capture.backstop).toEqual(
+          [1, 2, 3].map((attempts) => ({ "session.id": chat.id, attempts })),
+        )
         expect(capture.locked).toEqual([])
         expect(records()).toEqual(before)
         expect(yield* llm.calls).toBe(1)
@@ -8946,7 +9079,8 @@ consumeLock.instance(
         // Its uninterruptible BEGIN retry can reserve the shared connection until the session window expires.
         yield* awaitWithTimeout(Deferred.await(owned), "the transaction never took the shared connection", "75 seconds")
         expect(begins.busy.length).toBeGreaterThan(0)
-        expect(capture.locked.length + capture.backstop.length).toBeGreaterThan(0)
+        expect(capture.locked).toEqual([])
+        expect(capture.backstop).toEqual([{ "session.id": chat.id, attempts: 1 }])
         yield* lock.release
         const exits = yield* awaitWithTimeout(
           Effect.all([Fiber.await(task), Fiber.await(continuation)]),
@@ -8959,12 +9093,16 @@ consumeLock.instance(
           expect(refusal).toBeInstanceOf(SessionQueue.ConsumeLockedError)
           if (!(refusal instanceof SessionQueue.ConsumeLockedError)) return
           expect(refusal.sessionID).toBe(chat.id)
-          expect(refusal.attempts).toBeGreaterThan(0)
+          expect(refusal.attempts).toBe(3)
         })
-        expect(capture.backstop.length + capture.locked.length).toBeGreaterThan(0)
+        expect(capture.locked).toEqual([])
+        expect(capture.backstop).toEqual(
+          [1, 2, 3].map((attempts) => ({ "session.id": chat.id, attempts })),
+        )
         expect((yield* status.list()).has(chat.id)).toBe(false)
         expect(Exit.isSuccess(yield* runState.assertNotBusy(chat.id).pipe(Effect.exit))).toBe(true)
         expect(Deferred.isDoneUnsafe(holderRelease)).toBe(false)
+        const beginsAtRefusal = begins.count
 
         // Release the deferred connection owner and wait for session exclusion to end; no queue delete may land late.
         yield* Deferred.succeed(holderRelease, undefined)
@@ -8973,6 +9111,7 @@ consumeLock.instance(
           "the abandoned attempt never released the session permit",
           "15 seconds",
         )
+        expect(begins.count).toBeGreaterThan(beginsAtRefusal)
         expect(deletes.count).toBe(deletesBefore)
         expect(records()).toEqual(before)
         expect(yield* llm.calls).toBe(1)

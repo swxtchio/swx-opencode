@@ -17,6 +17,10 @@ export class RetryWindow extends Context.Service<RetryWindow, RetryWindowState>(
   "@opencode-ai/effect-sqlite-node/RetryWindow",
 ) {}
 
+class UnboundedPermitWait extends Context.Service<UnboundedPermitWait, true>()(
+  "@opencode-ai/effect-sqlite-node/UnboundedPermitWait",
+) {}
+
 export const withRetryWindow = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   Effect.withFiber((fiber) => {
     if (Option.isSome(Context.getOption(fiber.context, RetryWindow))) return effect
@@ -40,6 +44,10 @@ export const withFreshRetryWindow = <A, E, R>(effect: Effect.Effect<A, E, R>, wi
     }),
   )
 
+// An abandoned consume attempt may finish BEGIN and roll back after its caller's backstop; the body guard forbids deletion.
+export const withUnboundedPermitWait = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  effect.pipe(Effect.provideService(UnboundedPermitWait, true))
+
 export const resetRetryWindow = Effect.gen(function* () {
   const window = yield* Effect.serviceOption(RetryWindow)
   if (Option.isNone(window)) return
@@ -49,6 +57,7 @@ export const resetRetryWindow = Effect.gen(function* () {
 })
 
 const permitWaitBudget = Effect.withFiber((fiber) => {
+  if (Option.isSome(Context.getOption(fiber.context, UnboundedPermitWait))) return Effect.succeed(undefined)
   const window = Context.getOption(fiber.context, RetryWindow)
   if (Option.isNone(window)) return Effect.succeed(undefined)
   return Effect.sync(() => {

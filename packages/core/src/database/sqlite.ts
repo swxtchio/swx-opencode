@@ -14,6 +14,7 @@ export {
   resetRetryWindow,
   retryWindowStatus,
   withPermit,
+  withUnboundedPermitWait,
   withFreshRetryWindow,
   withRetryWindow,
 } from "@opencode-ai/effect-sqlite-node/retry"
