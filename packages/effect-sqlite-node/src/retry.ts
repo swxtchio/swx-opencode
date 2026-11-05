@@ -21,6 +21,12 @@ class UnboundedPermitWait extends Context.Service<UnboundedPermitWait, true>()(
   "@opencode-ai/effect-sqlite-node/UnboundedPermitWait",
 ) {}
 
+export type RetryOperationState = { sawContention: boolean }
+
+class RetryOperation extends Context.Service<RetryOperation, RetryOperationState>()(
+  "@opencode-ai/effect-sqlite-node/RetryOperation",
+) {}
+
 export const withRetryWindow = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   Effect.withFiber((fiber) => {
     if (Option.isSome(Context.getOption(fiber.context, RetryWindow))) return effect
@@ -58,6 +64,8 @@ export const resetRetryWindow = Effect.gen(function* () {
 
 const permitWaitBudget = Effect.withFiber((fiber) => {
   if (Option.isSome(Context.getOption(fiber.context, UnboundedPermitWait))) return Effect.succeed(undefined)
+  const operation = Context.getOption(fiber.context, RetryOperation)
+  if (Option.isSome(operation)) operation.value.sawContention = true
   const window = Context.getOption(fiber.context, RetryWindow)
   if (Option.isNone(window)) return Effect.succeed(undefined)
   return Effect.sync(() => {
@@ -91,13 +99,17 @@ const permitWaitTimeout = Effect.withFiber((fiber) =>
 )
 
 // The caller owns the returned scope and closes it after one statement attempt or transfers it to a transaction.
-export const acquirePermitLease = (semaphore: Semaphore.Semaphore) =>
+export const acquirePermitLease = (
+  semaphore: Semaphore.Semaphore,
+  permits = 1,
+  operation?: RetryOperationState,
+) =>
   Effect.uninterruptibleMask((restore) =>
     Effect.gen(function* () {
       const lease = yield* Scope.make()
       const acquired = yield* Deferred.make<void>()
       const hold = semaphore
-        .withPermits(1)(Effect.andThen(Deferred.succeed(acquired, undefined), Effect.never))
+        .withPermits(permits)(Effect.andThen(Deferred.succeed(acquired, undefined), Effect.never))
         .pipe(Effect.forkScoped({ startImmediately: true }), Effect.asVoid)
       const forked = yield* Effect.exit(Scope.provide(hold, lease))
       if (Exit.isFailure(forked)) {
@@ -106,6 +118,7 @@ export const acquirePermitLease = (semaphore: Semaphore.Semaphore) =>
       }
       if (Deferred.isDoneUnsafe(acquired)) return lease
 
+      if (operation) operation.sawContention = true
       const remainingMs = yield* permitWaitBudget
       if (remainingMs === undefined) {
         const waited = yield* restore(Deferred.await(acquired)).pipe(Effect.exit)
@@ -167,6 +180,87 @@ export const retryWindowStatus = Effect.withFiber((fiber) =>
   }),
 )
 
+export const makeStatementGate = Effect.sync(() => {
+  let active = 0
+  let exclusive = false
+  const waiters = new Set<Deferred.Deferred<void>>()
+  const wake = Effect.gen(function* () {
+    const pending = yield* Effect.sync(() => {
+      const result = Array.from(waiters)
+      waiters.clear()
+      return result
+    })
+    yield* Effect.forEach(pending, (waiter) => Deferred.succeed(waiter, undefined), { discard: true })
+  })
+  const withStatement = <A, E, R>(effect: Effect.Effect<A, E, R>, operation?: RetryOperationState) =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        while (true) {
+          const waiter = yield* Deferred.make<void>()
+          const admitted = yield* Effect.sync(() => {
+            if (exclusive) {
+              waiters.add(waiter)
+              return false
+            }
+            active++
+            return true
+          })
+          if (admitted) break
+          if (operation) operation.sawContention = true
+          const remainingMs = yield* permitWaitBudget
+          const wait =
+            remainingMs === undefined
+              ? Deferred.await(waiter).pipe(Effect.map(Option.some))
+              : Deferred.await(waiter).pipe(Effect.timeoutOption(Duration.millis(remainingMs)))
+          const result = yield* restore(wait).pipe(Effect.exit)
+          yield* Effect.sync(() => waiters.delete(waiter))
+          if (Exit.isFailure(result)) return yield* Effect.failCause(result.cause)
+          if (Option.isNone(result.value)) return yield* Effect.fail(yield* permitWaitTimeout)
+        }
+
+        const result = yield* Effect.exit(restore(effect))
+        const idle = yield* Effect.sync(() => --active === 0)
+        if (idle) yield* wake
+        return yield* result
+      }),
+    )
+  const withExclusive = <A, E, R>(effect: Effect.Effect<A, E, R>, operation?: RetryOperationState) =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        while (true) {
+          const waiter = yield* Deferred.make<void>()
+          const admitted = yield* Effect.sync(() => {
+            if (exclusive || active > 0) {
+              waiters.add(waiter)
+              return false
+            }
+            exclusive = true
+            return true
+          })
+          if (admitted) break
+          if (operation) operation.sawContention = true
+          const remainingMs = yield* permitWaitBudget
+          const wait =
+            remainingMs === undefined
+              ? Deferred.await(waiter).pipe(Effect.map(Option.some))
+              : Deferred.await(waiter).pipe(Effect.timeoutOption(Duration.millis(remainingMs)))
+          const result = yield* restore(wait).pipe(Effect.exit)
+          yield* Effect.sync(() => waiters.delete(waiter))
+          if (Exit.isFailure(result)) return yield* Effect.failCause(result.cause)
+          if (Option.isNone(result.value)) return yield* Effect.fail(yield* permitWaitTimeout)
+          // The driver's active count drops just before its caller resumes with the completed statement.
+          yield* Effect.yieldNow
+        }
+
+        const result = yield* Effect.exit(restore(effect))
+        yield* Effect.sync(() => (exclusive = false))
+        yield* wake
+        return yield* result
+      }),
+    )
+  return { withStatement, withExclusive }
+})
+
 export const lockWaitMs = (error: unknown) => {
   if (!isSqlError(error)) return undefined
   return lockWaits.get(error)
@@ -190,7 +284,12 @@ const isStaleSnapshot = (cause: unknown) =>
 
 // Every SQLite client routes its statements through this one gate. A lock failure that leaves it logs one summary,
 // never one line per attempt, so a contended statement cannot flood the log.
-export const retryLocked = <A>(execute: Effect.Effect<A, SqlError>, sql: string) =>
+export const retryLocked = <A>(
+  execute: Effect.Effect<A, SqlError>,
+  sql: string,
+  resetOnSuccess = true,
+  operation: RetryOperationState = { sawContention: false },
+) =>
   Effect.withFiber((fiber) => {
     const window = Option.getOrUndefined(Context.getOption(fiber.context, RetryWindow))
     return Effect.suspend(() => {
@@ -200,10 +299,11 @@ export const retryLocked = <A>(execute: Effect.Effect<A, SqlError>, sql: string)
       const attempt = Effect.suspend(() => {
         attempts++
         return execute
-      })
+      }).pipe(Effect.provideService(RetryOperation, operation))
       const retryable = (error: SqlError) => error.reason.isRetryable && !isStaleSnapshot(error.reason.cause)
       const withinWindow = (error: SqlError) => {
         if (!retryable(error)) return false
+        operation.sawContention = true
         if (error.reason._tag !== "LockTimeoutError" || !window) return true
         if (isPermitWait(error.reason.cause)) window.sawPermit = true
         else window.sawLock = true
@@ -223,6 +323,10 @@ export const retryLocked = <A>(execute: Effect.Effect<A, SqlError>, sql: string)
             while: withinWindow,
           }),
         ),
+        Effect.tap(() => {
+          if (!resetOnSuccess || !operation.sawContention) return Effect.void
+          return resetRetryWindow.pipe(Effect.andThen(Effect.sync(() => (operation.sawContention = false))))
+        }),
         Effect.tapError((error) => {
           if (error.reason._tag !== "LockTimeoutError") return Effect.void
           const cause: { code?: unknown; errcode?: unknown; errno?: unknown } =
@@ -253,6 +357,11 @@ const statementOperation = (sql: string) => {
   if (operation !== "begin") return operation ?? "unknown"
   const behavior = statement.match(/^begin\s+(deferred|immediate|exclusive)\b/i)?.[1]
   return behavior ? `begin ${behavior.toLowerCase()}` : "begin"
+}
+
+export const isCommitStatement = (sql: string) => {
+  const operation = statementOperation(sql)
+  return operation === "commit" || operation === "end"
 }
 
 const isPermitWait = (cause: unknown) =>

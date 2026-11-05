@@ -9,7 +9,9 @@ export class Drizzle extends Context.Service<Drizzle, DrizzleClient>()("@opencod
 
 export {
   acquirePermitLease,
+  isCommitStatement,
   isBeginStatement,
+  makeStatementGate,
   lockWaitMs,
   resetRetryWindow,
   retryWindowStatus,

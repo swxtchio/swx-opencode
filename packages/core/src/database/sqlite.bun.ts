@@ -132,29 +132,61 @@ const make = (options: Config) =>
     })
 
     const semaphore = yield* Semaphore.make(1)
-    const transactionConnection = (scope: Scope.Scope) => {
-      const state: { lease?: Scope.Closeable } = {}
+    const statementGate = yield* Sqlite.makeStatementGate
+    const reservationSemaphore = yield* Semaphore.make(1)
+    const withStatement = <A, E>(operation: { sawContention: boolean }, effect: Effect.Effect<A, E>) =>
+      statementGate.withStatement(effect, operation)
+    const transactionConnection = (
+      scope: Scope.Scope,
+      initialLease: Scope.Closeable,
+      operation: { sawContention: boolean },
+    ) => {
+      const state: { lease?: Scope.Closeable; transaction: boolean } = { lease: initialLease, transaction: false }
       const retry = <A>(query: string, effect: Effect.Effect<A, SqlError>) =>
         Effect.suspend(() => {
-          if (state.lease) return retryLocked(effect, query)
-          if (!Sqlite.isBeginStatement(query)) return retryLocked(Sqlite.withPermit(semaphore, effect), query)
+          if (state.transaction)
+            return retryLocked(effect, query, Sqlite.isCommitStatement(query), operation)
+          if (!Sqlite.isBeginStatement(query)) {
+            if (state.lease) return retryLocked(effect, query, true, operation)
+            return withStatement(
+              operation,
+              retryLocked(state.lease ? effect : Sqlite.withPermit(semaphore, effect), query, true, operation),
+            )
+          }
           return retryLocked(
             Effect.gen(function* () {
-              const lease = yield* Sqlite.acquirePermitLease(semaphore)
-              const result = yield* Effect.exit(effect)
-              if (Exit.isFailure(result)) {
-                yield* Scope.close(lease, result)
-                return yield* Effect.failCause(result.cause)
+              if (state.lease) {
+                const lease = state.lease
+                state.lease = undefined
+                yield* Scope.close(lease, Exit.void)
               }
-              const registered = yield* Effect.exit(Scope.addFinalizer(scope, Scope.close(lease, Exit.void)))
-              if (Exit.isFailure(registered)) {
-                yield* Scope.close(lease, registered)
-                return yield* Effect.failCause(registered.cause)
-              }
-              state.lease = lease
-              return result.value
+              return yield* statementGate.withExclusive(
+                Effect.uninterruptibleMask((restore) =>
+                  Effect.gen(function* () {
+                    const connectionLease = yield* restore(Sqlite.acquirePermitLease(semaphore, 1, operation))
+                    const registered = yield* Effect.exit(
+                      Scope.addFinalizer(scope, Scope.close(connectionLease, Exit.void)),
+                    )
+                    if (Exit.isFailure(registered)) {
+                      yield* Scope.close(connectionLease, registered)
+                      return yield* Effect.failCause(registered.cause)
+                    }
+                    const result = yield* Effect.exit(restore(effect))
+                    if (Exit.isFailure(result)) {
+                      yield* Scope.close(connectionLease, result)
+                      return yield* Effect.failCause(result.cause)
+                    }
+                    state.lease = connectionLease
+                    state.transaction = true
+                    return result.value
+                  }),
+                ),
+                operation,
+              )
             }),
             query,
+            false,
+            operation,
           )
         })
 
@@ -176,29 +208,34 @@ const make = (options: Config) =>
           return Stream.die("executeStream not implemented")
         },
         export: Effect.suspend(() =>
-          state.lease ? connection.export : Sqlite.withPermit(semaphore, connection.export),
+          state.lease
+            ? connection.export
+            : withStatement(operation, Sqlite.withPermit(semaphore, connection.export)),
         ),
         loadExtension(path) {
           return Effect.suspend(() =>
             state.lease
               ? connection.loadExtension(path)
-              : Sqlite.withPermit(semaphore, connection.loadExtension(path)),
+              : withStatement(operation, Sqlite.withPermit(semaphore, connection.loadExtension(path))),
           )
         },
       })
     }
-    const runWithPermit = <A>(query: string, effect: Effect.Effect<A, SqlError>) =>
-      retryLocked(Sqlite.withPermit(semaphore, effect), query)
-    const lockedConnection = identity<SqliteConnection>({
+    const runWithPermit = <A>(
+      query: string,
+      effect: Effect.Effect<A, SqlError>,
+      operation: { sawContention: boolean },
+    ) => withStatement(operation, retryLocked(Sqlite.withPermit(semaphore, effect), query, true, operation))
+    const lockedConnection = (operation: { sawContention: boolean }) => identity<SqliteConnection>({
       execute(query, params, transformRows) {
-        const result = runWithPermit(query, run(query, params))
+        const result = runWithPermit(query, run(query, params), operation)
         return transformRows ? Effect.map(result, transformRows) : result
       },
       executeRaw(query, params) {
-        return runWithPermit(query, run(query, params))
+        return runWithPermit(query, run(query, params), operation)
       },
       executeValues(query, params) {
-        return runWithPermit(query, runValues(query, params))
+        return runWithPermit(query, runValues(query, params), operation)
       },
       executeUnprepared(query, params, transformRows) {
         return this.execute(query, params, transformRows)
@@ -206,17 +243,42 @@ const make = (options: Config) =>
       executeStream(query, params, transformRows) {
         return connection.executeStream(query, params, transformRows)
       },
-      export: Sqlite.withPermit(semaphore, connection.export),
+      export: withStatement(operation, Sqlite.withPermit(semaphore, connection.export)),
       loadExtension(path) {
-        return Sqlite.withPermit(semaphore, connection.loadExtension(path))
+        return withStatement(operation, Sqlite.withPermit(semaphore, connection.loadExtension(path)))
       },
     })
-    const acquirer = Effect.succeed(lockedConnection)
-    // A failed BEGIN releases the native connection before retry backoff. Once BEGIN succeeds, its lease stays with the
-    // reservation scope so other statements cannot join that transaction.
+    const acquirer = Effect.sync(() => lockedConnection({ sawContention: false }))
+    // Reservations remain exclusive while a failed BEGIN releases the native connection during backoff. A successful
+    // BEGIN keeps the connection lease through the transaction so other statements cannot join it.
     const transactionAcquirer = Effect.gen(function* () {
       const scope = yield* Scope.Scope
-      return transactionConnection(scope)
+      const operation = { sawContention: false }
+      const resources = yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const lease = yield* Scope.make()
+          const acquired = yield* Effect.gen(function* () {
+            const reservation = yield* restore(Sqlite.acquirePermitLease(reservationSemaphore, 1, operation))
+            yield* Scope.addFinalizer(lease, Scope.close(reservation, Exit.void))
+            const connection = yield* restore(
+              statementGate.withExclusive(Sqlite.acquirePermitLease(semaphore, 1, operation), operation),
+            )
+            yield* Scope.addFinalizer(lease, Scope.close(connection, Exit.void))
+            return connection
+          }).pipe(Effect.exit)
+          if (Exit.isFailure(acquired)) {
+            yield* Scope.close(lease, acquired)
+            return yield* Effect.failCause(acquired.cause)
+          }
+          const registered = yield* Effect.exit(Scope.addFinalizer(scope, Scope.close(lease, Exit.void)))
+          if (Exit.isFailure(registered)) {
+            yield* Scope.close(lease, registered)
+            return yield* Effect.failCause(registered.cause)
+          }
+          return acquired.value
+        }),
+      )
+      return transactionConnection(scope, resources, operation)
     })
 
     const client = Object.assign(
