@@ -54,7 +54,10 @@ const verify = async (name, layer) => {
               yield* Deferred.await(holderReady).pipe(
                 Effect.timeoutOrElse({
                   duration: "1 second",
-                  orElse: () => Effect.fail(new Error(`${name} holder did not acquire the permit`)),
+                  orElse: () =>
+                    Effect.fail(
+                      new Error(`${name} holder did not acquire the permit for ${operation.kind} at delay ${delay}`),
+                    ),
                 }),
               )
               const queued = yield* Effect.scoped(Effect.andThen(operation.run(), Effect.yieldNow)).pipe(

@@ -842,6 +842,96 @@ describe("SQLite busy timeout and statement retries", () => {
     )
   }
 
+  for (const clientType of ["bun", "core-node", "standalone-node"] as const) {
+    test.skipIf(clientType !== "bun" && !nodeSqliteDrivers)(
+      `${clientType} retires a recovered permit-contention window before a later contention`,
+      async () => {
+        const windowMs = 500
+        const exit = await Effect.runPromiseExit(
+          Effect.scoped(
+            Sqlite.withFreshRetryWindow(
+              Effect.gen(function* () {
+                const client = yield* sqliteClientForPermitTest(clientType)
+                const holdConnection = (entered: Deferred.Deferred<void>, release: Deferred.Deferred<void>) =>
+                  client
+                    .withTransaction(
+                      Effect.gen(function* () {
+                        yield* Deferred.succeed(entered, undefined)
+                        yield* Deferred.await(release)
+                        return yield* Effect.fail("intentional rollback" as const)
+                      }),
+                    )
+                    .pipe(Effect.catch(() => Effect.void))
+                const awaitPermitWait = Effect.gen(function* () {
+                  while (!(yield* Sqlite.retryWindowStatus).sawPermit) yield* Effect.sleep("1 millis")
+                }).pipe(
+                  Effect.timeoutOrElse({
+                    duration: "1 second",
+                    orElse: () => Effect.fail(new Error(`${clientType} read never waited for the connection permit`)),
+                  }),
+                )
+
+                const firstEntered = yield* Deferred.make<void>()
+                const firstRelease = yield* Deferred.make<void>()
+                yield* Effect.addFinalizer(() => Deferred.succeed(firstRelease, undefined))
+                const firstOwner = yield* holdConnection(firstEntered, firstRelease).pipe(
+                  Effect.forkChild({ startImmediately: true }),
+                )
+                yield* Deferred.await(firstEntered)
+                const firstRead = yield* client.unsafe("SELECT 7").values.pipe(
+                  Effect.forkChild({ startImmediately: true }),
+                )
+                yield* awaitPermitWait
+                yield* Deferred.succeed(firstRelease, undefined)
+                expect(
+                  yield* Fiber.join(firstRead).pipe(
+                    Effect.timeoutOrElse({
+                      duration: "1 second",
+                      orElse: () => Effect.fail(new Error(`${clientType} first read did not recover`)),
+                    }),
+                  ),
+                ).toEqual([[7]])
+                yield* Fiber.join(firstOwner)
+                const afterRecovery = yield* Sqlite.retryWindowStatus
+
+                yield* Effect.sleep(Duration.millis(windowMs + 100))
+
+                const secondEntered = yield* Deferred.make<void>()
+                const secondRelease = yield* Deferred.make<void>()
+                yield* Effect.addFinalizer(() => Deferred.succeed(secondRelease, undefined))
+                const secondOwner = yield* holdConnection(secondEntered, secondRelease).pipe(
+                  Effect.forkChild({ startImmediately: true }),
+                )
+                yield* Deferred.await(secondEntered)
+                const secondRead = yield* client.unsafe("SELECT 7").values.pipe(
+                  Effect.forkChild({ startImmediately: true }),
+                )
+                yield* Effect.yieldNow
+                const beforeRelease = secondRead.pollUnsafe()
+                yield* Deferred.succeed(secondRelease, undefined)
+                const secondResult = yield* Fiber.await(secondRead).pipe(
+                  Effect.timeoutOrElse({
+                    duration: "1 second",
+                    orElse: () => Effect.fail(new Error(`${clientType} second read did not settle after release`)),
+                  }),
+                )
+                yield* Fiber.join(secondOwner)
+
+                expect(beforeRelease).toBeUndefined()
+                expect(Exit.isSuccess(secondResult)).toBe(true)
+                if (Exit.isSuccess(secondResult)) expect(secondResult.value).toEqual([[7]])
+                expect(afterRecovery).toMatchObject({ elapsedMs: 0, sawPermit: false })
+              }),
+              Duration.millis(windowMs),
+            ),
+          ),
+        )
+        if (Exit.isFailure(exit)) throw new Error(Cause.pretty(exit.cause))
+      },
+      10_000,
+    )
+  }
+
   for (const clientType of ["core", "standalone"] as const) {
     nodeSqliteTest(
       `classifies ${clientType} node:sqlite errcode 5 as retryable SQLITE_BUSY`,
