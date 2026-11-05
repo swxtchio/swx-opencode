@@ -95,6 +95,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Database maintenance
 
+- **#411** Recover V1 `SessionPrompt` tool-result and queued-prompt delivery through transient SQLite writer contention. Extend lock retries to one bounded 60-second SessionPrompt window; exclude stale snapshots and never replay transaction bodies. `SessionQueue.consume` retries only pre-body acquisition failures, stops with elapsed lock diagnostics at its own bound, and keeps queued prompts pending. Real-lock coverage spans Bun, Core Node, standalone Node, processor error persistence, and a tool result followed by its queued continuation. _Fork-only._
 - **#395** Partially port the atomic SQLite acquisition behavior from `anomalyco/opencode#60651`
   (`c6056f39312748c633de00ad2c2576b7e042b97d`, downstream `79aafa2f82e7293ba7f2c1222e35b2f58dc5c5ea`; review correction `9f7cc80702fee80e82dd811a35f9b8d16e97ae29`)
   into `packages/core/src/database/sqlite.bun.ts`, `packages/core/src/database/sqlite.node.ts`, and
