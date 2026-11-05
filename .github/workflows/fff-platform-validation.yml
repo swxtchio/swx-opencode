@@ -2,6 +2,7 @@ name: FFF native platform validation
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [swxtch]
     paths:
       - ".github/workflows/fff-platform-validation.yml"
@@ -33,6 +34,7 @@ env:
 jobs:
   windows-fff:
     name: Compiled FFF (${{ matrix.target }})
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     strategy:
       fail-fast: false
       matrix:
@@ -98,6 +100,7 @@ jobs:
 
   nix-node-modules:
     name: Nix node_modules (${{ matrix.system }})
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     strategy:
       fail-fast: false
       matrix:
