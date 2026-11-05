@@ -8476,8 +8476,7 @@ consumeLock.instance(
       const task = yield* prompt
         .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("run the tool") })
         .pipe(Effect.forkChild)
-      // Under host load the mock provider can take ~70 seconds to deliver its first request; this precedes the
-      // lock-boundary deadline below and must not masquerade as a lock-recovery failure.
+      // Provider readiness is outside the SQLite contention interval; keep its deadline independent of the lock boundary below.
       yield* awaitWithTimeout(llm.wait(1), "the tool provider call never started", "75 seconds")
       yield* pollWithTimeout(
         Effect.promise(() => Bun.file(ready).exists()).pipe(Effect.map((exists) => (exists ? (true as const) : undefined))),
