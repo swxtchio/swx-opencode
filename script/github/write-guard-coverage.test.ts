@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { AUDIT_STEPS, normaliseRun } from "../check-workflow-guards"
+import { AUDIT_STEPS, auditJobModeViolations, normaliseRun } from "../check-workflow-guards"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
 
@@ -50,11 +50,11 @@ describe("the audit stays wired into CI", () => {
     expect(normaliseRun(step?.run ?? "")).toBe(normaliseRun(run))
   })
 
-  // GOAL: and the job itself must be able to run at all - no condition, and no
-  // dependency on a job that could be skipped, which reports success too.
-  test("the audit's own job is unconditional and independent", () => {
+  // GOAL: the actual audit job may skip drafts, but its production audit must
+  // accept no condition that can skip a ready PR or a non-PR event.
+  test("the audit's own job has draft-only admission and no dependency", () => {
     const job = auditJob()
-    expect("if" in job).toBe(false)
+    expect(auditJobModeViolations("test.yml", job, true)).toEqual([])
     expect("needs" in job).toBe(false)
   })
 

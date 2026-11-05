@@ -5,11 +5,10 @@ import { existsSync, readFileSync } from "node:fs"
  * GOAL: prove that no inherited upstream workflow can take an outward-facing
  * action from this fork.
  *
- * Delivery path: this runs as a step in test.yml::unit, which today has no
- * `paths:` filter, so every push to the default branch and every pull request
- * is audited. Adding a `paths:` filter to test.yml, or moving this step, would
- * silently stop auditing workflow-only changes - the failure mode being
- * silence rather than a red check.
+ * Delivery path: this runs in test.yml::unit, whose trigger covers
+ * ready_for_review and whose job skips drafts only. It has no `paths:` filter,
+ * so default-branch pushes and eligible PR changes to workflows reach this
+ * audit rather than silently bypassing it.
  *
  * Every job in every workflow must either
  *   - carry the canonical repository guard, so it evaluates false here, or
@@ -22,6 +21,7 @@ import { existsSync, readFileSync } from "node:fs"
  */
 
 const GUARD = "github.repository == 'anomalyco/opencode'"
+const AUDIT_DRAFT_ONLY = "github.event_name != 'pull_request' || !github.event.pull_request.draft"
 
 /**
  * Jobs this fork adapted for its own use and must keep running, keyed
@@ -33,13 +33,13 @@ const GUARD = "github.repository == 'anomalyco/opencode'"
  * guarded on four jobs out of five.
  */
 const ALLOWED = new Map([
-  ["fff-platform-validation.yml::windows-fff", "f04bf8aa6b7a6845"],
-  ["fff-platform-validation.yml::nix-node-modules", "454365e67a9a2ffe"],
-  ["opencode-arm-release-x64.yml::release-proof", "315d54f452773986"],
+  ["fff-platform-validation.yml::windows-fff", "11fe39840e5d4fce"],
+  ["fff-platform-validation.yml::nix-node-modules", "f87c938689a00f8d"],
+  ["opencode-arm-release-x64.yml::release-proof", "7a239a300f47bb1f"],
   ["opencode-arm-release-x64.yml::release-candidate", "73e489a389e0a438"],
-  ["test.yml::unit", "6a6862d7fdea95bc"],
-  ["test.yml::e2e", "3c465d9522c227c8"],
-  ["typecheck.yml::typecheck", "276be38badce0802"],
+  ["test.yml::unit", "55c3194e76dd8b2b"],
+  ["test.yml::e2e", "5b46de6e781ef94b"],
+  ["typecheck.yml::typecheck", "f6f1cdc79c4f4fd5"],
 ])
 
 /**
@@ -63,16 +63,16 @@ const ALLOWED_ACTIONS = new Map([["setup-bun", "23350828cf950200"]])
  * RUNS is part of what is being trusted.
  */
 const ALLOWED_ENVELOPES = new Map([
-  ["fff-platform-validation.yml", "7c3c7fc7328f12b6"],
-  ["opencode-arm-release-x64.yml", "36e0b68540ceff46"],
-  ["test.yml", "0e4560dca190d1b3"],
-  ["typecheck.yml", "783bae590157a011"],
+  ["fff-platform-validation.yml", "3eca2642e255cc98"],
+  ["opencode-arm-release-x64.yml", "41f0150b7a5fad3b"],
+  ["test.yml", "b0b45a9edd4732e1"],
+  ["typecheck.yml", "929818fcd23e9884"],
 ])
 
 /**
  * The workflow carrying this audit, and the property that has to hold for the
- * audit to mean anything: it must run on every pull request and every push to
- * the default branch, with nothing narrowing which paths trigger it.
+ * audit to mean anything: ready pull requests and default-branch pushes reach
+ * it, with nothing narrowing which paths trigger it.
  *
  * Checked structurally rather than by digest alone, because the digest only
  * says "someone changed this" - it does not say which change would be harmful.
@@ -461,10 +461,8 @@ function scanTopLevel(expression: string): "has-or" | "no-or" | "malformed" {
 }
 
 /**
- * The audit is only worth anything if it actually runs. Its own workflow must
- * fire on every pull request and every push, unnarrowed by a path filter -
- * otherwise a workflow-only change, which is exactly what this audits, would
- * sail through untested.
+ * Workflow-only changes must reach this audit on ready PRs and default-branch
+ * pushes, without path filters that could hide them.
  */
 export function auditWorkflowViolations(file: string, on: unknown): Violation[] {
   const problem = (reason: string): Violation => ({ workflow: file, job: "-", reason, found: "" })
@@ -499,7 +497,16 @@ export function auditWorkflowViolations(file: string, on: unknown): Violation[] 
       continue
     }
     const config = triggers[event]
-    if (!config || typeof config !== "object") continue
+    if (!config || typeof config !== "object") {
+      if (event === "pull_request")
+        found.push(
+          problem(
+            "this audit's own workflow does not fire on pull_request activity ready_for_review, " +
+              "so a change can reach a pull request unaudited",
+          ),
+        )
+      continue
+    }
     const filters = config as Record<string, unknown>
 
     for (const filter of ["paths", "paths-ignore"]) {
@@ -527,15 +534,15 @@ export function auditWorkflowViolations(file: string, on: unknown): Violation[] 
         problem("this audit's own workflow restricts `push` to tags, so pushes to the default branch are not audited"),
       )
 
-    // Narrowing `types` stops the trigger firing for the activity that
-    // matters: a pull request being opened or updated.
     const types = asList(filters["types"])
-    if (event === "pull_request" && types) {
-      const required = ["opened", "synchronize"].filter((type) => !types.includes(type))
+    if (event === "pull_request") {
+      const required = types
+        ? ["opened", "synchronize", "reopened", "ready_for_review"].filter((type) => !types.includes(type))
+        : ["ready_for_review"]
       if (required.length)
         found.push(
           problem(
-            `this audit's own workflow narrows \`pull_request\` types and no longer fires on ` +
+            `this audit's own workflow does not fire on pull_request activity ` +
               `${required.join(" or ")}, so a change can reach a pull request unaudited`,
           ),
         )
@@ -601,7 +608,7 @@ function matchesGlob(pattern: string, value: string): boolean {
 }
 
 /**
- * The audit's own job must be ALLOWLISTED, not guarded.
+ * The audit's own job stays allowlisted and uses only the draft-PR exclusion.
  *
  * kimi-k3's E2, and the purest instance of this branch's recurring defect.
  * Add the repository guard to `test.yml::unit` and drop its ALLOWED row, and
@@ -627,16 +634,8 @@ export function auditJobModeViolations(file: string, job: unknown, allowlisted: 
       ),
     )
 
-  // Unconditional, not merely unguarded.
-  //
-  // This first checked whether the condition contained the guard - asserting
-  // one spelling where the requirement is a behaviour, which is the ninth
-  // instance of this branch's recurring defect and the second inside a fix for
-  // the eighth. sol found it: `if: false` on this job, or any condition at all,
-  // skips it, and GitHub reports a job skipped by its own `if` as SUCCESS even
-  // when required. Every other control - the step attestation, the digests,
-  // these tests - runs INSIDE this job, so a skip takes all of them with it and
-  // the check reports nothing.
+  // The audit job may skip draft pull requests, but it must still run for ready
+  // pull requests and non-PR events. GitHub reports skipped jobs as success.
   // `needs` skips this job when the needed job is skipped, and GitHub reports
   // THAT as success too - so a guarded one-line `gate` job upstream of this one
   // retires the whole audit without ever touching its `if`. glm-5.3's finding,
@@ -675,17 +674,18 @@ export function auditJobModeViolations(file: string, job: unknown, allowlisted: 
     }
   }
 
-  if (job !== null && typeof job === "object" && "if" in job) {
+  if (job !== null && typeof job === "object") {
     const condition = conditionOf((job as { if?: unknown }).if)
-    found.push(
-      problem(
-        condition.includes(GUARD)
-          ? "the audit's own job carries the repository guard, so it never runs in this fork " +
-              "and neither does this check. Allowlist it instead"
-          : "the audit's own job has a condition. It must be unconditional: a job skipped by its " +
-              "own `if` reports success, and every check in this file runs inside it",
-      ),
-    )
+    const normalized = stripWrappingParens(stripExpressionSyntax(condition.replace(/\s+/g, " ").trim()))
+    if (normalized !== AUDIT_DRAFT_ONLY)
+      found.push(
+        problem(
+          condition.includes(GUARD)
+            ? "the audit's own job carries the repository guard, so it never runs in this fork " +
+                "and neither does this check. Allowlist it instead"
+            : "the audit's own job condition must be draft-only, so it still runs for ready PRs and non-PR events",
+        ),
+      )
   }
 
   return found
@@ -1030,8 +1030,8 @@ async function main() {
   }
   console.error(`\nEach job needs  if: ${GUARD}  on its own, or as`)
   console.error(`  if: ${GUARD} && (<the existing condition>)`)
-  console.error(`The one exception is ${AUDIT_WORKFLOW}::${AUDIT_JOB}, which runs this check: it must stay`)
-  console.error(`in ALLOWED and must NOT be guarded, or the check stops running in this fork.`)
+  console.error(`The one exception is ${AUDIT_WORKFLOW}::${AUDIT_JOB}, which runs this check: it must stay in ALLOWED`)
+  console.error(`and may skip draft pull_request activity only; ready PRs and non-PR events must still run it.`)
   console.error(`Otherwise add the job to ALLOWED in this script, keyed <workflow>::<job>`)
   console.error(`with the digest the failure above prints, if this fork genuinely needs it to run.`)
   process.exit(1)

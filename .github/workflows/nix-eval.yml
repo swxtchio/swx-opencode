@@ -4,6 +4,7 @@ on:
   push:
     branches: [dev]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [dev]
   workflow_dispatch:
 
@@ -16,7 +17,7 @@ permissions:
 
 jobs:
   nix-eval:
-    if: github.repository == 'anomalyco/opencode'
+    if: github.repository == 'anomalyco/opencode' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:

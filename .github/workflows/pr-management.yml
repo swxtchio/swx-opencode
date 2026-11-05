@@ -2,11 +2,11 @@ name: pr-management
 
 on:
   pull_request_target:
-    types: [opened]
+    types: [opened, ready_for_review]
 
 jobs:
   check-duplicates:
-    if: github.repository == 'anomalyco/opencode'
+    if: github.repository == 'anomalyco/opencode' && (github.event_name != 'pull_request_target' || !github.event.pull_request.draft)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: read
@@ -73,7 +73,7 @@ jobs:
           fi
 
   add-contributor-label:
-    if: github.repository == 'anomalyco/opencode'
+    if: github.repository == 'anomalyco/opencode' && (github.event_name != 'pull_request_target' || !github.event.pull_request.draft)
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write

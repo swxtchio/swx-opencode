@@ -2,11 +2,11 @@ name: pr-standards
 
 on:
   pull_request_target:
-    types: [opened, edited, synchronize]
+    types: [opened, edited, synchronize, ready_for_review]
 
 jobs:
   check-standards:
-    if: github.repository == 'anomalyco/opencode'
+    if: github.repository == 'anomalyco/opencode' && (github.event_name != 'pull_request_target' || !github.event.pull_request.draft)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -154,7 +154,7 @@ jobs:
             console.log('PR meets all standards');
 
   check-compliance:
-    if: github.repository == 'anomalyco/opencode'
+    if: github.repository == 'anomalyco/opencode' && (github.event_name != 'pull_request_target' || !github.event.pull_request.draft)
     runs-on: ubuntu-latest
     permissions:
       contents: read
