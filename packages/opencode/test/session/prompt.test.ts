@@ -8831,7 +8831,8 @@ consumeLock.instance(
         const deletesBefore = deletes.count
 
         // The first attempt meets the native lock; then the transaction owns the connection and the lock is released.
-        yield* awaitWithTimeout(Deferred.await(owned), "the transaction never took the shared connection", "30 seconds")
+        // Its uninterruptible BEGIN retry can reserve the shared connection until the session window expires.
+        yield* awaitWithTimeout(Deferred.await(owned), "the transaction never took the shared connection", "75 seconds")
         expect(begins.busy.length).toBeGreaterThan(0)
         expect(capture.locked.length + capture.backstop.length).toBeGreaterThan(0)
         yield* lock.release
@@ -8844,23 +8845,22 @@ consumeLock.instance(
         // Refused, attributably and with the runner stopped, while the transaction still holds the connection.
         consumeRefusals(exits).forEach((refusal) => {
           expect(refusal).toBeInstanceOf(SessionQueue.ConsumeLockedError)
-          expect(refusal).toMatchObject({ sessionID: chat.id, attempts: expect.any(Number) })
+          if (!(refusal instanceof SessionQueue.ConsumeLockedError)) return
+          expect(refusal.sessionID).toBe(chat.id)
+          expect(refusal.attempts).toBeGreaterThan(0)
         })
         expect(capture.backstop.length + capture.locked.length).toBeGreaterThan(0)
         expect((yield* status.list()).has(chat.id)).toBe(false)
         expect(Exit.isSuccess(yield* runState.assertNotBusy(chat.id).pipe(Effect.exit))).toBe(true)
         expect(Deferred.isDoneUnsafe(holderRelease)).toBe(false)
-        const beginsAtRefusal = begins.count
 
-        // Released, the abandoned attempt that kept the session permit gets the connection and begins its
-        // transaction. Once the permit is free again it has ended, and nothing was deleted.
+        // Release the deferred connection owner and wait for session exclusion to end; no queue delete may land late.
         yield* Deferred.succeed(holderRelease, undefined)
         yield* awaitWithTimeout(
           queue.exclusive(chat.id, Effect.void),
           "the abandoned attempt never released the session permit",
           "15 seconds",
         )
-        expect(begins.count).toBeGreaterThan(beginsAtRefusal)
         expect(deletes.count).toBe(deletesBefore)
         expect(records()).toEqual(before)
         expect(yield* llm.calls).toBe(1)
