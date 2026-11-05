@@ -8476,7 +8476,9 @@ consumeLock.instance(
       const task = yield* prompt
         .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("run the tool") })
         .pipe(Effect.forkChild)
-      yield* awaitWithTimeout(llm.wait(1), "the tool provider call never started", "10 seconds")
+      // Under host load the mock provider can take ~70 seconds to deliver its first request; this precedes the
+      // lock-boundary deadline below and must not masquerade as a lock-recovery failure.
+      yield* awaitWithTimeout(llm.wait(1), "the tool provider call never started", "75 seconds")
       yield* pollWithTimeout(
         Effect.promise(() => Bun.file(ready).exists()).pipe(Effect.map((exists) => (exists ? (true as const) : undefined))),
         "the tool side effect never reached its hold point",
@@ -8511,17 +8513,20 @@ consumeLock.instance(
 
       // The lock and a failed BEGIN are observed before crossing the prior retry window.
       yield* Effect.sleep("12 seconds")
-      expect(yield* lock.isHeld).toBe(true)
-      expect(attempts.busy.length).toBeGreaterThan(firstBusy)
-      expect((yield* status.get(chat.id)).type).toBe("busy")
+      const lockHeldAtBoundary = yield* lock.isHeld
+      const attemptsAtBoundary = attempts.busy.length
+      const statusAtBoundary = yield* status.get(chat.id)
       const blockedTool = reader
         .query<{ status: string }, [string]>(
           "select json_extract(data, '$.state.status') as status from part where session_id = ? and json_extract(data, '$.tool') = 'bash'",
         )
         .get(chat.id)
-      expect(blockedTool?.status).toBe("running")
 
       yield* lock.releaseAndProbe
+      expect(lockHeldAtBoundary).toBe(true)
+      expect(attemptsAtBoundary).toBeGreaterThan(firstBusy)
+      expect(statusAtBoundary.type).toBe("busy")
+      expect(blockedTool?.status).toBe("running")
       expect(yield* lock.isHeld).toBe(false)
       const [taskReply, continuationReply] = yield* awaitWithTimeout(
         Effect.all([Fiber.join(task), Fiber.join(continuation)]),
@@ -8555,7 +8560,7 @@ consumeLock.instance(
       const queue = yield* SessionQueue.Service
       expect(yield* queue.list(chat.id)).toEqual([])
     }),
-  75_000,
+  180_000,
 )
 
 // `onAttemptFailure` runs inline with a refused acquisition, before the consume makes its next attempt.
