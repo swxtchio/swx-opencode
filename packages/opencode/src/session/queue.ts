@@ -454,13 +454,15 @@ const layer = Layer.effect(
     // snapshot in assertWritableIn, and a commit by another writer while its
     // write waits on the lock would leave that snapshot stale.
     const writable = <A, E>(sessionID: SessionID, effect: (tx: DatabaseTransaction) => Effect.Effect<A, E>) =>
-      db.transaction(
-        (tx) =>
-          Effect.gen(function* () {
-            yield* EventV2.assertWritableIn(tx, sessionID)
-            return yield* effect(tx)
-          }),
-        { behavior: "immediate" },
+      Sqlite.withRetryWindow(
+        db.transaction(
+          (tx) =>
+            Effect.gen(function* () {
+              yield* EventV2.assertWritableIn(tx, sessionID)
+              return yield* effect(tx)
+            }),
+          { behavior: "immediate" },
+        ),
       )
 
     const exclusive: Interface["exclusive"] = (sessionID, effect) => semaphore(locks, sessionID).withPermit(effect)
@@ -1142,32 +1144,34 @@ const layer = Layer.effect(
         Effect.sync(() => {
           if (key && preparations.get(key) === owner) preparations.delete(key)
         })
-      return Effect.acquireUseRelease(
-        exclusive(
-          input.sessionID,
-          Effect.gen(function* () {
-            yield* assertFreshIdentityLocked(input.sessionID, input.messageID)
-            const owner = Symbol()
-            if (key) preparations.set(key, owner)
-            return owner
-          }),
+      return Sqlite.withRetryWindow(
+        Effect.acquireUseRelease(
+          exclusive(
+            input.sessionID,
+            Effect.gen(function* () {
+              yield* assertFreshIdentityLocked(input.sessionID, input.messageID)
+              const owner = Symbol()
+              if (key) preparations.set(key, owner)
+              return owner
+            }),
+          ),
+          (owner) =>
+            Effect.gen(function* () {
+              // A caller interrupt must not abandon native IO or hook promises and reopen the identity.
+              const prepared = yield* input.prepare().pipe(Effect.uninterruptible)
+              return yield* exclusive(
+                input.sessionID,
+                Effect.gen(function* () {
+                  // Handoff to durable custody is serialized, but shell and hook IO never hold the session permit.
+                  yield* release(owner)
+                  yield* assertFreshIdentityLocked(input.sessionID, input.messageID)
+                  const own = yield* admitLocked(prepared)
+                  return { input: prepared, own }
+                }),
+              )
+            }),
+          release,
         ),
-        (owner) =>
-          Effect.gen(function* () {
-            // A caller interrupt must not abandon native IO or hook promises and reopen the identity.
-            const prepared = yield* input.prepare().pipe(Effect.uninterruptible)
-            return yield* exclusive(
-              input.sessionID,
-              Effect.gen(function* () {
-                // Handoff to durable custody is serialized, but shell and hook IO never hold the session permit.
-                yield* release(owner)
-                yield* assertFreshIdentityLocked(input.sessionID, input.messageID)
-                const own = yield* admitLocked(prepared)
-                return { input: prepared, own }
-              }),
-            )
-          }),
-        release,
       )
     }
 
@@ -2993,7 +2997,7 @@ const layer = Layer.effect(
             new ConsumeLockedError({
               sessionID,
               attempts,
-              message: `${sawLock || current.sawLock ? "SQLite lock contention" : "SQLite write acquisition"} persisted for ${waitedMs} ms while SessionQueue.consume tried to begin its write; session ${sessionID} stopped, and its queued prompts stay pending until it is prompted again`,
+              message: `${sawLock || current.sawLock ? "SQLite lock contention" : current.sawPermit ? "SQLite connection acquisition" : "SQLite write acquisition"} persisted for ${waitedMs} ms while SessionQueue.consume tried to begin its write; session ${sessionID} stopped, and its queued prompts stay pending until it is prompted again`,
             }),
           )
       }

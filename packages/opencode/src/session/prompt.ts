@@ -2063,7 +2063,7 @@ const layer = Layer.effect(
           }),
         ))
       return yield* drain(input.sessionID, undefined, messageID, input.messageID !== undefined).pipe(Effect.orDie)
-    })
+    }, Sqlite.withRetryWindow)
 
     // Runs or joins the session's drain. With `own`, returns the reply the turn
     // that prompt joined recorded for it: the drain's final message may answer
@@ -2185,7 +2185,7 @@ const layer = Layer.effect(
       // gets the run's final message, as every caller did before the queue. A
       // prompt still pending on a parked session gets it from the re-drain.
       return yield* withdrawn.pipe(Effect.as(result))
-    })
+    }, Sqlite.withRetryWindow)
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
       "SessionPrompt.shell",

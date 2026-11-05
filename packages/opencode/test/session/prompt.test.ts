@@ -8565,6 +8565,118 @@ consumeLock.instance(
   180_000,
 )
 
+consumeLock.instance(
+  "a loop-started tool result that outlasts its SQLite window fails visibly and keeps queued work",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const queue = yield* SessionQueue.Service
+      const status = yield* SessionStatus.Service
+      const runState = yield* SessionRunState.Service
+      const chat = yield* sessions.create({
+        title: "Persistent loop tool result lock",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* queue.hold(chat.id, "persistent-test")
+      yield* Effect.addFinalizer(() => queue.release(chat.id, "persistent-test").pipe(Effect.asVoid))
+      const root = yield* seedUser({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: said("run the tool from an explicit loop"),
+      })
+      const marker = path.join(dir, "tool-runs.txt")
+      const ready = path.join(dir, "tool-ready")
+      const release = path.join(dir, "tool-release")
+      yield* Effect.addFinalizer(() => Effect.promise(() => writeFile(release, "release")))
+      const reader = new Sqlite(consumeLockDbPath, { readonly: true })
+      yield* Effect.addFinalizer(() => Effect.sync(() => reader.close()))
+
+      const attempts = newStatementAttempts()
+      yield* patchBunQuery((sql) => sql === "begin immediate", attempts)
+      yield* llm.push(
+        reply().tool("bash", {
+          command: `printf 'ran\\n' >> "${marker}"; touch "${ready}"; while [ ! -e "${release}" ]; do sleep 0.01; done; printf 'tool-output-not-persisted'`,
+          description: "Hold the tool result until the persistent-lock test releases it",
+        }),
+      )
+      yield* llm.text("must not continue after the refused tool-result write")
+
+      const loop = yield* prompt.loop({ sessionID: chat.id, messageID: root.info.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "the loop-started provider call never started", "75 seconds")
+      yield* pollWithTimeout(
+        Effect.promise(() => Bun.file(ready).exists()).pipe(Effect.map((exists) => (exists ? (true as const) : undefined))),
+        "the tool side effect never reached its hold point",
+        "10 seconds",
+      )
+
+      const queued = yield* queue.admit({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        delivery: "queue",
+        parts: said("continue after the persistent lock"),
+      })
+      const lock = yield* writeLockHold()
+      yield* lock.take(chat.id)
+      yield* Effect.addFinalizer(() => lock.release)
+      yield* Effect.promise(() => writeFile(release, "release"))
+      yield* pollWithTimeout(
+        Effect.sync(() => (attempts.busy.length > 0 ? true : undefined)),
+        "the loop's tool-result transaction never met the held SQLite lock",
+        "10 seconds",
+      )
+
+      const firstBusy = attempts.busy.length
+      const startedAt = performance.now()
+      yield* awaitWithTimeout(
+        Fiber.await(loop),
+        "the loop did not stop when its SQLite retry window expired",
+        "75 seconds",
+      )
+      const elapsedMs = performance.now() - startedAt
+      expect(elapsedMs).toBeGreaterThanOrEqual(55_000)
+      expect(elapsedMs).toBeLessThan(75_000)
+      expect(yield* lock.isHeld).toBe(true)
+      expect(attempts.busy.length).toBeGreaterThan(firstBusy)
+      expect((yield* status.get(chat.id)).type).toBe("idle")
+      expect(Exit.isSuccess(yield* runState.assertNotBusy(chat.id).pipe(Effect.exit))).toBe(true)
+      expect(
+        reader
+          .query<{ id: string; time_promoted: number | null; message_id: string | null }, [string]>(
+            "select id, time_promoted, message_id from session_prompt_queue where session_id = ?",
+          )
+          .all(chat.id),
+      ).toEqual([{ id: queued.id, time_promoted: null, message_id: null }])
+      expect(
+        reader
+          .query<{ status: string }, [string]>(
+            "select json_extract(data, '$.state.status') as status from part where session_id = ? and json_extract(data, '$.tool') = 'bash'",
+          )
+          .get(chat.id)?.status,
+      ).toBe("running")
+      expect(yield* Effect.promise(() => Bun.file(marker).text())).toBe("ran\n")
+      expect(yield* llm.calls).toBe(1)
+
+      yield* lock.releaseAndProbe
+      const terminal = yield* pollWithTimeout(
+        sessions.messages({ sessionID: chat.id }).pipe(
+          Effect.map((messages) =>
+            messages.findLast((message) => message.info.role === "assistant" && message.info.error !== undefined),
+          ),
+        ),
+        "the failed assistant was not persisted after the lock was released",
+        "15 seconds",
+      )
+      if (terminal.info.role !== "assistant" || terminal.info.error?.name !== "UnknownError")
+        throw new Error("persistent turn lock did not leave a named assistant error")
+      expect(terminal.info.error.data.message).toMatch(/^Database is locked \(SQLITE_BUSY\) after \d+ ms$/)
+    }),
+  240_000,
+)
+
 // `onAttemptFailure` runs inline with a refused acquisition, before the consume makes its next attempt.
 const captureConsumeLogs = Effect.fn("test.captureConsumeLogs")(function* (onAttemptFailure?: () => void) {
   const locked: unknown[] = []
