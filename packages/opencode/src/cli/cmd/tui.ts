@@ -10,6 +10,7 @@ import { withNetworkOptions, resolveNetworkOptionsNoConfig, hasArg } from "@/cli
 import { Filesystem } from "@/util/filesystem"
 import type { GlobalEvent } from "@opencode-ai/sdk/v2"
 import type { EventSource } from "@opencode-ai/tui/context/sdk"
+import { ProcessGroup } from "../tui/process-group"
 import { writeHeapSnapshot } from "v8"
 import { ServerAuth } from "@/server/auth"
 import { validateSession } from "../tui/validate-session"
@@ -193,6 +194,7 @@ export const TuiThreadCommand = cmd({
     }
 
     const unguard = win32InstallCtrlCGuard()
+    let stopWorker: (() => Promise<void>) | undefined
     try {
       const { TuiConfig } = await import("@/config/tui")
       if (args.fork && !args.continue && !args.session) {
@@ -219,6 +221,20 @@ export const TuiThreadCommand = cmd({
         ),
       })
       const client = Rpc.client<typeof rpc>(worker)
+      const ownedGroups = new Map<number, ProcessGroup.Event>()
+      const killOwnedGroups = () => ProcessGroup.signalOwned(ownedGroups.values())
+      const removeGroupListener = client.on<ProcessGroup.Event>("process.group", (event) => {
+        if (event.action === "acquire") {
+          ownedGroups.set(event.pgid, event)
+          return void client.call("ackProcessGroup", { eventID: event.eventID }).catch(() => {})
+        }
+        const current = ownedGroups.get(event.pgid)
+        if (current && ProcessGroup.sameIdentity(current.identity, event.identity)) ownedGroups.delete(event.pgid)
+        void client.call("ackProcessGroup", { eventID: event.eventID }).catch(() => {})
+      })
+      const processExit = () => killOwnedGroups()
+      process.once("exit", processExit)
+      worker.onerror = () => killOwnedGroups()
       const reload = () => {
         client.call("reload", undefined).catch(() => {})
       }
@@ -229,9 +245,17 @@ export const TuiThreadCommand = cmd({
         if (stopped) return
         stopped = true
         process.off("SIGUSR2", reload)
-        await withTimeout(client.call("shutdown", undefined), 5000).catch(() => {})
+        const shutdown = await withTimeout(client.call("shutdown", undefined), 5000).then(
+          () => true,
+          () => false,
+        )
+        if (!shutdown || ownedGroups.size > 0)
+          await ProcessGroup.killOwned(ownedGroups).catch(() => killOwnedGroups())
         worker.terminate()
+        process.off("exit", processExit)
+        removeGroupListener()
       }
+      stopWorker = stop
 
       const prompt = await input(args.prompt)
       const config = await TuiConfig.get()
@@ -307,8 +331,12 @@ export const TuiThreadCommand = cmd({
       }
     } finally {
       try {
-        unguard?.()
-      } catch {}
+        if (stopWorker) await stopWorker()
+      } finally {
+        try {
+          unguard?.()
+        } catch {}
+      }
     }
     process.exit()
   },
