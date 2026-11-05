@@ -134,7 +134,6 @@ const make = (options: Config) =>
 
     const semaphore = yield* Semaphore.make(1)
     const statementGate = yield* Sqlite.makeStatementGate
-    const reservationSemaphore = yield* Semaphore.make(1)
     const withStatement = <A, E>(operation: { sawContention: boolean }, effect: Effect.Effect<A, E>) =>
       statementGate.withStatement(effect, operation)
     const transactionConnection = (
@@ -244,36 +243,25 @@ const make = (options: Config) =>
       },
     })
     const acquirer = Effect.sync(() => lockedConnection({ sawContention: false }))
-    // Reservations remain exclusive while a failed BEGIN releases the native connection during backoff. A successful
-    // BEGIN keeps the connection lease through the transaction so other statements cannot join it.
+    // A failed BEGIN owns the connection only for that native attempt. After BEGIN succeeds, its lease stays with the
+    // transaction scope so other statements cannot join it.
     const transactionAcquirer = Effect.gen(function* () {
       const scope = yield* Scope.Scope
       const operation = { sawContention: false }
-      const resources = yield* Effect.uninterruptibleMask((restore) =>
+      const connectionLease = yield* Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
-          const lease = yield* Scope.make()
-          const acquired = yield* Effect.gen(function* () {
-            const reservation = yield* restore(Sqlite.acquirePermitLease(reservationSemaphore, 1, operation))
-            yield* Scope.addFinalizer(lease, Scope.close(reservation, Exit.void))
-            const connection = yield* restore(
-              statementGate.withExclusive(Sqlite.acquirePermitLease(semaphore, 1, operation), operation),
-            )
-            yield* Scope.addFinalizer(lease, Scope.close(connection, Exit.void))
-            return connection
-          }).pipe(Effect.exit)
-          if (Exit.isFailure(acquired)) {
-            yield* Scope.close(lease, acquired)
-            return yield* Effect.failCause(acquired.cause)
-          }
+          const lease = yield* restore(
+            statementGate.withExclusive(Sqlite.acquirePermitLease(semaphore, 1, operation), operation),
+          )
           const registered = yield* Effect.exit(Scope.addFinalizer(scope, Scope.close(lease, Exit.void)))
           if (Exit.isFailure(registered)) {
             yield* Scope.close(lease, registered)
             return yield* Effect.failCause(registered.cause)
           }
-          return acquired.value
+          return lease
         }),
       )
-      return transactionConnection(scope, resources, operation)
+      return transactionConnection(scope, connectionLease, operation)
     })
 
     const client = Object.assign(

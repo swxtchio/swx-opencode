@@ -507,6 +507,81 @@ describe("SQLite permit acquisition interruption", () => {
       },
       10_000,
     )
+
+    test.skipIf(clientType !== "bun" && !nodeSqliteDrivers)(
+      `${clientType} lets a deferred read transaction finish while BEGIN IMMEDIATE retries a real lock`,
+      async () => {
+        await using tmp = await tmpdir()
+        const filename = path.join(tmp.path, `${clientType}-deferred-read-during-begin.sqlite`)
+        const writerSql = "BEGIN IMMEDIATE"
+        const exit = await Effect.runPromiseExit(
+          Effect.scoped(
+            Sqlite.withFreshRetryWindow(
+              Effect.gen(function* () {
+                const attempts = newStatementAttempts()
+                const client = yield* clientWithAttemptCount({
+                  clientType,
+                  filename,
+                  statement: writerSql,
+                  attempts,
+                })
+                yield* client.unsafe("CREATE TABLE busy_retry_test (id INTEGER PRIMARY KEY, value TEXT NOT NULL)").raw
+                const holder = yield* Effect.promise(() =>
+                  startLockHolder(filename, clientType === "bun" ? bunHolderScript : nodeHolderScript),
+                )
+                yield* Effect.addFinalizer(() => Effect.promise(() => holder.release()))
+
+                const transactionScope = yield* Scope.make()
+                yield* Effect.addFinalizer(() => Scope.close(transactionScope, Exit.void))
+                const connection = yield* Scope.provide(client.reserve, transactionScope)
+                const writer = yield* connection
+                  .executeUnprepared(writerSql, [], undefined)
+                  .pipe(Effect.forkChild({ startImmediately: true }))
+                yield* Effect.gen(function* () {
+                  while (attempts.count < 2) yield* Effect.sleep("1 millis")
+                }).pipe(
+                  Effect.timeoutOrElse({
+                    duration: "2 seconds",
+                    orElse: () => Effect.fail(new Error(`${clientType} writer did not reach BEGIN IMMEDIATE retry`)),
+                  }),
+                )
+                expect(writer.pollUnsafe()).toBeUndefined()
+
+                const deferredRead = yield* client
+                  .withTransaction(client.unsafe("SELECT COUNT(*) FROM busy_retry_test").values)
+                  .pipe(Effect.forkChild({ startImmediately: true }))
+                const read = yield* Fiber.await(deferredRead).pipe(
+                  Effect.timeoutOrElse({
+                    duration: "1 second",
+                    orElse: () =>
+                      Effect.fail(
+                        new Error(`${clientType} deferred read waited behind a writer whose BEGIN has not succeeded`),
+                      ),
+                  }),
+                )
+                expect(Exit.isSuccess(read)).toBe(true)
+                if (Exit.isSuccess(read)) expect(read.value).toEqual([[0]])
+                expect(writer.pollUnsafe()).toBeUndefined()
+
+                yield* Effect.promise(() => holder.release())
+                const writerExit = yield* Fiber.await(writer).pipe(
+                  Effect.timeoutOrElse({
+                    duration: "2 seconds",
+                    orElse: () => Effect.fail(new Error(`${clientType} writer did not finish after lock release`)),
+                  }),
+                )
+                expect(Exit.isSuccess(writerExit)).toBe(true)
+                if (!Exit.isSuccess(writerExit)) return
+                yield* connection.executeUnprepared("ROLLBACK", [], undefined)
+              }),
+              Duration.seconds(5),
+            ),
+          ),
+        )
+        if (Exit.isFailure(exit)) throw new Error(Cause.pretty(exit.cause))
+      },
+      15_000,
+    )
   }
 })
 
