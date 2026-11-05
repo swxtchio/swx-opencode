@@ -45,15 +45,18 @@ describe("plugin.openai.ws", () => {
     ).rejects.toThrow("WebSocket connect timed out")
   })
 
-  test("surfaces websocket upgrade rejection messages", async () => {
+  test("surfaces websocket upgrade rejection status", async () => {
     await using server = await createRejectingWebSocketServer(() => {})
 
-    await expect(
-      OpenAIWebSocket.connectResponsesWebSocket({
-        url: server.wsUrl,
-        headers: {},
-      }),
-    ).rejects.toThrow("Expected 101 status code")
+    const error = await OpenAIWebSocket.connectResponsesWebSocket({
+      url: server.wsUrl,
+      headers: {},
+    }).catch((error: unknown) => error)
+
+    expect(error).toBeInstanceOf(Error)
+    if (!(error instanceof Error)) throw new Error("Expected a websocket upgrade rejection")
+    // The fixture responds with HTTP 401; do not pin Bun's wording for the rejected upgrade.
+    expect(error.message).toContain("401")
   })
 
   test("enforces websocket send idle timeout", async () => {

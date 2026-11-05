@@ -1,0 +1,16 @@
+{
+  "method": "binary-runtime-strings",
+  "compiler_version": "1.4.4",
+  "compiler_revision": "38afee6c84fcf48c0edb2466aa4b27d287a59c30",
+  "embedded_version_command": "BUN_BE_BUN=1 <candidate> --version",
+  "embedded_version_output": "1.4.4",
+  "embedded_version_exit_status": 0,
+  "embedded_revision_command": "BUN_BE_BUN=1 <candidate> --revision",
+  "embedded_revision_output": "1.4.4+38afee6c8",
+  "embedded_revision_exit_status": 0,
+  "matches_compiler": false,
+  "fallback_matches": {
+    "version_match": "Bun v1.4.4 (Linux x64)",
+    "revision_match": "38afee6c84fcf48c0edb2466aa4b27d287a59c30"
+  }
+}

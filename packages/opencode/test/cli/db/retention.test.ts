@@ -146,7 +146,7 @@ class RetentionProducerTimeout extends Error {
   constructor(
     readonly pid: number,
     readonly timeout: number,
-    readonly signal: string | null,
+    readonly signal: string | number | null,
   ) {
     super(`retention producer timed out after ${timeout}ms (pid ${pid}, signal ${signal ?? "<absent>"})`)
     this.name = "RetentionProducerTimeout"

@@ -1,0 +1,6 @@
+Host: vm14-001
+Remote task directory: /tmp/fm-oc-bun-update-392-ad3fde78c5-arm64-full1
+Result: removed by the leased qualification command after archive, provenance and native-probe evidence were copied and their hashes acknowledged.
+Read-back: a subsequent SSH `test ! -e` confirmed the task directory was absent.
+Build lease release: lease-build-release.json
+Qualification lease release: lease-release.json

@@ -51,7 +51,7 @@ const ALLOWED = new Map([
  * add a `paths:` filter to test.yml and workflow-only changes stop being
  * audited, silently.
  */
-const ALLOWED_ACTIONS = new Map([["setup-bun", "761c61a6a87fd34a"]])
+const ALLOWED_ACTIONS = new Map([["setup-bun", "23350828cf950200"]])
 
 /**
  * Digest of each local composite action an allowlisted job calls out to.
