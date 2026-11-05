@@ -142,18 +142,27 @@ Newest first. Each entry names the upstream range brought in.
   payload is complete; #59411's payload is partial because its upstream CLI shutdown-deadline module is absent here
   and was not imported. `packages/core/src/no-timeout-fetch.ts` is wired to
   `packages/tui/src/context/sdk.tsx` and `packages/opencode/src/cli/cmd/run.ts` for long TUI/run/mini requests;
-  `packages/core/src/effect/app-node-platform.ts` applies the override at the native `RequestExecutor` composition.
-  Preserve request options, abort signals, configured provider deadlines and fork #303's generation-progress
-  watchdog. `packages/core/src/cross-spawn-spawner.ts` synchronously terminates detached POSIX groups while cleanup
-  remains owed, preserving fork #380 cancellation escalation and intentional descendant release. The terminal
-  SIGHUP adaptation is in `packages/tui/src/app.tsx` / `packages/tui/src/terminal-signal.ts`; a non-terminal process
-  retains nohup's ignored SIGHUP. Focused regressions are in `packages/core/test/no-timeout-fetch.test.ts`,
+  `packages/core/src/effect/app-node-platform.ts` applies the donor-faithful replace-not-merge of
+  `FetchHttpClient.RequestInit` (`{ timeout: false }`) at native `RequestExecutor` composition; the high-level
+  TUI/run/mini fetch wrapper preserves its caller's other request options and abort signal. Provider caller deadlines
+  and fork #303's generation-progress watchdog remain independent of Bun's idle timeout.
+  `packages/core/src/cross-spawn-spawner.ts` reports acknowledged group ownership changes from the TUI server Worker;
+  Worker `shutdown` signals and confirms remaining owned groups before replying, and
+  `packages/opencode/src/cli/tui/process-group.ts` applies the recorded-PGID ledger as a bounded backstop when the
+  TUI owner sees a shutdown timeout, Worker error or parent exit. Fork #380 cancellation escalation and intentional
+  descendant release remain intact. The terminal SIGHUP adaptation is in
+  `packages/tui/src/app.tsx` / `packages/tui/src/terminal-signal.ts`: terminal TUI hangup runs graceful cleanup,
+  nohup's non-TTY ignore remains untouched, and a non-TTY non-nohup TUI retains the OS default SIGHUP action rather
+  than installing graceful cleanup. Focused regressions are in `packages/core/test/no-timeout-fetch.test.ts`,
   `packages/core/test/effect/app-node-platform.test.ts`, `packages/tui/test/cli/tui/sdk-transport.test.tsx`,
-  `packages/opencode/test/cli/run/mini-attach.test.ts` and `run-process.test.ts`,
-  `packages/opencode/test/session/llm.test.ts`, `packages/core/test/effect/cross-spawn-spawner.test.ts`, and
-  `packages/tui/test/app-lifecycle.test.tsx` with its terminal/nohup fixtures. The native acceptance holds a real local
-  HTTP response past Bun's unmodified idle timeout, verifies the default control expires on that timeout while the
-  provider request remains owned, then confirms the provider response and attached-run session content after release.
+  `packages/opencode/test/cli/run/mini-attach.test.ts`, `packages/opencode/test/cli/run/run-process.test.ts`,
+  `packages/opencode/test/cli/tui/worker-process-group.test.ts` (real Server Worker shutdown and parent-backstop RPC paths),
+  `packages/opencode/test/session/llm.test.ts`,
+  `packages/core/test/effect/cross-spawn-spawner.test.ts`, and `packages/tui/test/app-lifecycle.test.tsx` with
+  observed terminal, nohup and default-action fixtures. The default unit suite uses child Bun 1.4.4 processes with
+  `BUN_CONFIG_HTTP_IDLE_TIMEOUT=2` for held-request witnesses, so no test waits multiple minutes; control fetches
+  expire before TUI/mini/native requests are released. The pre-review Bun 1.4.4 run also observed the native and
+  attached paths survive their unmodified default idle interval before completion.
   _Partly upstream._
 - **#406** Backport `anomalyco/opencode#54023` (`94353780cf289dcecee2866322dbbe1f34d51641`) to coordinate provider OAuth refresh across concurrent callers. The required provider-refresh behavior is complete; donor payload is partial.
   - Adapt `packages/core/src/credential.ts` to add `Credential.lock` to the fork's global service and use its existing `EffectFlock`; keep `packages/core/src/integration.ts`'s `Integration.connection.resolve` Location-owned, re-read stored state inside the lock, and preserve key, environment, missing-credential, fresh-token and no-refresh behavior. MCP SDK refresh and provider-401 recovery remain out of scope.
