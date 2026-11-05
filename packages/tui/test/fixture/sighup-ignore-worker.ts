@@ -38,10 +38,7 @@ unregister()
 await Bun.write(
   resultFile,
   JSON.stringify({
-    rendererDestroyed: false,
-    disposed: 0,
     sighupListenersRestored: process.listeners("SIGHUP").every((listener) => previousSighupListeners.has(listener)),
-    terminalTitleCleared: false,
     signalHandled,
   }),
 )

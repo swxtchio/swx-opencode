@@ -10,16 +10,30 @@ import { tmpdir } from "./fixture/fixture"
 import { createTuiResolvedConfig } from "./fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "./fixture/tui-sdk"
 
-type SighupFixtureMode = "terminal" | "background"
-type SighupFixtureResult = {
-  terminal: boolean
-  sighupHandlerAdded: boolean
-  rendererDestroyed: boolean
-  disposed: number
-  sighupListenersRestored: boolean
-  terminalTitleCleared: boolean
-  signalHandled?: number
-}
+type SighupFixtureMode = "terminal" | "nohup" | "non-tty"
+type SighupFixtureResult =
+  | {
+      type: "terminal"
+      terminal: true
+      sighupHandlerAdded: true
+      rendererDestroyed: boolean
+      disposed: number
+      sighupListenersRestored: boolean
+      terminalTitleCleared: boolean
+    }
+  | {
+      type: "nohup"
+      terminal: false
+      sighupHandlerAdded: false
+      sighupListenersRestored: boolean
+      signalHandled: number
+    }
+  | {
+      type: "default"
+      terminal: false
+      sighupHandlerAdded: false
+      exitCode: number
+    }
 
 async function runSighupFixture(mode: SighupFixtureMode): Promise<SighupFixtureResult> {
   if (process.platform !== "linux") throw new Error("SIGHUP process fixture requires Linux")
@@ -52,7 +66,18 @@ async function runSighupFixture(mode: SighupFixtureMode): Promise<SighupFixtureR
   const worker =
     mode === "terminal"
       ? Bun.spawn(["script", "-q", "-e", "-c", command, "/dev/null"], options)
-      : Bun.spawn(["nohup", process.execPath, workerFile], options)
+      : mode === "nohup"
+        ? Bun.spawn(["nohup", process.execPath, workerFile], options)
+        : Bun.spawn(
+            [
+              "python3",
+              "-c",
+              "import os, signal, sys; signal.signal(signal.SIGHUP, signal.SIG_DFL); os.execv(sys.argv[1], [sys.argv[1], sys.argv[2]])",
+              process.execPath,
+              workerFile,
+            ],
+            options,
+          )
   const launcherIdentity = EventWriter.readIdentity(worker.pid)
   if (!launcherIdentity?.bootID || !launcherIdentity.startTicks)
     throw new Error("SIGHUP launcher has no recorded start identity")
@@ -103,7 +128,7 @@ async function runSighupFixture(mode: SighupFixtureMode): Promise<SighupFixtureR
       }
       if (!ready) await new Promise((resolve) => setTimeout(resolve, 20))
     }
-    if (!ready) throw new Error("SIGHUP worker did not report a mounted TUI")
+    if (!ready) throw new Error("SIGHUP fixture did not report its readiness")
 
     workerIdentity = EventWriter.readIdentity(ready.pid)
     if (!workerIdentity?.bootID || !workerIdentity.startTicks || !sameProcess(workerIdentity))
@@ -114,11 +139,11 @@ async function runSighupFixture(mode: SighupFixtureMode): Promise<SighupFixtureR
       )
     if (mode === "terminal" && !ready.sighupHandlerAdded)
       throw new Error("terminal TUI did not install its SIGHUP lifecycle handler")
-    if (mode === "background" && ready.sighupHandlerAdded)
-      throw new Error("background TUI installed a SIGHUP listener despite lacking a terminal")
+    if (mode !== "terminal" && ready.sighupHandlerAdded)
+      throw new Error(`${mode} fixture installed a SIGHUP listener despite lacking a terminal`)
 
     process.kill(workerIdentity.pid, "SIGHUP")
-    if (mode === "background") {
+    if (mode === "nohup") {
       if (!sameProcess(workerIdentity)) throw new Error("nohup TUI exited after receiving SIGHUP")
       process.kill(workerIdentity.pid, "SIGUSR1")
       const acknowledgementDeadline = Date.now() + 10_000
@@ -141,43 +166,79 @@ async function runSighupFixture(mode: SighupFixtureMode): Promise<SighupFixtureR
       process.kill(workerIdentity.pid, "SIGUSR2")
     }
 
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const exitCode = await Promise.race([
-      worker.exited,
-      new Promise<undefined>((resolve) => {
-        timer = setTimeout(() => resolve(undefined), 15_000)
-      }),
-    ])
-    if (timer) clearTimeout(timer)
-    if (exitCode === undefined) throw new Error("SIGHUP worker did not finish its owned lifecycle")
-    const [stdout, stderr] = await output
-    if (exitCode !== 0) throw new Error(`SIGHUP worker exited ${exitCode}: ${stdout}\n${stderr}`)
+    if (mode === "non-tty") {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const exitCode = await Promise.race([
+        worker.exited,
+        new Promise<undefined>((resolve) => {
+          timer = setTimeout(() => resolve(undefined), 5_000)
+        }),
+      ])
+      if (timer) clearTimeout(timer)
+      if (exitCode === undefined) throw new Error("non-TTY TUI did not take the default SIGHUP action")
+      if (exitCode !== 129) throw new Error(`non-TTY TUI exited ${exitCode}, not from default SIGHUP disposition`)
+      if (sameProcess(workerIdentity)) throw new Error("non-TTY TUI survived SIGHUP without a handler")
+      if (await Bun.file(resultFile).exists())
+        throw new Error("non-TTY TUI performed graceful lifecycle cleanup instead of the default SIGHUP action")
+      result = {
+        type: "default",
+        terminal: false,
+        sighupHandlerAdded: false,
+        exitCode,
+      }
+    }
 
-    const value: unknown = await Bun.file(resultFile).json()
-    if (
-      typeof value !== "object" ||
-      value === null ||
-      !("rendererDestroyed" in value) ||
-      typeof value.rendererDestroyed !== "boolean" ||
-      !("disposed" in value) ||
-      typeof value.disposed !== "number" ||
-      !("sighupListenersRestored" in value) ||
-      typeof value.sighupListenersRestored !== "boolean" ||
-      !("terminalTitleCleared" in value) ||
-      typeof value.terminalTitleCleared !== "boolean"
-    )
-      throw new Error("SIGHUP worker did not publish its lifecycle result")
-    const signalHandled = "signalHandled" in value && typeof value.signalHandled === "number" ? value.signalHandled : undefined
-    if (mode === "background" && signalHandled === undefined)
-      throw new Error("nohup SIGHUP worker did not report its signal handling")
-    result = {
-      terminal: ready.terminal,
-      sighupHandlerAdded: ready.sighupHandlerAdded,
-      rendererDestroyed: value.rendererDestroyed,
-      disposed: value.disposed,
-      sighupListenersRestored: value.sighupListenersRestored,
-      terminalTitleCleared: value.terminalTitleCleared,
-      ...(signalHandled === undefined ? {} : { signalHandled }),
+    if (mode !== "non-tty") {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const exitCode = await Promise.race([
+        worker.exited,
+        new Promise<undefined>((resolve) => {
+          timer = setTimeout(() => resolve(undefined), 15_000)
+        }),
+      ])
+      if (timer) clearTimeout(timer)
+      if (exitCode === undefined) throw new Error("SIGHUP worker did not finish its owned lifecycle")
+      const [stdout, stderr] = await output
+      if (exitCode !== 0) throw new Error(`SIGHUP worker exited ${exitCode}: ${stdout}\n${stderr}`)
+
+      const value: unknown = await Bun.file(resultFile).json()
+      if (
+        typeof value !== "object" ||
+        value === null ||
+        !("sighupListenersRestored" in value) ||
+        typeof value.sighupListenersRestored !== "boolean"
+      )
+        throw new Error("SIGHUP fixture did not publish its observed listener state")
+      if (mode === "terminal") {
+        if (
+          !("rendererDestroyed" in value) ||
+          typeof value.rendererDestroyed !== "boolean" ||
+          !("disposed" in value) ||
+          typeof value.disposed !== "number" ||
+          !("terminalTitleCleared" in value) ||
+          typeof value.terminalTitleCleared !== "boolean"
+        )
+          throw new Error("terminal TUI did not publish its observed lifecycle result")
+        result = {
+          type: "terminal",
+          terminal: true,
+          sighupHandlerAdded: true,
+          rendererDestroyed: value.rendererDestroyed,
+          disposed: value.disposed,
+          sighupListenersRestored: value.sighupListenersRestored,
+          terminalTitleCleared: value.terminalTitleCleared,
+        }
+      } else {
+        if (!("signalHandled" in value) || typeof value.signalHandled !== "number")
+          throw new Error("nohup SIGHUP fixture did not report its observed signal handling")
+        result = {
+          type: "nohup",
+          terminal: false,
+          sighupHandlerAdded: false,
+          sighupListenersRestored: value.sighupListenersRestored,
+          signalHandled: value.signalHandled,
+        }
+      }
     }
   } catch (error) {
     failure = error
@@ -212,6 +273,7 @@ async function runSighupFixture(mode: SighupFixtureMode): Promise<SighupFixtureR
 test("terminal SIGHUP clears title and disposes scoped resources once", async () => {
   if (process.platform !== "linux") return
   expect(await runSighupFixture("terminal")).toEqual({
+    type: "terminal",
     terminal: true,
     sighupHandlerAdded: true,
     rendererDestroyed: true,
@@ -221,16 +283,24 @@ test("terminal SIGHUP clears title and disposes scoped resources once", async ()
   })
 })
 
-test("nohup SIGHUP stays ignored outside a terminal", async () => {
+test("nohup SIGHUP listener policy preserves process survival without a terminal", async () => {
   if (process.platform !== "linux") return
-  expect(await runSighupFixture("background")).toEqual({
+  expect(await runSighupFixture("nohup")).toEqual({
+    type: "nohup",
     terminal: false,
     sighupHandlerAdded: false,
-    rendererDestroyed: false,
-    disposed: 0,
     sighupListenersRestored: true,
-    terminalTitleCleared: false,
     signalHandled: 0,
+  })
+})
+
+test("non-TTY listener policy leaves SIGHUP at the OS default", async () => {
+  if (process.platform !== "linux") return
+  expect(await runSighupFixture("non-tty")).toEqual({
+    type: "default",
+    terminal: false,
+    sighupHandlerAdded: false,
+    exitCode: 129,
   })
 })
 
