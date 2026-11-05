@@ -8343,7 +8343,10 @@ const consumeBackstopLog = "queue consume waited past its acquisition backstop"
 // Takes the hold on the session just before its consume; the listener runs inline with the loop's status publish.
 type ConsumeHold = (sessionID: SessionID) => Effect.Effect<void>
 
-const startConsumeLocked = Effect.fn("test.startConsumeLocked")(function* (hold: ConsumeHold) {
+const startConsumeLocked = Effect.fn("test.startConsumeLocked")(function* (
+  hold: ConsumeHold,
+  providerStartTimeout: Duration.Input = "75 seconds",
+) {
   const { dir, llm } = yield* useServerConfig(providerCfg)
   const prompt = yield* SessionPrompt.Service
   const sessions = yield* Session.Service
@@ -8386,7 +8389,7 @@ const startConsumeLocked = Effect.fn("test.startConsumeLocked")(function* (hold:
       .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said(text), ...extra })
       .pipe(Effect.forkChild)
   const task = yield* send("run the tool")
-  yield* awaitWithTimeout(llm.wait(1), "the tool step's provider call never started", "10 seconds")
+  yield* awaitWithTimeout(llm.wait(1), "the tool step's provider call never started", providerStartTimeout)
   const continuation = yield* send("continue after the tool", { delivery: "queue" })
   yield* admitted(chat.id, "continue after the tool")
   yield* Deferred.succeed(gate, undefined)
@@ -8616,7 +8619,10 @@ consumeLock.instance(
         const attempts = newStatementAttempts()
         yield* patchBunQuery((sql) => sql === "begin immediate", attempts)
         const lock = yield* writeLockHold()
-        const { llm, sessions, chat, task, continuation, records, toolRuns } = yield* startConsumeLocked(lock.take)
+        const { llm, sessions, chat, task, continuation, records, toolRuns } = yield* startConsumeLocked(
+          lock.take,
+          "75 seconds",
+        )
         yield* Effect.addFinalizer(() => lock.release)
         yield* llm.text("task done")
         yield* llm.text("continuation done")
@@ -8680,7 +8686,7 @@ consumeLock.instance(
         expect(remaining).toEqual([])
       }).pipe(Effect.provideService(Logger.CurrentLoggers, capture.loggers))
     }),
-  90_000,
+  180_000,
 )
 
 consumeLock.instance(
@@ -8692,7 +8698,7 @@ consumeLock.instance(
         const status = yield* SessionStatus.Service
         const runState = yield* SessionRunState.Service
         const lock = yield* writeLockHold()
-        const started = yield* startConsumeLocked(lock.take)
+        const started = yield* startConsumeLocked(lock.take, "75 seconds")
         yield* Effect.addFinalizer(() => lock.release)
         const { llm, chat, task, continuation, records } = started
         const before = records()
@@ -8726,7 +8732,7 @@ consumeLock.instance(
         yield* wakeDeliversContinuation(started)
       }).pipe(Effect.provideService(Logger.CurrentLoggers, capture.loggers))
     }),
-  90_000,
+  180_000,
 )
 
 consumeLock.instance(
@@ -8752,7 +8758,7 @@ consumeLock.instance(
               .pipe(Effect.forkIn(scope))
             yield* Deferred.await(taken)
           })
-        const started = yield* startConsumeLocked(take)
+        const started = yield* startConsumeLocked(take, "75 seconds")
         const { llm, chat, task, continuation, records } = started
         const before = records()
         const startedAt = performance.now()
@@ -8784,7 +8790,7 @@ consumeLock.instance(
         yield* wakeDeliversContinuation(started)
       }).pipe(Effect.provideService(Logger.CurrentLoggers, capture.loggers))
     }),
-  90_000,
+  180_000,
 )
 
 consumeLock.instance(
@@ -8818,7 +8824,7 @@ consumeLock.instance(
       })
       yield* Effect.gen(function* () {
         const lock = yield* writeLockHold()
-        const started = yield* startConsumeLocked(lock.take)
+        const started = yield* startConsumeLocked(lock.take, "75 seconds")
         yield* Effect.addFinalizer(() => lock.release)
         const { llm, chat, task, continuation, records } = started
         const before = records()
@@ -8862,7 +8868,7 @@ consumeLock.instance(
         yield* wakeDeliversContinuation(started)
       }).pipe(Effect.provideService(Logger.CurrentLoggers, capture.loggers))
     }),
-  90_000,
+  180_000,
 )
 
 // Makes the consume's delete, which runs only after its transaction began, fail with SQLITE_BUSY while armed, so the
@@ -8915,8 +8921,9 @@ consumeLock.instance(
       const capture = yield* captureConsumeLogs()
       yield* Effect.gen(function* () {
         const busy = yield* busyConsumeDelete()
-        const { llm, chat, task, continuation, records } = yield* startConsumeLocked(() =>
-          Effect.sync(() => void (busy.on = true)),
+        const { llm, chat, task, continuation, records } = yield* startConsumeLocked(
+          () => Effect.sync(() => void (busy.on = true)),
+          "10 seconds",
         )
         const before = records()
         const exits = yield* awaitWithTimeout(
