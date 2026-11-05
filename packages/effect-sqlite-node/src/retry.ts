@@ -183,9 +183,7 @@ export const retryWindowStatus = Effect.withFiber((fiber) =>
 export const makeStatementGate = Effect.sync(() => {
   let active = 0
   let exclusive = false
-  let retrying = 0
   const waiters = new Set<Deferred.Deferred<void>>()
-  const preemptibleWaiters = new Set<Deferred.Deferred<void>>()
   const wake = Effect.gen(function* () {
     const pending = yield* Effect.sync(() => {
       const result = Array.from(waiters)
@@ -194,123 +192,70 @@ export const makeStatementGate = Effect.sync(() => {
     })
     yield* Effect.forEach(pending, (waiter) => Deferred.succeed(waiter, undefined), { discard: true })
   })
-  const withStatement = <A, E, R>(
-    effect: Effect.Effect<A, E, R>,
-    operation?: RetryOperationState,
-    retryPriority = false,
-  ) =>
-    Effect.uninterruptibleMask((restore) =>
-      Effect.gen(function* () {
-        let ticket = retryPriority && operation !== undefined
-        if (ticket) {
-          const pending = yield* Effect.sync(() => {
-            retrying++
-            return Array.from(preemptibleWaiters)
-          })
-          yield* Effect.forEach(pending, (waiter) => Deferred.succeed(waiter, undefined), { discard: true })
-        }
-
-        return yield* Effect.gen(function* () {
-          while (true) {
-            const waiter = yield* Deferred.make<void>()
-            const admitted = yield* Effect.sync(() => {
-              if (exclusive || (retrying > 0 && !ticket)) {
-                waiters.add(waiter)
-                return false
-              }
-              active++
-              if (ticket) {
-                retrying--
-                ticket = false
-              }
-              return true
-            })
-            if (admitted) break
-            if (operation) operation.sawContention = true
-            const remainingMs = yield* permitWaitBudget
-            const wait =
-              remainingMs === undefined
-                ? Deferred.await(waiter).pipe(Effect.map(Option.some))
-                : Deferred.await(waiter).pipe(Effect.timeoutOption(Duration.millis(remainingMs)))
-            const result = yield* restore(wait).pipe(Effect.exit)
-            yield* Effect.sync(() => waiters.delete(waiter))
-            if (Exit.isFailure(result)) return yield* Effect.failCause(result.cause)
-            if (Option.isNone(result.value)) return yield* Effect.fail(yield* permitWaitTimeout)
-          }
-
-          const result = yield* Effect.exit(restore(effect))
-          const idle = yield* Effect.sync(() => --active === 0)
-          if (idle) yield* wake
-          return yield* result
-        }).pipe(
-          Effect.ensuring(
-            Effect.sync(() => {
-              if (!ticket) return
-              retrying--
-              ticket = false
-            }),
-          ),
-        )
-      }),
-    )
-  const withExclusive = <A, E, R>(
-    effect: Effect.Effect<A, E, R>,
-    operation?: RetryOperationState,
-    preemptible = false,
-  ) =>
+  const withStatement = <A, E, R>(effect: Effect.Effect<A, E, R>, operation?: RetryOperationState) =>
     Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
         while (true) {
-          while (true) {
-            const waiter = yield* Deferred.make<void>()
-            const admitted = yield* Effect.sync(() => {
-              if (exclusive || active > 0 || retrying > 0) {
-                waiters.add(waiter)
-                return false
-              }
-              exclusive = true
-              return true
-            })
-            if (admitted) break
-            if (operation) operation.sawContention = true
-            const remainingMs = yield* permitWaitBudget
-            const wait =
-              remainingMs === undefined
-                ? Deferred.await(waiter).pipe(Effect.map(Option.some))
-                : Deferred.await(waiter).pipe(Effect.timeoutOption(Duration.millis(remainingMs)))
-            const result = yield* restore(wait).pipe(Effect.exit)
-            yield* Effect.sync(() => waiters.delete(waiter))
-            if (Exit.isFailure(result)) return yield* Effect.failCause(result.cause)
-            if (Option.isNone(result.value)) return yield* Effect.fail(yield* permitWaitTimeout)
-            // The driver's active count drops just before its caller resumes with the completed statement.
-            yield* Effect.yieldNow
-          }
-
-          const preempt = preemptible ? yield* Deferred.make<void>() : undefined
-          if (preempt) {
-            const retryPending = yield* Effect.sync(() => {
-              preemptibleWaiters.add(preempt)
-              return retrying > 0
-            })
-            if (retryPending) yield* Deferred.succeed(preempt, undefined)
-          }
-          const result = yield* Effect.exit(
-            preempt
-              ? restore(
-                  Effect.raceFirst(
-                    effect.pipe(Effect.map((value) => ({ _tag: "acquired" as const, value }))),
-                    Deferred.await(preempt).pipe(Effect.as({ _tag: "preempted" as const })),
-                  ),
-                )
-              : restore(effect).pipe(Effect.map((value) => ({ _tag: "acquired" as const, value }))),
-          )
-          if (preempt) yield* Effect.sync(() => preemptibleWaiters.delete(preempt))
-          yield* Effect.sync(() => (exclusive = false))
-          yield* wake
+          const waiter = yield* Deferred.make<void>()
+          const admitted = yield* Effect.sync(() => {
+            if (exclusive) {
+              waiters.add(waiter)
+              return false
+            }
+            active++
+            return true
+          })
+          if (admitted) break
+          if (operation) operation.sawContention = true
+          const remainingMs = yield* permitWaitBudget
+          const wait =
+            remainingMs === undefined
+              ? Deferred.await(waiter).pipe(Effect.map(Option.some))
+              : Deferred.await(waiter).pipe(Effect.timeoutOption(Duration.millis(remainingMs)))
+          const result = yield* restore(wait).pipe(Effect.exit)
+          yield* Effect.sync(() => waiters.delete(waiter))
           if (Exit.isFailure(result)) return yield* Effect.failCause(result.cause)
-          if (result.value._tag === "preempted") continue
-          return result.value.value
+          if (Option.isNone(result.value)) return yield* Effect.fail(yield* permitWaitTimeout)
         }
+
+        const result = yield* Effect.exit(restore(effect))
+        const idle = yield* Effect.sync(() => --active === 0)
+        if (idle) yield* wake
+        return yield* result
+      }),
+    )
+  const withExclusive = <A, E, R>(effect: Effect.Effect<A, E, R>, operation?: RetryOperationState) =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        while (true) {
+          const waiter = yield* Deferred.make<void>()
+          const admitted = yield* Effect.sync(() => {
+            if (exclusive || active > 0) {
+              waiters.add(waiter)
+              return false
+            }
+            exclusive = true
+            return true
+          })
+          if (admitted) break
+          if (operation) operation.sawContention = true
+          const remainingMs = yield* permitWaitBudget
+          const wait =
+            remainingMs === undefined
+              ? Deferred.await(waiter).pipe(Effect.map(Option.some))
+              : Deferred.await(waiter).pipe(Effect.timeoutOption(Duration.millis(remainingMs)))
+          const result = yield* restore(wait).pipe(Effect.exit)
+          yield* Effect.sync(() => waiters.delete(waiter))
+          if (Exit.isFailure(result)) return yield* Effect.failCause(result.cause)
+          if (Option.isNone(result.value)) return yield* Effect.fail(yield* permitWaitTimeout)
+          // The driver's active count drops just before its caller resumes with the completed statement.
+          yield* Effect.yieldNow
+        }
+
+        const result = yield* Effect.exit(restore(effect))
+        yield* Effect.sync(() => (exclusive = false))
+        yield* wake
+        return yield* result
       }),
     )
   return { withStatement, withExclusive }
@@ -441,11 +386,8 @@ export const isBeginStatement = (sql: string) => {
 export const makeRetryOwnership = (semaphore: Semaphore.Semaphore) =>
   Effect.gen(function* () {
     const statementGate = yield* makeStatementGate
-    const withStatement = <A, E, R>(
-      operation: RetryOperationState,
-      effect: Effect.Effect<A, E, R>,
-      retryPriority = false,
-    ) => statementGate.withStatement(effect, operation, retryPriority)
+    const withStatement = <A, E, R>(operation: RetryOperationState, effect: Effect.Effect<A, E, R>) =>
+      statementGate.withStatement(effect, operation)
     const registerLease = (scope: Scope.Scope, lease: Scope.Closeable) =>
       Effect.gen(function* () {
         const registered = yield* Effect.exit(Scope.addFinalizer(scope, Scope.close(lease, Exit.void)))
@@ -466,14 +408,12 @@ export const makeRetryOwnership = (semaphore: Semaphore.Semaphore) =>
       withStatement(operation, withPermit(semaphore, effect))
     const statement = <A>(sql: string, effect: Effect.Effect<A, SqlError>, operation: RetryOperationState) =>
       retryLocked(withPermit(semaphore, effect), sql, true, operation, {
-        wrapAttempt: (attempt, attemptNumber) => withStatement(operation, attempt, attemptNumber > 1),
+        wrapAttempt: (attempt) => withStatement(operation, attempt),
       })
     const acquireTransactionLease = (scope: Scope.Scope, operation: RetryOperationState) =>
       Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
-          const lease = yield* restore(
-            statementGate.withExclusive(acquirePermitLease(semaphore, 1, operation), operation, true),
-          )
+          const lease = yield* restore(statementGate.withExclusive(acquirePermitLease(semaphore, 1, operation), operation))
           yield* registerLease(scope, lease)
           return lease
         }),
@@ -489,11 +429,10 @@ export const makeRetryOwnership = (semaphore: Semaphore.Semaphore) =>
           if (state.transaction) return retryLocked(effect, sql, isCommitStatement(sql), operation)
           if (!isBeginStatement(sql)) {
             return retryLocked(effect, sql, true, operation, {
-              wrapAttempt: (attempt, attemptNumber) =>
+              wrapAttempt: (attempt) =>
                 withStatement(
                   operation,
                   Effect.suspend(() => (state.lease ? Effect.void : acquireLease()).pipe(Effect.andThen(attempt))),
-                  attemptNumber > 1,
                 ),
               beforeRetry: () => {
                 if (!state.lease) return Effect.void

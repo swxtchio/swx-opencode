@@ -26,45 +26,27 @@ const nodeSqliteDrivers = await import("node:sqlite").then(
 )
 const nodeSqliteTest = test.skipIf(!nodeSqliteDrivers)
 
-test("a retry attempt preempts a pending transaction connection acquisition", async () => {
-  const exit = await Effect.runPromiseExit(
-    Effect.scoped(
-      Effect.gen(function* () {
-        const gate = yield* Sqlite.makeStatementGate
-        const entered = yield* Deferred.make<void>()
-        const release = yield* Deferred.make<void>()
-        const acquisition = yield* gate
-          .withExclusive(
-            Effect.gen(function* () {
-              yield* Deferred.succeed(entered, undefined)
-              yield* Deferred.await(release)
-            }),
-            { sawContention: false },
-            true,
-          )
-          .pipe(Effect.forkChild({ startImmediately: true }))
-        yield* Deferred.await(entered)
-
-        const retry = yield* gate
-          .withStatement(Effect.succeed("writer"), { sawContention: false }, true)
-          .pipe(Effect.forkChild({ startImmediately: true }))
-        const result = yield* Fiber.await(retry).pipe(
-          Effect.timeoutOrElse({
-            duration: "1 second",
-            orElse: () => Effect.fail(new Error("retry attempt did not preempt the queued transaction acquisition")),
-          }),
-        )
-        expect(Exit.isSuccess(result)).toBe(true)
-        if (Exit.isSuccess(result)) expect(result.value).toBe("writer")
-        expect(acquisition.pollUnsafe()).toBeUndefined()
-
-        yield* Deferred.succeed(release, undefined)
-        expect(Exit.isSuccess(yield* Fiber.await(acquisition))).toBe(true)
-      }),
-    ),
-  )
-  if (Exit.isFailure(exit)) throw new Error(Cause.pretty(exit.cause))
-})
+test(
+  "a retry-priority grant race never loses the connection permit",
+  async () => {
+    const bun = Bun.which("bun")
+    if (!bun) throw new Error("Bun is required for the connection-lease handoff regression")
+    const script = path.join(import.meta.dir, "fixture/sqlite-lease-grant-race.mjs")
+    const child = Bun.spawn([bun, script, "bun"], {
+      cwd: path.resolve(import.meta.dir, ".."),
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    const [exitCode, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ])
+    if (exitCode !== 0) throw new Error(`Bun connection-lease handoff sweep failed (${exitCode})\n${stdout}\n${stderr}`)
+    for (const maxOps of [3, 4, 8, 16, 64]) expect(stdout).toContain(`PASS bun lease grant race maxOps=${maxOps}`)
+  },
+  30_000,
+)
 
 // The retry window each statement must give a competing writer.
 const lockWindowMs = 10_000
@@ -1869,6 +1851,8 @@ test(
     expect(stdout).toMatch(/^runtime=node node=\d+\.\d+\.\d+$/m)
     expect(stdout).toContain("PASS core-node")
     expect(stdout).toContain("PASS standalone-node")
+    expect(stdout).toContain("PASS core-node lease grant race maxOps=64")
+    expect(stdout).toContain("PASS standalone-node lease grant race maxOps=64")
   },
   120_000,
 )

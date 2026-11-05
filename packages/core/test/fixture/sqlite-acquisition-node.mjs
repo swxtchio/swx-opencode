@@ -8,6 +8,7 @@ import { SqlClient } from "effect/unstable/sql/SqlClient"
 import { countStatement, newStatementAttempts } from "../../src/database/sqlite-attempts.ts"
 import { retryWindowStatus, withFreshRetryWindow } from "../../src/database/sqlite.ts"
 import { layer as coreNodeLayer } from "../../src/database/sqlite.node.ts"
+import { verifyLeaseGrantRace } from "./sqlite-lease-grant-race.mjs"
 import { NodeSqliteClient } from "../../../effect-sqlite-node/src/index.ts"
 
 const nodeMajor = Number(process.versions.node.split(".")[0])
@@ -474,6 +475,7 @@ for (const [name, layer, layerForFilename] of [
   ["standalone-node", NodeSqliteClient.layer({ filename: ":memory:" }), NodeSqliteClient.layer],
 ]) {
   try {
+    await verifyLeaseGrantRace(name)
     await verify(name, layer)
     await verifyDeferredReadDuringBegin(name, layerForFilename)
     await verifyStatementRetryDuringBackoff(name, layerForFilename, "ordinary")
