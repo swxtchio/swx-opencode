@@ -8703,7 +8703,8 @@ consumeLock.instance(
         consumeRefusals(exits).forEach((refusal) => {
           expect(refusal).toBeInstanceOf(SessionQueue.ConsumeLockedError)
           if (!(refusal instanceof SessionQueue.ConsumeLockedError)) return
-          expect(refusal).toMatchObject({ sessionID: chat.id, attempts: expect.any(Number) })
+          expect(refusal.sessionID).toBe(chat.id)
+          expect(refusal.attempts).toBeGreaterThan(0)
           expect(refusal.message).toContain("SQLite lock contention")
           expect(refusal.message).toMatch(/persisted for \d+ ms/)
         })
@@ -8761,7 +8762,8 @@ consumeLock.instance(
         consumeRefusals(exits).forEach((refusal) => {
           expect(refusal).toBeInstanceOf(SessionQueue.ConsumeLockedError)
           if (!(refusal instanceof SessionQueue.ConsumeLockedError)) return
-          expect(refusal).toMatchObject({ sessionID: chat.id, attempts: expect.any(Number) })
+          expect(refusal.sessionID).toBe(chat.id)
+          expect(refusal.attempts).toBeGreaterThan(0)
           expect(refusal.message).toContain("SQLite write acquisition")
           expect(refusal.message).toMatch(/persisted for \d+ ms/)
         })
