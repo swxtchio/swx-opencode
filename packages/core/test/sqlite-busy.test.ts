@@ -27,7 +27,7 @@ const nodeSqliteDrivers = await import("node:sqlite").then(
 const nodeSqliteTest = test.skipIf(!nodeSqliteDrivers)
 
 test(
-  "a retry-priority grant race never loses the connection permit",
+  "a granted lease is never lost across an acquisition race",
   async () => {
     const bun = Bun.which("bun")
     if (!bun) throw new Error("Bun is required for the connection-lease handoff regression")

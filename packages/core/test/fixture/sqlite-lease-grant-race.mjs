@@ -25,12 +25,9 @@ export const verifyLeaseGrantRace = async (name) =>
                 const scope = yield* Scope.make()
                 yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
                 const operation = { sawContention: false }
-                // Preserve the d61 retry-priority call on the old implementation; the fixed gate ignores these removed flags.
                 const acquisition = yield* Effect.uninterruptibleMask((restore) =>
                   Effect.gen(function* () {
-                    const lease = yield* restore(
-                      gate.withExclusive(acquirePermitLease(semaphore, 1, operation), operation, true),
-                    )
+                    const lease = yield* restore(gate.withExclusive(acquirePermitLease(semaphore, 1, operation), operation))
                     yield* Scope.addFinalizer(scope, Scope.close(lease, Exit.void))
                     return lease
                   }),
@@ -46,7 +43,6 @@ export const verifyLeaseGrantRace = async (name) =>
                       acquirePermitLease(semaphore).pipe(Effect.flatMap((lease) => Scope.close(lease, Exit.void))),
                     ),
                     { sawContention: false },
-                    true,
                   )
                   .pipe(
                     Effect.provideService(References.MaxOpsBeforeYield, maxOps),
