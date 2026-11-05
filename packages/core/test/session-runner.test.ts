@@ -4042,13 +4042,26 @@ describe("SessionRunnerLLM", () => {
       const first = yield* session.resume(sessionID).pipe(Effect.forkChild)
       yield* Deferred.await(streamStarted)
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Recover with this" }) })
+      const recoveryStarted = yield* Deferred.make<void>()
+      streamStartAcks.push(recoveryStarted)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          const index = streamStartAcks.indexOf(recoveryStarted)
+          if (index !== -1) streamStartAcks.splice(index, 1)
+        }),
+      )
       yield* Deferred.succeed(streamGate, undefined)
       expect(yield* Fiber.join(first).pipe(Effect.flip)).toBe(streamFailure)
 
       streamFailure = undefined
       streamGate = undefined
       streamStarted = undefined
-      yield* Effect.yieldNow
+      yield* Deferred.await(recoveryStarted).pipe(
+        Effect.timeoutOrElse({
+          duration: "2 seconds",
+          orElse: () => Effect.fail(new Error("accepted steering input did not start the recovery provider request")),
+        }),
+      )
 
       expect(requests).toHaveLength(2)
       expect(userTexts(requests[1]!)).toEqual(["Start working", "Recover with this"])
