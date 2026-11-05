@@ -1,6 +1,5 @@
 import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 import { Cause, Option } from "effect"
-import { Sqlite } from "@opencode-ai/core/database/sqlite"
 import { isSqlError } from "effect/unstable/sql/SqlError"
 
 export function sqliteLockMessage(error: unknown) {
@@ -19,7 +18,5 @@ export function sqliteLockMessage(error: unknown) {
     (("code" in lockCause && typeof lockCause.code === "string" && lockCause.code.startsWith("SQLITE_LOCKED")) ||
       ("code" in lockCause && typeof lockCause.code === "number" && (lockCause.code & 0xff) === 6) ||
       ("errcode" in lockCause && typeof lockCause.errcode === "number" && (lockCause.errcode & 0xff) === 6))
-  const elapsedMs = Sqlite.lockWaitMs(sqlError)
-  const elapsed = elapsedMs === undefined ? "" : ` after ${elapsedMs} ms`
-  return locked ? `Database is locked (SQLITE_LOCKED)${elapsed}` : `Database is locked (SQLITE_BUSY)${elapsed}`
+  return locked ? "Database is locked (SQLITE_LOCKED)" : "Database is locked (SQLITE_BUSY)"
 }

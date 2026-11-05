@@ -8872,10 +8872,7 @@ consumeLock.instance(
       if (terminal.info.role !== "assistant" || terminal.info.error?.name !== "UnknownError")
         throw new Error("persistent turn lock did not leave a named assistant error")
       const lockMessage = terminal.info.error.data.message
-      expect(lockMessage).toMatch(/^Database is locked \(SQLITE_BUSY\) after (\d+) ms$/)
-      const waitedMs = Number(/^Database is locked \(SQLITE_BUSY\) after (\d+) ms$/.exec(lockMessage)?.[1])
-      expect(waitedMs).toBeGreaterThanOrEqual(55_000)
-      expect(waitedMs).toBeLessThan(75_000)
+      expect(lockMessage).toBe("Database is locked (SQLITE_BUSY)")
     }),
   240_000,
 )
@@ -9260,7 +9257,7 @@ consumeLock.instance(
 
         consumeRefusals(exits).forEach((refusal) => {
           expect(refusal).not.toBeInstanceOf(SessionQueue.ConsumeLockedError)
-          expect(sqliteLockMessage(refusal)).toMatch(/^Database is locked \(SQLITE_BUSY\) after \d+ ms$/)
+          expect(sqliteLockMessage(refusal)).toBe("Database is locked (SQLITE_BUSY)")
         })
         // The delete's own statement retries ran inside its attempt, and no further attempt was made.
         expect(busy.executions).toBeGreaterThan(0)
