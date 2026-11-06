@@ -354,6 +354,7 @@ test("runSighupFixture fails inside its drain bound when a writer outlives the l
     | { readonly type: "rejected"; readonly message: string }
     | { readonly type: "resolved" }
     | undefined
+  let failed = false
   try {
     result = await bounded(
       runSighupFixture("non-tty", writerPIDFile).then(
@@ -372,24 +373,35 @@ test("runSighupFixture fails inside its drain bound when a writer outlives the l
     expect(result?.type).toBe("rejected")
     if (result?.type === "rejected")
       expect(result.message).toContain("SIGHUP launcher exited while a writer still held stdout/stderr open")
+  } catch (error) {
+    failed = true
+    throw error
   } finally {
-    if (!writerIdentity?.bootID || !writerIdentity.startTicks)
-      throw new Error("SIGHUP pipe writer ownership could not be established for cleanup")
-    const currentWriterIdentity = EventWriter.readIdentity(writerIdentity.pid)
-    if (!currentWriterIdentity || !sameIdentity(writerIdentity, currentWriterIdentity))
-      throw new Error("SIGHUP pipe writer identity changed before cleanup; refusing to signal it")
-    process.kill(writerIdentity.pid, "SIGKILL")
-    const gone = await bounded(
-      (async () => {
-        while (true) {
-          const current = EventWriter.readIdentity(writerIdentity.pid)
-          if (!current || !sameIdentity(writerIdentity, current)) return true
-          await Bun.sleep(20)
+    if (!writerIdentity?.bootID || !writerIdentity.startTicks) {
+      if (!failed) throw new Error("SIGHUP pipe writer ownership could not be established for cleanup")
+    } else {
+      const currentWriterIdentity = EventWriter.readIdentity(writerIdentity.pid)
+      if (!currentWriterIdentity || !sameIdentity(writerIdentity, currentWriterIdentity)) {
+        if (!failed) throw new Error("SIGHUP pipe writer identity changed before cleanup; refusing to signal it")
+      } else {
+        try {
+          process.kill(writerIdentity.pid, "SIGKILL")
+        } catch (error) {
+          if (!failed) throw error
         }
-      })(),
-      5_000,
-    )
-    if (!gone) throw new Error("owned SIGHUP pipe writer did not exit after SIGKILL")
+        const gone = await bounded(
+          (async () => {
+            while (true) {
+              const current = EventWriter.readIdentity(writerIdentity.pid)
+              if (!current || !sameIdentity(writerIdentity, current)) return true
+              await Bun.sleep(20)
+            }
+          })(),
+          5_000,
+        )
+        if (!gone && !failed) throw new Error("owned SIGHUP pipe writer did not exit after SIGKILL")
+      }
+    }
   }
 }, 20_000)
 

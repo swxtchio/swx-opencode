@@ -174,13 +174,23 @@ async function runOwnerCase(input: (typeof cases)[number]) {
       ]),
       25_000,
     )
-    if (startup.type === "exit") {
+    const startupFixture =
+      startup.type === "record"
+        ? startup.fixture
+        : startup.exitCode === 0
+          ? await Bun.file(recordFile)
+              .json()
+              .then(processGroupFixture)
+              .catch(() => undefined)
+          : undefined
+    if (!startupFixture) {
       const [stdout, stderr] = await withTimeout(output, 5_000)
+      const result = await Bun.file(resultFile).text().catch(() => "<missing>")
       throw new Error(
-        `TUI owner fixture for ${input.action} exited ${startup.exitCode} before recording its group: ${stdout}\n${stderr}`,
+        `TUI owner fixture for ${input.action} exited ${startup.type === "exit" ? startup.exitCode : "without an exit"} before recording its group: ${result}\n${stdout}\n${stderr}`,
       )
     }
-    fixture = startup.fixture
+    fixture = startupFixture
     expect(fixture.pgid).toBe(fixture.leader.pid)
     if (input.action === "stop-confirmed") {
       if (!discoveryHoldFile || !cleanupAcquireEventFile) throw new Error("cleanup discovery witness paths are missing")
@@ -216,14 +226,19 @@ async function runOwnerCase(input: (typeof cases)[number]) {
       ]),
       30_000,
     )
-    if (ownerResultState.type === "exit") {
+    if (ownerResultState.type === "exit" && ownerResultState.exitCode !== 0) {
       const [stdout, stderr] = await withTimeout(output, 5_000)
       const result = await Bun.file(resultFile).text().catch(() => "<missing>")
       throw new Error(
         `TUI owner fixture for ${input.action} exited ${ownerResultState.exitCode} before publishing a result: ${result}\n${stdout}\n${stderr}`,
       )
     }
-    const ownerResult = ownerResultState.result
+    const ownerResult =
+      ownerResultState.type === "result"
+        ? ownerResultState.result
+        : await Bun.file(resultFile).json().catch(() => undefined)
+    if (typeof ownerResult !== "object" || ownerResult === null)
+      throw new Error(`TUI owner fixture for ${input.action} exited without a valid result file`)
     await withTimeout(
       (async () => {
         const deadline = Date.now() + 20_000
@@ -240,8 +255,6 @@ async function runOwnerCase(input: (typeof cases)[number]) {
       const [stdout, stderr] = await withTimeout(output, 5_000)
       throw new Error(`TUI owner fixture exited ${exitCode}: ${stdout}\n${stderr}`)
     }
-    if (typeof ownerResult !== "object" || ownerResult === null)
-      throw new Error("TUI owner fixture did not publish its result")
     const events = ownerGroupEvents("events" in ownerResult ? ownerResult.events : undefined)
     expect(events.some((event) => event.action === "acquire")).toBe(true)
     if (input.action === "exit" || input.action === "worker-terminate-exit")
@@ -439,9 +452,16 @@ test("real Core cleanup publication beats a delayed initial acquire acknowledgem
       throw new Error(`pending owner exited ${ownerExit}: ${stdout}\n${stderr}`)
     }
     const result: unknown = await Bun.file(resultFile).json()
-    const events = ownerGroupEvents(
-      typeof result === "object" && result !== null && "events" in result ? result.events : undefined,
+    if (
+      typeof result !== "object" ||
+      result === null ||
+      !("descendantAlive" in result) ||
+      typeof result.descendantAlive !== "boolean" ||
+      !("events" in result)
     )
+      throw new Error("cancellation-overlap owner result is missing its descendant and event state")
+    const events = ownerGroupEvents(result.events)
+    expect(result.descendantAlive).toBe(false)
     expect(pendingSeen).toBe(true)
     expect(discoveryHeld).toBe(true)
     expect(events.some((event) => event.cleanupOwed && event.membersPending)).toBe(true)
@@ -578,7 +598,7 @@ test("real cancellation acquire publishes while discovery is held before leader 
     expect(liveIndex).toBeGreaterThanOrEqual(0)
     expect(events[liveIndex]?.groupAlive).toBe(true)
     expect(exitedIndex).toBeGreaterThan(liveIndex)
-    expect("descendantAlive" in result && result.descendantAlive).toBe(false)
+    expect(result.descendantAlive).toBe(false)
     expect(isGroupMember(fixture.pgid, fixture.descendant)).toBe(false)
   } finally {
     await Bun.write(`${recordFile}.exit`, "exit").catch(() => {})
@@ -1056,7 +1076,32 @@ test("release then reacquire uses recorded descendant identity after the leader 
 
       await expect(tracker.observe({ action: "release", ...group })).rejects.toThrow()
       expect(owner.has(group.pgid)).toBe(false)
+      const reacquireEventIndex = events.length
       await expect(tracker.observe({ ...group, action: "acquire", cleanupOwed: true })).rejects.toThrow()
+      const reacquireEvent = events
+        .slice(reacquireEventIndex)
+        .find((event) => event.action === "acquire" && event.cleanupOwed)
+      if (!reacquireEvent) throw new Error("reacquire did not publish its initial acquire event")
+      await withTimeout(
+        (async () => {
+          const deadline = Date.now() + 5_000
+          while (Date.now() < deadline) {
+            if (
+              events.some(
+                (event) =>
+                  event.ownershipSequence === reacquireEvent.ownershipSequence &&
+                  event.action === "acquire" &&
+                  !event.membersPending &&
+                  event.membersSnapshotComplete,
+              )
+            )
+              return
+            await Bun.sleep(20)
+          }
+          throw new Error("reacquire did not publish its resolved member snapshot")
+        })(),
+        5_500,
+      )
       const hasDescendant = () =>
         owner.get(group.pgid)?.members.some(
           (member) =>
@@ -1064,17 +1109,6 @@ test("release then reacquire uses recorded descendant identity after the leader 
             member.bootID === descendant.bootID &&
             member.startTicks === descendant.startTicks,
         ) === true
-      await withTimeout(
-        (async () => {
-          const deadline = Date.now() + 5_000
-          while (Date.now() < deadline) {
-            if (hasDescendant()) return
-            await Bun.sleep(20)
-          }
-          throw new Error("reacquire did not publish the recorded descendant identity")
-        })(),
-        5_500,
-      )
       expect(hasDescendant()).toBe(true)
 
       worker.onerror?.(new ErrorEvent("error", { message: "simulated owner exit after reacquire" }))
@@ -1251,17 +1285,19 @@ test("Core-spawned completed commands retire Worker tracker ownership", async ()
       ]),
       30_000,
     )
-    if (result.type === "exit") {
+    if (result.type === "exit" && result.code !== 0) {
       const [stdout, stderr] = await withTimeout(output, 5_000)
       throw new Error(`retirement owner exited ${result.code}: ${stdout}\n${stderr}`)
     }
-    if (typeof result.value !== "object" || result.value === null || !("sizes" in result.value))
+    const resultValue =
+      result.type === "result" ? result.value : await Bun.file(resultFile).json().catch(() => undefined)
+    if (typeof resultValue !== "object" || resultValue === null || !("sizes" in resultValue))
       throw new Error("retirement owner returned no tracker size list")
-    const sizes = Array.isArray(result.value.sizes)
-      ? result.value.sizes.filter((size): size is number => typeof size === "number")
+    const sizes = Array.isArray(resultValue.sizes)
+      ? resultValue.sizes.filter((size): size is number => typeof size === "number")
       : []
     expect(sizes).toEqual(Array.from({ length: 24 }, () => 0))
-    expect("ownerSize" in result.value && result.value.ownerSize).toBe(0)
+    expect("ownerSize" in resultValue && resultValue.ownerSize).toBe(0)
     expect(await withTimeout(ownerProcess.exited, 5_000)).toBe(0)
   } finally {
     if (ownerIdentity && sameProcess(ownerIdentity)) {
