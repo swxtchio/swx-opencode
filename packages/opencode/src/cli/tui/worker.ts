@@ -113,10 +113,6 @@ export const rpc = {
     void runtime.runFork(task)
     return await spawned.promise
   },
-  testProcessGroupIdentityCount() {
-    if (!process.env.OPENCODE_TEST_HOME) throw new Error("test process-group tracker is not enabled")
-    return groupTracker.identityCount
-  },
   ackProcessGroup(input: { eventID: number }) {
     return groupTracker.acknowledge(input.eventID)
   },

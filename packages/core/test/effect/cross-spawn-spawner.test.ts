@@ -1227,41 +1227,115 @@ describe("cross-spawn spawner", () => {
     )
 
     fx.live(
-      "detached spawn fails and reaps its group when the ownership acknowledgement rejects",
+      "detached spawn releases its owner entry when acquire acknowledgement rejects or is delayed",
       Effect.gen(function* () {
         if (process.platform === "win32") return
 
-        let pgid: number | undefined
-        const group: RecordedProcessGroup = { pgid: undefined, members: [] }
-        yield* Effect.addFinalizer(() => cleanupRecordedProcessGroup(group))
-        CrossSpawnSpawner.setProcessGroupObserver(async (event) => {
-          if (event.action !== "acquire" || event.cleanupOwed) return
-          pgid = event.pgid
-          group.pgid = event.pgid
-          const leader = processIdentity(event.pgid)
-          if (leader) {
-            group.members.push(leader)
-            recordProcess(event.pgid, leader)
-          }
-          expect(groupAlive(event.pgid)).toBe(true)
-          throw new Error("injected process-group acknowledgement rejection")
-        })
-        yield* Effect.addFinalizer(() => Effect.sync(() => CrossSpawnSpawner.setProcessGroupObserver(undefined)))
         const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
-        const result = yield* Effect.exit(
-          spawner.spawn(js("setInterval(() => {}, 1000)", { detached: true })).pipe(Effect.timeout("5 seconds")),
-        )
-        expect(Exit.isFailure(result)).toBe(true)
-        if (Exit.isFailure(result))
-          expect(Cause.prettyErrors(result.cause).join("\n")).toContain("ChildProcess.spawn")
-        if (pgid === undefined) throw new Error("rejected group ownership was not observed")
-        expect(yield* Effect.promise(() => groupGone(pgid!))).toBe(true)
+        for (const mode of ["rejected", "delayed"] as const) {
+          let pgid: number | undefined
+          const events: CrossSpawnSpawner.ProcessGroupEvent[] = []
+          const releaseObserved = Promise.withResolvers<void>()
+          const group: RecordedProcessGroup = { pgid: undefined, members: [] }
+          yield* Effect.addFinalizer(() => cleanupRecordedProcessGroup(group))
+          CrossSpawnSpawner.setProcessGroupObserver(async (event) => {
+            events.push(event)
+            if (event.action === "release") releaseObserved.resolve()
+            if (event.action !== "acquire" || event.cleanupOwed) return
+            pgid = event.pgid
+            group.pgid = event.pgid
+            const leader = processIdentity(event.pgid)
+            if (leader) {
+              group.members.push(leader)
+              recordProcess(event.pgid, leader)
+            }
+            expect(groupAlive(event.pgid)).toBe(true)
+            if (mode === "delayed") await new Promise((resolve) => setTimeout(resolve, 25))
+            throw new Error(`injected ${mode} process-group acknowledgement failure`)
+          })
+          yield* Effect.addFinalizer(() => Effect.sync(() => CrossSpawnSpawner.setProcessGroupObserver(undefined)))
+          const result = yield* Effect.exit(
+            spawner.spawn(js("setInterval(() => {}, 1000)", { detached: true })).pipe(Effect.timeout("10 seconds")),
+          )
+          expect(Exit.isFailure(result)).toBe(true)
+          if (Exit.isFailure(result))
+            expect(Cause.prettyErrors(result.cause).join("\n")).toContain("ChildProcess.spawn")
+          if (pgid === undefined) throw new Error(`${mode} acquire acknowledgement was not observed`)
+          yield* Effect.promise(() => releaseObserved.promise).pipe(Effect.timeout("5 seconds"))
+          expect(events.at(-1)?.action).toBe("release")
+          expect(events.at(-1)?.identity).toEqual(events[0]?.identity)
+          expect(yield* Effect.promise(() => groupGone(pgid!))).toBe(true)
+        }
       }),
-      20_000,
+      30_000,
     )
 
     fx.live(
-      "group cleanup announces its owed ownership before signaling and releases after confirmation",
+      "a late initial-acquire failure does not re-own a leader-exited released group",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+        for (const mode of ["rejected", "delayed"] as const) {
+          const initialObserved = Promise.withResolvers<CrossSpawnSpawner.ProcessGroupEvent>()
+          const releaseObserved = Promise.withResolvers<void>()
+          const allowFailure = Promise.withResolvers<void>()
+          const events: CrossSpawnSpawner.ProcessGroupEvent[] = []
+          const owner = new Map<number, CrossSpawnSpawner.ProcessGroupEvent>()
+          const group: RecordedProcessGroup = { pgid: undefined, members: [] }
+          yield* Effect.addFinalizer(() => cleanupRecordedProcessGroup(group))
+          CrossSpawnSpawner.setProcessGroupObserver(async (event) => {
+            events.push(event)
+            if (event.action === "acquire") owner.set(event.pgid, event)
+            else if (owner.get(event.pgid)?.identity === event.identity) owner.delete(event.pgid)
+            if (event.action === "release") releaseObserved.resolve()
+            if (event.action === "acquire" && !event.cleanupOwed) {
+              group.pgid = event.pgid
+              const leader = processIdentity(event.pgid)
+              if (leader) {
+                group.members.push(leader)
+                recordProcess(event.pgid, leader)
+              }
+              initialObserved.resolve(event)
+              await allowFailure.promise
+              if (mode === "delayed") await new Promise((resolve) => setTimeout(resolve, 25))
+              throw new Error(`injected ${mode} initial-acquire acknowledgement failure`)
+            }
+          })
+          yield* Effect.addFinalizer(() => Effect.sync(() => CrossSpawnSpawner.setProcessGroupObserver(undefined)))
+          const spawning = yield* spawner
+            .spawn(js("setTimeout(() => process.exit(0), 100)", { detached: true }))
+            .pipe(Effect.forkChild)
+          const initial = yield* Effect.promise(() => initialObserved.promise).pipe(Effect.timeout("5 seconds"))
+          const pgid = initial.pgid
+          yield* Effect.promise(() => releaseObserved.promise).pipe(Effect.timeout("5 seconds"))
+          expect(yield* Effect.promise(() => groupGone(pgid))).toBe(true)
+
+          const originalKill = process.kill.bind(process)
+          const signalled: Array<NodeJS.Signals | number | undefined> = []
+          const patchedKill: typeof process.kill = (pid, signal) => {
+            if (pid === -pgid && signal === "SIGKILL") {
+              signalled.push(signal)
+              return true
+            }
+            return originalKill(pid, signal)
+          }
+          yield* Effect.addFinalizer(() => Effect.sync(() => void (process.kill = originalKill)))
+          process.kill = patchedKill
+          allowFailure.resolve()
+          const result = yield* Fiber.join(spawning).pipe(Effect.timeout("5 seconds"), Effect.exit)
+          expect(Exit.isFailure(result)).toBe(true)
+          expect(events.map((event) => event.action)).toEqual(["acquire", "release"])
+          expect(owner.size).toBe(0)
+          expect(signalled).toEqual([])
+          expect(events.at(-1)?.identity).toEqual(initial.identity)
+        }
+      }),
+      30_000,
+    )
+
+    fx.live(
+      "group cleanup signals before a delayed ownership acknowledgement and releases without waiting for its ack",
       Effect.gen(function* () {
         if (process.platform === "win32") return
 
@@ -1270,8 +1344,16 @@ describe("cross-spawn spawner", () => {
         const allowSignal = Promise.withResolvers<void>()
         const releaseAnnounced = Promise.withResolvers<void>()
         const allowReleaseAck = Promise.withResolvers<void>()
+        const releaseAckFinished = Promise.withResolvers<void>()
         const signalIssued = Promise.withResolvers<void>()
         const signalState = { sent: false }
+        let releaseAckSettled = false
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            allowSignal.resolve()
+            allowReleaseAck.resolve()
+          }),
+        )
         CrossSpawnSpawner.setProcessGroupObserver(async (event) => {
           events.push({ action: event.action, cleanupOwed: event.cleanupOwed, groupAlive: groupAlive(event.pgid) })
           if (event.action === "acquire" && event.cleanupOwed) {
@@ -1281,6 +1363,8 @@ describe("cross-spawn spawner", () => {
           if (event.action === "release") {
             releaseAnnounced.resolve()
             await allowReleaseAck.promise
+            releaseAckSettled = true
+            releaseAckFinished.resolve()
           }
         })
         yield* Effect.addFinalizer(() => Effect.sync(() => CrossSpawnSpawner.setProcessGroupObserver(undefined)))
@@ -1304,25 +1388,53 @@ describe("cross-spawn spawner", () => {
         process.kill = patchedKill
         const killing = yield* handle.kill({ killSignal: "SIGUSR2", forceKillAfter: "2 seconds" }).pipe(Effect.forkChild)
         yield* Effect.promise(() => cleanupAnnounced.promise).pipe(Effect.timeout("5 seconds"))
-        expect(sameProcess(leader)).toBe(true)
-        expect(groupAlive(pgid)).toBe(true)
         expect(events.some((event) => event.action === "acquire" && !event.cleanupOwed && event.groupAlive)).toBe(true)
         expect(events.some((event) => event.action === "acquire" && event.cleanupOwed && event.groupAlive)).toBe(true)
-        yield* Effect.promise(() => Bun.sleep(50))
-        expect(signalState.sent).toBe(false)
-        allowSignal.resolve()
         yield* Effect.promise(() => signalIssued.promise).pipe(Effect.timeout("3 seconds"))
+        expect(signalState.sent).toBe(true)
         yield* Effect.promise(() => releaseAnnounced.promise).pipe(Effect.timeout("5 seconds"))
 
         const release = events.find((event) => event.action === "release")
         expect(release?.groupAlive).toBe(false)
-        expect(Option.isNone(yield* Fiber.await(killing).pipe(Effect.timeoutOption("100 millis")))).toBe(true)
-        allowReleaseAck.resolve()
         yield* Fiber.join(killing).pipe(Effect.timeout("5 seconds"))
+        expect(releaseAckSettled).toBe(false)
+        allowReleaseAck.resolve()
+        yield* Effect.promise(() => releaseAckFinished.promise).pipe(Effect.timeout("5 seconds"))
         expect(signalState.sent).toBe(true)
         expect(yield* Effect.promise(() => groupGone(pgid))).toBe(true)
       }),
       20_000,
+    )
+
+    fx.live(
+      "group cleanup still signals and releases after its cleanup-owed acknowledgement rejects",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+
+        const group: RecordedProcessGroup = { pgid: undefined, members: [] }
+        const releaseObserved = Promise.withResolvers<void>()
+        yield* Effect.addFinalizer(() => cleanupRecordedProcessGroup(group))
+        CrossSpawnSpawner.setProcessGroupObserver(async (event) => {
+          if (event.action === "acquire" && event.cleanupOwed)
+            throw new Error("injected cleanup-owed acknowledgement rejection")
+          if (event.action === "release") releaseObserved.resolve()
+        })
+        yield* Effect.addFinalizer(() => Effect.sync(() => CrossSpawnSpawner.setProcessGroupObserver(undefined)))
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+        const handle = yield* spawner.spawn(js("setInterval(() => {}, 1000)", { detached: true }))
+        const pgid = Number(handle.pid)
+        group.pgid = pgid
+        const leader = processIdentity(pgid)
+        if (!leader?.bootID || !leader.startTicks) throw new Error("spawned group leader has no identity")
+        group.members.push(leader)
+        recordProcess(pgid, leader)
+
+        const result = yield* Effect.exit(handle.kill({ forceKillAfter: "2 seconds" }).pipe(Effect.timeout("5 seconds")))
+        expect(Exit.isSuccess(result)).toBe(true)
+        yield* Effect.promise(() => releaseObserved.promise).pipe(Effect.timeout("5 seconds"))
+        expect(yield* Effect.promise(() => groupGone(pgid))).toBe(true)
+      }),
+      15_000,
     )
 
     fx.live(

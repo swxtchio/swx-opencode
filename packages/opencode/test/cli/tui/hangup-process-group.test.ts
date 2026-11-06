@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test"
 import { EventWriter } from "@opencode-ai/core/event/writer"
+import { readFileSync } from "node:fs"
 import { tmpdir } from "../../fixture/fixture"
 import { withTimeout } from "../../../src/util/timeout"
 import path from "node:path"
@@ -28,8 +29,21 @@ function processGroupFixture(value: unknown): ProcessGroupFixture | undefined {
 }
 
 function sameProcess(identity: ProcessIdentity) {
+  if (!identity.bootID || !identity.startTicks) return false
   const current = EventWriter.readIdentity(identity.pid)
   return current?.bootID === identity.bootID && current.startTicks === identity.startTicks
+}
+
+function processGroupMember(pgid: number, identity: ProcessIdentity | undefined) {
+  if (!identity || !sameProcess(identity)) return false
+  try {
+    const stat = readFileSync(`/proc/${identity.pid}/stat`, "utf8")
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ")
+    const current = EventWriter.readIdentity(identity.pid)
+    return current?.bootID === identity.bootID && current.startTicks === identity.startTicks && Number(fields[2]) === pgid
+  } catch {
+    return false
+  }
 }
 
 function groupAlive(pgid: number) {
@@ -66,10 +80,14 @@ test(
     const exitGateFile = path.join(home.path, "tui-hangup-exit-gate")
     const entry = path.join(import.meta.dir, "../../../src/index.ts")
     const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`
+    const initialized = Bun.spawnSync(["git", "init", "-q"], { cwd: home.path, timeout: 5_000 })
+    if (initialized.exitCode !== 0) throw new Error(`could not initialize isolated TUI project: ${initialized.stderr}`)
     const child = Bun.spawn(["script", "-q", "-e", "-c", `${quote(process.execPath)} ${quote(entry)}`, "/dev/null"], {
       cwd: process.cwd(),
       env: {
         ...process.env,
+        GIT_DIR: path.join(home.path, ".git"),
+        GIT_WORK_TREE: process.cwd(),
         HOME: home.path,
         OPENCODE_TEST_HOME: home.path,
         XDG_CONFIG_HOME: path.join(home.path, ".config"),
@@ -97,15 +115,14 @@ test(
       detached: true,
     })
     const launcher = EventWriter.readIdentity(child.pid)
-    if (!launcher?.bootID || !launcher.startTicks) {
-      child.kill("SIGKILL")
-      throw new Error("TUI terminal launcher has no start identity")
-    }
     const output = Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()])
     let tui: ProcessIdentity | undefined
     let group: ProcessGroupFixture | undefined
+    let failure: unknown
 
     try {
+      if (!launcher?.bootID || !launcher.startTicks)
+        throw new Error("TUI terminal launcher has no start identity; cleanup skipped")
       const groupReady = await waitForFile(groupReadyFile, (value) => JSON.parse(value))
       const signalReady = await waitForFile(signalReadyFile, (value) => {
         const pid = Number(value)
@@ -125,7 +142,7 @@ test(
       process.kill(tui.pid, "SIGHUP")
       await waitForFile(stoppedFile, (value) => (value.trim() === "stopped" ? value : undefined))
       const deadline = Date.now() + 10_000
-      while (groupAlive(group.pgid)) {
+      while (sameProcess(group.leader) || sameProcess(group.descendant)) {
         if (Date.now() >= deadline) throw new Error(`terminal SIGHUP left Worker group ${group.pgid} alive`)
         await Bun.sleep(20)
       }
@@ -135,27 +152,49 @@ test(
 
       await Bun.write(exitGateFile, "release")
       const exitCode = await withTimeout(child.exited, 15_000)
-      const [stdout, stderr] = await output
+      const [stdout, stderr] = await withTimeout(output, 5_000)
       if (exitCode !== 0) throw new Error(`terminal TUI exited ${exitCode}: ${stdout}\n${stderr}`)
+    } catch (error) {
+      failure = error
     } finally {
       await Bun.write(exitGateFile, "release")
-      if (group && groupAlive(group.pgid)) {
+      if (group && (sameProcess(group.leader) || sameProcess(group.descendant))) {
         try {
           process.kill(-group.pgid, "SIGKILL")
         } catch {}
+      }
+      if (processGroupMember(child.pid, launcher) || processGroupMember(child.pid, tui)) {
+        try {
+          process.kill(-child.pid, "SIGKILL")
+        } catch {}
+      } else if (groupAlive(child.pid)) {
+        throw new Error(`cannot clean PTY process group ${child.pid} without a current recorded member identity`)
       }
       if (tui && sameProcess(tui)) {
         try {
           process.kill(tui.pid, "SIGKILL")
         } catch {}
       }
-      if (sameProcess(launcher)) {
-        try {
-          process.kill(-launcher.pid, "SIGKILL")
-        } catch {}
+      const exitCode = await withTimeout(child.exited, 5_000).then(
+        (value) => value,
+        () => undefined,
+      )
+      const exited = exitCode !== undefined
+      const drained = await withTimeout(output, 5_000).then(
+        () => true,
+        () => false,
+      )
+      if (!exited) throw new Error("TUI hangup fixture child survived identity-owned cleanup")
+      if (!drained) throw new Error("TUI hangup fixture output did not drain after cleanup")
+      if (failure) {
+        const [stdout, stderr] = await withTimeout(output, 5_000)
+        const files = await Promise.all(
+          [recordFile, groupReadyFile, signalReadyFile, stoppedFile].map((file) => Bun.file(file).exists()),
+        )
+        throw new Error(
+          `${failure instanceof Error ? failure.message : String(failure)}\nexit=${exitCode}\nfiles=${files.join(",")}\n${stdout}\n${stderr}`,
+        )
       }
-      await child.exited
-      await output
     }
   },
   90_000,

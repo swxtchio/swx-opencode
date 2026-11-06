@@ -1,4 +1,5 @@
 import { expect, mock, test } from "bun:test"
+import { EventWriter } from "@opencode-ai/core/event/writer"
 import path from "node:path"
 
 const testName = "runMini interactive attached runtime uses its no-timeout SDK for successful and cancellable calls"
@@ -10,10 +11,12 @@ if (process.env.SWX_MINI_INTERACTIVE_CHILD !== "1") {
   const controlURL = process.env.SWX_MINI_INTERACTIVE_CONTROL_URL
   const controlFile = process.env.SWX_MINI_INTERACTIVE_CONTROL_FILE
   const resultFile = process.env.SWX_MINI_INTERACTIVE_RESULT_FILE
+  const identityFile = process.env.SWX_MINI_INTERACTIVE_IDENTITY_FILE
   const attach = process.env.SWX_MINI_INTERACTIVE_ATTACH_URL
   const session = process.env.SWX_MINI_INTERACTIVE_SESSION
-  if (!requestFile || !controlURL || !controlFile || !resultFile || !attach || !session)
+  if (!requestFile || !controlURL || !controlFile || !resultFile || !identityFile || !attach || !session)
     throw new Error("interactive Mini attach worker inputs are missing")
+  await Bun.write(identityFile, JSON.stringify(EventWriter.self()))
 
   type HealthResult = {
     readonly response: Response
@@ -77,7 +80,7 @@ if (process.env.SWX_MINI_INTERACTIVE_CHILD !== "1") {
       while (Date.now() < cancellationDeadline && healthRequests.length < 2) await Bun.sleep(20)
       if (healthRequests.length < 2) throw new Error("interactive runtime did not issue the cancellable SDK request")
       abort.abort()
-      const cancellation = await cancelledRequest
+      await cancelledRequest
       await Bun.write(
         resultFile,
         JSON.stringify({
@@ -86,7 +89,7 @@ if (process.env.SWX_MINI_INTERACTIVE_CHILD !== "1") {
           timeoutDisabled: healthRequests[0]?.timeoutDisabled,
           cancelTimeoutDisabled: healthRequests[1]?.timeoutDisabled,
           cancelHasSignal: healthRequests[1]?.hasSignal,
-          cancellation: cancellation.type === "failed" ? cancellation.name : cancellation.type,
+          abortRequested: abort.signal.aborted,
         }),
       )
     },
@@ -107,7 +110,7 @@ if (process.env.SWX_MINI_INTERACTIVE_CHILD !== "1") {
       timeoutDisabled: true,
       cancelTimeoutDisabled: true,
       cancelHasSignal: true,
-      cancellation: "AbortError",
+      abortRequested: true,
     })
   })
 }

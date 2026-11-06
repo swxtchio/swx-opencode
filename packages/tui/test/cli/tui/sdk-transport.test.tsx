@@ -10,12 +10,56 @@ import { directory } from "../../fixture/tui-sdk"
 
 const testName = "SDKProvider completes a held external SDK request after Bun's idle timeout"
 
+async function waitWithin<T>(promise: Promise<T>, timeoutMs: number, description: string) {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${description} exceeded ${timeoutMs}ms`)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+function sameProcess(identity: EventWriter.ProcessIdentity) {
+  if (!identity.bootID || !identity.startTicks) return false
+  const current = EventWriter.readIdentity(identity.pid)
+  return current?.bootID === identity.bootID && current.startTicks === identity.startTicks
+}
+
+async function cleanupChild(input: {
+  pid: number
+  exited: Promise<number>
+  identity: EventWriter.ProcessIdentity | undefined
+  output: Promise<[string, string]>
+}) {
+  if (input.identity?.bootID && input.identity.startTicks && sameProcess(input.identity)) {
+    try {
+      process.kill(-input.pid, "SIGKILL")
+    } catch {}
+  }
+  const exited = await waitWithin(input.exited, 5_000, "nested TUI SDK child exit").then(
+    () => true,
+    () => false,
+  )
+  const drained = await waitWithin(input.output, 5_000, "nested TUI SDK output drain").then(
+    () => true,
+    () => false,
+  )
+  if (!exited) throw new Error("nested TUI SDK child survived identity-owned cleanup")
+  if (!drained) throw new Error("nested TUI SDK child output did not drain after cleanup")
+}
+
 test(
   testName,
   async () => {
     if (process.env.SWX_TUI_SDK_IDLE_CHILD !== "1") {
+      if (process.platform !== "linux") return
       const file = path.join(import.meta.dir, "sdk-transport.test.tsx")
-      const child = Bun.spawn([process.execPath, "test", "--timeout", "45_000", file, "-t", testName], {
+      const child = Bun.spawn([process.execPath, "test", "--timeout", "35_000", file, "-t", testName], {
         cwd: process.cwd(),
         env: {
           ...process.env,
@@ -28,35 +72,25 @@ test(
         detached: true,
       })
       const identity = EventWriter.readIdentity(child.pid)
-      if (!identity?.bootID || !identity.startTicks) {
-        child.kill("SIGKILL")
-        throw new Error("nested TUI SDK test has no recorded process identity")
-      }
       const output = Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()])
       let timer: ReturnType<typeof setTimeout> | undefined
       try {
+        if (!identity?.bootID || !identity.startTicks)
+          throw new Error("nested TUI SDK test has no recorded process identity; cleanup skipped")
         const outcome = await Promise.race([
           child.exited.then((exitCode) => ({ type: "exit" as const, exitCode })),
           new Promise<{ type: "timeout" }>((resolve) => {
-            timer = setTimeout(() => resolve({ type: "timeout" }), 50_000)
+            timer = setTimeout(() => resolve({ type: "timeout" }), 40_000)
           }),
         ])
         if (timer) clearTimeout(timer)
-        const [stdout, stderr] = await output
-        if (outcome.type === "timeout")
-          throw new Error(`nested TUI SDK behavior test timed out\n${stdout}\n${stderr}`)
+        if (outcome.type === "timeout") throw new Error("nested TUI SDK behavior test timed out")
+        const [stdout, stderr] = await waitWithin(output, 5_000, "nested TUI SDK output drain")
         if (outcome.exitCode !== 0) throw new Error(`${stdout}\n${stderr}`)
         expect(outcome.exitCode).toBe(0)
       } finally {
         if (timer) clearTimeout(timer)
-        const current = EventWriter.readIdentity(identity.pid)
-        if (current?.bootID === identity.bootID && current.startTicks === identity.startTicks) {
-          try {
-            process.kill(-identity.pid, "SIGKILL")
-          } catch {}
-        }
-        await child.exited
-        await output
+        await cleanupChild({ pid: child.pid, exited: child.exited, identity, output })
       }
       return
     }
@@ -215,3 +249,118 @@ test(
   },
   60_000,
 )
+
+test("SDKProvider keeps ordinary external transport and caller cancellation portable", async () => {
+  const mounted = Promise.withResolvers<void>()
+  const heldStarted = Promise.withResolvers<void>()
+  const heldCancelled = Promise.withResolvers<void>()
+  const encoder = new TextEncoder()
+  let healthRequests = 0
+  const server = Bun.serve({
+    port: 0,
+    idleTimeout: 30,
+    fetch: () => {
+      healthRequests += 1
+      if (healthRequests === 1) return Response.json({ healthy: true, version: "portable" })
+      heldStarted.resolve()
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode("partial"))
+          },
+          pull: () => new Promise<void>(() => {}),
+          cancel() {
+            heldCancelled.resolve()
+          },
+        }),
+        { headers: { "content-type": "application/json" } },
+      )
+    },
+  })
+
+  const events = {
+    async subscribe() {
+      return () => {}
+    },
+  }
+  let app: Awaited<ReturnType<typeof testRender>> | undefined
+  let client!: ReturnType<typeof useSDK>
+  function Probe() {
+    client = useSDK()
+    onMount(() => mounted.resolve())
+    return <box />
+  }
+
+  const abort = new AbortController()
+  try {
+    app = await testRender(() => (
+      <TestTuiContexts>
+        <SDKProvider url={server.url.toString()} directory={directory} events={events}>
+          <Probe />
+        </SDKProvider>
+      </TestTuiContexts>
+    ))
+    await mounted.promise
+    const health = await client.client.global.health()
+    expect(health.data?.healthy).toBe(true)
+
+    const cancellation = client.client.global.health({ signal: abort.signal }).then(
+      () => "completed",
+      (error: unknown) => (error instanceof Error ? error.name : "unknown"),
+    )
+    await heldStarted.promise
+    abort.abort()
+    await heldCancelled.promise
+    await cancellation
+    expect(healthRequests).toBe(2)
+  } finally {
+    abort.abort()
+    if (app && !app.renderer.isDestroyed) app.renderer.destroy()
+    await server.stop(true)
+  }
+}, 15_000)
+
+test("nested SDK fixture bounds identity-owned cleanup when a child holds its output pipes", async () => {
+  if (process.platform !== "linux") return
+  const child = Bun.spawn([process.execPath, "-e", "process.stdout.write('held-ready\\n'); setInterval(() => {}, 1000)"], {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    detached: true,
+  })
+  const identity = EventWriter.readIdentity(child.pid)
+  const ready = Promise.withResolvers<void>()
+  const stdout = (async () => {
+    const reader = child.stdout.getReader()
+    const decoder = new TextDecoder()
+    let output = ""
+    while (true) {
+      const result = await reader.read()
+      if (result.done) return output
+      output += decoder.decode(result.value)
+      if (output.includes("held-ready")) ready.resolve()
+    }
+  })()
+  const output = Promise.all([stdout, new Response(child.stderr).text()])
+
+  try {
+    if (!identity?.bootID || !identity.startTicks) throw new Error("held-pipe child has no recorded process identity")
+    await waitWithin(ready.promise, 5_000, "held-pipe child readiness")
+    expect(sameProcess(identity)).toBe(true)
+    const exitOutcome = await waitWithin(child.exited, 100, "held-pipe child exit").then(
+      () => "exited",
+      () => "timed-out",
+    )
+    expect(exitOutcome).toBe("timed-out")
+    await cleanupChild({ pid: child.pid, exited: child.exited, identity, output })
+    expect(sameProcess(identity)).toBe(false)
+  } finally {
+    if (identity?.bootID && identity.startTicks && sameProcess(identity)) {
+      try {
+        process.kill(-identity.pid, "SIGKILL")
+      } catch {}
+    }
+    await waitWithin(child.exited, 5_000, "held-pipe child exit").catch(() => undefined)
+    await waitWithin(output, 5_000, "held-pipe output drain").catch(() => undefined)
+  }
+}, 20_000)

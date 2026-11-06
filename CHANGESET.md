@@ -135,65 +135,18 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
-- **#410** Backport `anomalyco/opencode#55149` (`52a10f573f1da5103c85990da9341e3645a39365`), `#55007`
-  (`460c626acd9e3de8fdffc27bde99bb5f070bb70f`), and `#59411`
-  (`e2bc79dc0bae112b79ab780f7c1a63db8a7f7dae`) in separate `git cherry-pick -x` commits. Assigned behavior is
-  complete: #55149's payload is partial because its existing-session shell-failure UI recovery is unassigned; #55007's
-  payload is complete; #59411's payload is partial because its upstream CLI shutdown-deadline module is absent here
-  and was not imported. `packages/core/src/no-timeout-fetch.ts` is wired to
-  `packages/tui/src/context/sdk.tsx` and `packages/opencode/src/cli/cmd/run.ts` for long TUI/run/mini requests;
-  `packages/core/src/effect/app-node-platform.ts` applies the donor-faithful replace-not-merge of
-  `FetchHttpClient.RequestInit` (`{ timeout: false }`) at native `RequestExecutor` composition; the high-level
-  TUI/run/mini fetch wrapper preserves its caller's other request options and abort signal. Provider caller deadlines
-  and fork #303's generation-progress watchdog remain independent of Bun's idle timeout.
-  `packages/core/src/cross-spawn-spawner.ts` reports acknowledged group ownership changes from the TUI server Worker;
-  Worker `shutdown` signals and confirms remaining owned groups before replying. `packages/opencode/src/cli/tui/process-group.ts`
-  is the shared parent owner implementation used by `TuiThreadCommand`: it owns the event ledger, identity-checked
-  release acknowledgements, Worker-error hook, owner-exit hook and default five-second stop backstop. The Worker-side
-  identity cache is `ProcessGroup.makeWorkerTracker` and drops a group identity only after its release is acknowledged.
-  The deterministic Worker group-spawn and shutdown-gate RPCs remain test-only, guarded by `OPENCODE_TEST_HOME` and
-  (for spawning) the record-file setting; they exercise the real Worker RPC and `CrossSpawnSpawner` without a provider
-  turn, and the gate is used only to hold the missing-shutdown-reply case. The PTY hangup regression also uses
-  `OPENCODE_TEST_HOME` plus `SWX_TUI_GROUP_TUI_TEST` to publish signal-readiness and hold the owner at an exit gate,
-  distinguishing the graceful stop/finally path from the process-exit backstop. Fork #380 cancellation escalation and
-  intentional descendant release remain intact. The terminal SIGHUP adaptation is in
-  `packages/tui/src/app.tsx` / `packages/tui/src/terminal-signal.ts`: terminal TUI hangup runs graceful cleanup,
-  nohup's non-TTY ignore remains untouched, and a non-TTY non-nohup TUI retains the OS default SIGHUP action rather
-  than installing graceful cleanup. `packages/core/test/effect/cross-spawn-spawner.test.ts` proves that rejecting an
-  acquisition acknowledgement fails and reaps the spawn, cleanup ownership is announced while the group is alive
-  before signaling, the release event follows group-death confirmation, and cleanup waits for the release
-  acknowledgement. `packages/opencode/test/cli/tui/worker-process-group.test.ts` drives the shared production owner
-  helper with the real Server Worker (`worker-process-group-owner.ts`) and checks abrupt owner exit during gated
-  shutdown, Worker termination followed by owner exit, the real five-second no-reply backstop, cleanup-owed leader
-  exit, deliberate descendant release, Worker-error handling and acknowledged shutdown; it also verifies the Worker
-  identity cache is pruned after release.
-  `packages/opencode/test/cli/tui/hangup-process-group.test.ts` sends terminal SIGHUP to a PTY-backed TUI that owns a
-  live group and confirms `TuiThreadCommand` reaches its `finally` stop path, removes the group while the owner is held
-  alive at a test exit gate, and only then exits. `packages/tui/test/cli/tui/sdk-transport.test.tsx` restores a held
-  SDK response body cancellation on renderer destroy and proves an ordinary SDK health call survives the shortened
-  idle window. `packages/opencode/test/cli/run/mini-attach.test.ts` and
-  `packages/opencode/test/cli/run/mini-attach-interactive-worker.test.ts` exercise the successful `runMini` interactive
-  handoff: a harness runtime issues held successful and cancellable SDK calls through the client passed by production
-  `RunCommand`. The retained `packages/core/test/no-timeout-fetch.test.ts` cases prove request-init preservation and
-  caller-signal cancellation. `packages/core/test/effect/app-node-platform.test.ts` proves native provider requests
-  replace a configured timeout with `false` at `RequestExecutor`, survive a short-idle control, and still abort on a
-  caller deadline. `packages/opencode/test/cli/run/run-process.test.ts` holds an attached provider response past a
-  short injected idle timeout and verifies the answer is persisted. `packages/opencode/test/session/llm.test.ts`
-  proves the #303 watchdog rejects keepalive-only stalls while Foundry reasoning and structured Chat/OpenRouter/
-  Mistral progress keeps a live attempt active. `packages/tui/test/app-lifecycle.test.tsx` distinguishes terminal
-  SIGHUP cleanup, nohup survival, and the non-TTY OS default action. The owner-process-exit, Worker-error,
-  stop-backstop, release-ledger, and Worker identity-pruning mutation checks each made their matching process-group
-  regression fail. Removing the TuiThread run-finally stop link made the PTY hangup regression fail. Core observer
-  mutation checks also failed when spawn-ack rejection,
-  pre-signal announcement, confirmed group wait or release-ack waiting was removed; all mutations were restored.
-  Held-request witnesses use child Bun 1.4.4 processes with
-  `BUN_CONFIG_HTTP_IDLE_TIMEOUT=2`, so none needs to wait past the real idle default; control fetches expire before
-  TUI/mini/native requests are released. The pre-review unmodified-default Bun 1.4.4 run is historical acceptance
-  evidence for the native and attached paths, not a test timing requirement. Removing `timeout: false` from
-  `noTimeoutFetch` made the held ordinary TUI SDK witness fail with `TimeoutError`; restoring it made the focused test
-  pass. Round-two local validation is focused under verified Bun 1.4.4; the full suite and typecheck are pending
-  Firstmate's leased build-box run per the captain ruling.
-  _Partly upstream._
+- **#410** Backport `anomalyco/opencode#55149` (`52a10f573f1da5103c85990da9341e3645a39365`), `#55007` (`460c626acd9e3de8fdffc27bde99bb5f070bb70f`), and `#59411` (`e2bc79dc0bae112b79ab780f7c1a63db8a7f7dae`) in separate `git cherry-pick -x` commits, retaining each donor trailer. Assigned behavior is complete; #55149's payload is partial because its existing-session shell-failure UI recovery is unassigned, #55007's payload is complete, and #59411's payload is partial because its upstream CLI shutdown-deadline module is absent here and was not imported. _Partly upstream._
+  - `packages/core/src/no-timeout-fetch.ts` is wired to `packages/tui/src/context/sdk.tsx` and `packages/opencode/src/cli/cmd/run.ts` for long TUI/run/mini requests; `packages/core/src/effect/app-node-platform.ts` applies the donor-faithful replace-not-merge of `FetchHttpClient.RequestInit` (`{ timeout: false }`) at native `RequestExecutor` composition, while the high-level fetch wrapper preserves caller request options and abort signals. Provider caller deadlines and fork #303's generation-progress watchdog remain independent of Bun's idle timeout.
+  - `packages/core/src/cross-spawn-spawner.ts` captures each detached leader's process identity in its ownership events; detached Worker spawn waits for the parent acquire acknowledgement and fails/reaps if `ProcessGroup.makeWorkerTracker` does not receive it within its configured five-second timeout. Failed and late acknowledgements do not reverse local release or cleanup facts, cleanup signals before waiting on acknowledgement, and release events retain the original identity after the leader exits.
+  - `packages/opencode/src/cli/tui/process-group.ts` is the shared parent owner used by `TuiThreadCommand`; its Worker tracker snapshots live group-member identities for cleanup/release after leader exit and retains them across release/reacquire. The owner revalidates both process identity and current group membership before signalling a PGID. The Worker-error hook, owner-exit hook, and default stop backstop remain; the test-only `testProcessGroupIdentityCount` RPC was removed.
+  - Preserve fork #380 cancellation escalation. A generic detached spawn without `forceKillAfter` whose leader exits abnormally is deliberately released from exit-hook ownership; its later scope finalizer may still send TERM. The non-renderer `run`/`serve` SIGHUP/SIGTERM gap is tracked by swxtchio/swx-opencode#417.
+  - `packages/tui/src/app.tsx` creates the OpenTUI renderer without overriding its `exitSignals`, so the renderer's own SIGHUP handler destroys it regardless of TTY state; `TuiThreadCommand` then reaches its stop/finally owner cleanup. `registerTerminalSighup` only gates the app-level listener and does not preserve nohup or non-TTY SIGHUP behavior; this change makes no such preservation claim.
+  - `packages/core/test/effect/cross-spawn-spawner.test.ts` covers rejected/delayed initial-acquire acknowledgements, late acquire failure after a local leader-exit release, cleanup-owed announcements rejected or delayed, group death, and identity-stable release. `packages/opencode/test/cli/tui/worker-process-group.test.ts` drives the shared owner with the real Worker and checks rejected/delayed release acknowledgements, stale-PGID signalling, cleanup-owed leader exit, release/reacquire with a surviving descendant, intentional descendant release, Worker failure, and shutdown. Its process fixtures revalidate recorded member identities before emergency group cleanup and fail without signalling when identity is unavailable.
+  - `packages/opencode/test/tool/shell.test.ts` retains its abort/interruption regressions asserting that a TERM-resistant command's output-write refusal still ends with both its process and recorded group gone.
+  - `packages/opencode/test/cli/tui/hangup-process-group.test.ts` sends terminal SIGHUP to a PTY-backed TUI and confirms the stop/finally path removes a live Worker group before the owner exits. `packages/tui/test/cli/tui/sdk-transport.test.tsx` proves the held SDK request survives the shortened idle window, preserves portable caller-cancellation coverage, and bounds a held-pipe child cleanup; `packages/opencode/test/cli/run/mini-attach.test.ts` and `packages/opencode/test/cli/run/mini-attach-interactive-worker.test.ts` exercise successful and cancellable `runMini` SDK calls through production `RunCommand` and record both the PTY launcher and command identities.
+  - `packages/core/test/no-timeout-fetch.test.ts` proves request-init preservation and caller-signal cancellation; `packages/core/test/effect/app-node-platform.test.ts` proves native provider requests replace configured timeout with `false` at `RequestExecutor`, survive a short-idle control, and abort on caller deadline; `packages/opencode/test/cli/run/run-process.test.ts` holds an attached provider response past a short injected idle timeout; and `packages/opencode/test/session/llm.test.ts` preserves the #303 keepalive-only stall watchdog while valid reasoning and structured progress keep attempts live.
+  - `packages/tui/test/app-lifecycle.test.tsx` exercises `registerTerminalSighup` listener gating in isolation, not OpenTUI's renderer-backed production signal policy. Held-request witnesses use child Bun 1.4.4 processes with `BUN_CONFIG_HTTP_IDLE_TIMEOUT=2`; the prior unmodified-default Bun 1.4.4 run remains historical acceptance evidence, not a test timing requirement. Removing `timeout: false` from `noTimeoutFetch` made the held ordinary TUI SDK witness fail with `TimeoutError`.
+  - Review-fix focused tests pass under checksum-verified Bun 1.4.4; the final suite and typecheck remain firstmate's leased build-box gate.
 - **#406** Backport `anomalyco/opencode#54023` (`94353780cf289dcecee2866322dbbe1f34d51641`) to coordinate provider OAuth refresh across concurrent callers. The required provider-refresh behavior is complete; donor payload is partial.
   - Adapt `packages/core/src/credential.ts` to add `Credential.lock` to the fork's global service and use its existing `EffectFlock`; keep `packages/core/src/integration.ts`'s `Integration.connection.resolve` Location-owned, re-read stored state inside the lock, and preserve key, environment, missing-credential, fresh-token and no-refresh behavior. MCP SDK refresh and provider-401 recovery remain out of scope.
   - Omit the donor's upstream-only `CredentialLegacy`, Bus and ErrorSummary plumbing and interface-only updates to upstream config/MCP OAuth test doubles; do not restore the deleted MCP OAuth suite or config fixture.

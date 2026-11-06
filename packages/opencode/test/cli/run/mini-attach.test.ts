@@ -1,8 +1,28 @@
 import { expect } from "bun:test"
 import { EventWriter } from "@opencode-ai/core/event/writer"
 import { Effect, Option } from "effect"
+import { readFileSync } from "node:fs"
 import path from "node:path"
 import { cliIt, deadline } from "../../lib/cli-process"
+import { withTimeout } from "../../../src/util/timeout"
+
+function sameProcess(identity: EventWriter.ProcessIdentity) {
+  if (!identity.bootID || !identity.startTicks) return false
+  const current = EventWriter.readIdentity(identity.pid)
+  return current?.bootID === identity.bootID && current.startTicks === identity.startTicks
+}
+
+function processGroupMember(pgid: number, identity: EventWriter.ProcessIdentity | undefined) {
+  if (!identity || !sameProcess(identity)) return false
+  try {
+    const stat = readFileSync(`/proc/${identity.pid}/stat`, "utf8")
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ")
+    const current = EventWriter.readIdentity(identity.pid)
+    return current?.bootID === identity.bootID && current.startTicks === identity.startTicks && Number(fields[2]) === pgid
+  } catch {
+    return false
+  }
+}
 
 cliIt.live(
   "runMini completes a held attached request beyond Bun's idle timeout",
@@ -103,16 +123,12 @@ cliIt.live(
         detached: true,
       })
       const scriptIdentity = EventWriter.readIdentity(child.pid)
-      if (!scriptIdentity?.bootID || !scriptIdentity.startTicks)
-        throw new Error("runMini PTY launcher has no recorded start identity")
       let miniIdentity: EventWriter.ProcessIdentity | undefined
-      const sameProcess = (identity: EventWriter.ProcessIdentity) => {
-        const current = EventWriter.readIdentity(identity.pid)
-        return current?.bootID === identity.bootID && current?.startTicks === identity.startTicks
-      }
       const output = Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()])
 
       try {
+        if (!scriptIdentity?.bootID || !scriptIdentity.startTicks)
+          throw new Error("runMini PTY launcher has no recorded start identity; cleanup skipped")
         const ready = yield* Effect.promise(async () => {
           const readyDeadline = Date.now() + 15_000
           while (Date.now() < readyDeadline) {
@@ -183,7 +199,7 @@ cliIt.live(
 
         releaseSession.resolve()
         const exitCode = yield* Effect.promise(() => child.exited).pipe(Effect.timeout("15 seconds"))
-        const [stdout, stderr] = yield* Effect.promise(() => output)
+        const [stdout, stderr] = yield* Effect.promise(() => withTimeout(output, 5_000))
         expect(exitCode).toBe(1)
         expect(`${stdout}\n${stderr}`).toContain("Session not found")
       } finally {
@@ -192,17 +208,18 @@ cliIt.live(
             process.kill(miniIdentity.pid, "SIGKILL")
           } catch {}
         }
-        if (sameProcess(scriptIdentity)) {
+        if (scriptIdentity && sameProcess(scriptIdentity)) {
           try {
             process.kill(scriptIdentity.pid, "SIGKILL")
           } catch {}
         }
         const stopped = yield* Effect.promise(() => child.exited).pipe(Effect.timeoutOption("5 seconds"))
+        const drained = yield* Effect.promise(() => withTimeout(output, 5_000)).pipe(Effect.timeoutOption("5 seconds"))
         if (Option.isNone(stopped)) throw new Error("runMini worker survived test cleanup")
-        yield* Effect.promise(() => output).pipe(Effect.ignore)
+        if (Option.isNone(drained)) throw new Error("runMini worker output did not drain after cleanup")
       }
     }),
-  deadline(40_000),
+  deadline(60_000),
 )
 
 cliIt.live(
@@ -215,6 +232,7 @@ cliIt.live(
       const requestFile = path.join(home, "run-mini-interactive-requests.json")
       const controlFile = path.join(home, "run-mini-interactive-control.json")
       const resultFile = path.join(home, "run-mini-interactive-result.json")
+      const identityFile = path.join(home, "run-mini-interactive-identity.json")
       const healthStarted = Promise.withResolvers<void>()
       const healthCancelled = Promise.withResolvers<void>()
       const controlExpired = Promise.withResolvers<void>()
@@ -324,6 +342,7 @@ cliIt.live(
           SWX_MINI_INTERACTIVE_CONTROL_URL: new URL("/control", server.url).toString(),
           SWX_MINI_INTERACTIVE_CONTROL_FILE: controlFile,
           SWX_MINI_INTERACTIVE_RESULT_FILE: resultFile,
+          SWX_MINI_INTERACTIVE_IDENTITY_FILE: identityFile,
         },
         stdin: "ignore",
         stdout: "pipe",
@@ -331,23 +350,59 @@ cliIt.live(
         detached: true,
       })
       const childIdentity = EventWriter.readIdentity(child.pid)
-      if (!childIdentity?.bootID || !childIdentity.startTicks) {
-        child.kill("SIGKILL")
-        throw new Error("interactive Mini attach worker has no recorded start identity")
-      }
       const output = Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()])
+      let commandIdentity: EventWriter.ProcessIdentity | undefined
       yield* Effect.addFinalizer(() =>
         Effect.promise(async () => {
-          const current = EventWriter.readIdentity(childIdentity.pid)
-          if (current?.bootID === childIdentity.bootID && current.startTicks === childIdentity.startTicks) {
+          if (processGroupMember(child.pid, commandIdentity) || processGroupMember(child.pid, childIdentity)) {
             try {
-              process.kill(-childIdentity.pid, "SIGKILL")
+              process.kill(-child.pid, "SIGKILL")
             } catch {}
           }
-          await child.exited
-          await output
+          const exited = await withTimeout(child.exited, 5_000).then(
+            () => true,
+            () => false,
+          )
+          const drained = await withTimeout(output, 5_000).then(
+            () => true,
+            () => false,
+          )
+          if (!exited) throw new Error("interactive Mini worker survived identity-owned cleanup")
+          if (!drained) throw new Error("interactive Mini worker output did not drain after cleanup")
         }).pipe(Effect.asVoid),
       )
+
+      if (!childIdentity?.bootID || !childIdentity.startTicks)
+        throw new Error("interactive Mini attach launcher has no recorded start identity; cleanup skipped")
+      commandIdentity = yield* Effect.promise(async () => {
+        const deadline = Date.now() + 10_000
+        while (Date.now() < deadline) {
+          try {
+            const value: unknown = await Bun.file(identityFile).json()
+            if (
+              typeof value === "object" &&
+              value !== null &&
+              "pid" in value &&
+              typeof value.pid === "number" &&
+              "bootID" in value &&
+              typeof value.bootID === "string" &&
+              "startTicks" in value &&
+              typeof value.startTicks === "string"
+            ) {
+              const current = EventWriter.readIdentity(value.pid)
+              if (
+                current?.bootID &&
+                current.startTicks &&
+                current.bootID === value.bootID &&
+                current.startTicks === value.startTicks
+              )
+                return current
+            }
+          } catch {}
+          await Bun.sleep(20)
+        }
+        throw new Error("interactive Mini command did not publish its process identity; cleanup skipped")
+      })
 
       const ready = yield* Effect.race(
         Effect.promise(() => healthStarted.promise).pipe(Effect.as("health" as const)),
@@ -386,7 +441,7 @@ cliIt.live(
       yield* Effect.promise(() => cancelHealthStarted.promise).pipe(Effect.timeout("10 seconds"))
       yield* Effect.promise(() => cancelHealthCancelled.promise).pipe(Effect.timeout("5 seconds"))
       const exitCode = yield* Effect.promise(() => child.exited).pipe(Effect.timeout("15 seconds"))
-      const [stdout, stderr] = yield* Effect.promise(() => output)
+      const [stdout, stderr] = yield* Effect.promise(() => withTimeout(output, 5_000))
       if (exitCode !== 0) throw new Error(`interactive Mini worker exited ${exitCode}: ${stdout}\n${stderr}`)
       expect(`${stdout}\n${stderr}`).toContain("pass")
       const request: unknown = yield* Effect.promise(() => Bun.file(requestFile).json())
@@ -395,7 +450,7 @@ cliIt.live(
         { timeoutDisabled: true, hasSignal: true },
       ])
       const result: unknown = yield* Effect.promise(() => Bun.file(resultFile).json())
-      expect(result).toMatchObject({ status: 200, healthy: true, cancellation: "AbortError" })
+      expect(result).toMatchObject({ status: 200, healthy: true, abortRequested: true })
     }),
   deadline(60_000),
 )

@@ -15,7 +15,7 @@ const nativeIdleTestName = "native provider requests survive a short Bun idle ti
 it.live(
   nativeIdleTestName,
   Effect.gen(function* () {
-    if (process.platform === "win32") return
+    if (process.env.SWX_CORE_IDLE_TEST_CHILD !== "1" && process.platform !== "linux") return
     if (process.env.SWX_CORE_IDLE_TEST_CHILD !== "1") {
       const child = Bun.spawn(
         [process.execPath, "test", "--timeout", "35_000", path.join(import.meta.dir, "app-node-platform.test.ts"), "-t", nativeIdleTestName],
@@ -33,26 +33,27 @@ it.live(
         },
       )
       const identity = EventWriter.readIdentity(child.pid)
-      if (!identity?.bootID || !identity.startTicks) {
-        child.kill("SIGKILL")
-        throw new Error("native idle-timeout test child has no recorded process identity")
-      }
       const output = Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()])
       try {
-        const exitCode = yield* Effect.promise(() => child.exited).pipe(Effect.timeout("40 seconds"))
-        const [stdout, stderr] = yield* Effect.promise(() => output)
+        if (!identity?.bootID || !identity.startTicks)
+          throw new Error("native idle-timeout test child has no recorded process identity; cleanup skipped")
+        const exitCode = yield* Effect.promise(() => child.exited).pipe(Effect.timeout("30 seconds"))
+        const [stdout, stderr] = yield* Effect.promise(() => output).pipe(Effect.timeout("5 seconds"))
         expect(exitCode).toBe(0)
         if (exitCode !== 0) throw new Error(`${stdout}\n${stderr}`)
       } finally {
-        const current = EventWriter.readIdentity(identity.pid)
-        if (current?.bootID === identity.bootID && current.startTicks === identity.startTicks) {
-          try {
-            process.kill(-identity.pid, "SIGKILL")
-          } catch {}
+        if (identity?.bootID && identity.startTicks) {
+          const current = EventWriter.readIdentity(identity.pid)
+          if (current?.bootID === identity.bootID && current.startTicks === identity.startTicks) {
+            try {
+              process.kill(-identity.pid, "SIGKILL")
+            } catch {}
+          }
         }
         const stopped = yield* Effect.promise(() => child.exited).pipe(Effect.timeoutOption("5 seconds"))
+        const drained = yield* Effect.promise(() => output).pipe(Effect.timeoutOption("5 seconds"))
         if (Option.isNone(stopped)) throw new Error("native idle-timeout test child survived cleanup")
-        yield* Effect.promise(() => output).pipe(Effect.ignore)
+        if (Option.isNone(drained)) throw new Error("native idle-timeout test child output did not drain after cleanup")
       }
       return
     }

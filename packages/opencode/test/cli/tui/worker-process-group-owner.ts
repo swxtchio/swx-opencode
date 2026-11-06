@@ -49,6 +49,7 @@ const action = process.env.SWX_TUI_OWNER_ACTION
 const recordFile = process.env.SWX_TUI_GROUP_RECORD_FILE
 const resultFile = process.env.SWX_TUI_OWNER_RESULT_FILE
 const ownerStartFile = process.env.SWX_TUI_OWNER_START_FILE
+const acknowledgementMode = process.env.SWX_TUI_GROUP_ACK_MODE
 if (!action || !recordFile || !resultFile || !ownerStartFile)
   throw new Error("TUI process-group owner fixture inputs are missing")
 const ownerIdentity = EventWriter.readIdentity(process.pid)
@@ -63,15 +64,31 @@ const worker = new Worker(path.join(import.meta.dir, "../../../src/cli/tui/worke
 })
 const client = Rpc.client<typeof rpc>(worker)
 const shutdownStarted = Promise.withResolvers<void>()
+const releaseAckDone = Promise.withResolvers<void>()
+const eventsByID = new Map<number, ProcessGroup.Event>()
 const events: { action: string; cleanupOwed: boolean; groupAlive: boolean }[] = []
 const owner = ProcessGroup.makeOwner({
   client: {
     subscribe: (handler) =>
       client.on<ProcessGroup.Event>("process.group", (event) => {
+        eventsByID.set(event.eventID, event)
         events.push({ action: event.action, cleanupOwed: event.cleanupOwed, groupAlive: groupAlive(event.pgid) })
         handler(event)
       }),
-    acknowledge: async (eventID) => client.call("ackProcessGroup", { eventID }),
+    acknowledge: async (eventID) => {
+      const event = eventsByID.get(eventID)
+      if (event?.action === "release" && acknowledgementMode === "rejected") {
+        releaseAckDone.resolve()
+        throw new Error("injected release acknowledgement rejection")
+      }
+      if (event?.action === "release" && acknowledgementMode === "delayed") {
+        await new Promise((resolve) => setTimeout(resolve, 5_250))
+        const result = await client.call("ackProcessGroup", { eventID })
+        releaseAckDone.resolve()
+        return result
+      }
+      return client.call("ackProcessGroup", { eventID })
+    },
     shutdown: async () => {
       shutdownStarted.resolve()
       return client.call("shutdown", undefined)
@@ -128,7 +145,7 @@ const record = await waitForRecord()
 if (record.pgid !== started.pgid || !sameIdentity(record.leader, started.identity))
   throw new Error(`Worker record ${record.pgid} did not match acknowledged PGID ${started.pgid}`)
 const pgid = record.pgid
-if (action === "cleanup-owed" || action === "release") await Bun.write(`${recordFile}.exit`, "exit")
+if (action === "cleanup-owed" || action.startsWith("release")) await Bun.write(`${recordFile}.exit`, "exit")
 
 if (action === "exit") {
   void owner.stop()
@@ -158,12 +175,13 @@ if (action === "cleanup-owed") {
   process.exit(0)
 }
 
-if (action === "release") {
+if (action.startsWith("release")) {
   await waitFor(() => !owner.has(pgid), "the acknowledged release event")
-  const identityCount = await client.call("testProcessGroupIdentityCount", undefined)
+  if (acknowledgementMode === "delayed") await releaseAckDone.promise
+  if (acknowledgementMode) await owner.stop()
   await Bun.write(
     resultFile,
-    JSON.stringify({ ownerSize: owner.size, identityCount, descendantAlive: sameProcess(record.descendant), events }),
+    JSON.stringify({ ownerSize: owner.size, descendantAlive: sameProcess(record.descendant), events }),
   )
   process.exit(0)
 }
