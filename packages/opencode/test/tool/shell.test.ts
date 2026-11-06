@@ -1525,6 +1525,8 @@ const sigtermResistant = Effect.fn("ShellToolTest.sigtermResistant")(function* (
   const dir = yield* tmpdirScoped()
   const pidFile = path.join(dir, "pid")
   const consumed = Deferred.makeUnsafe<void>()
+  // ShellTool parses and prepares the command before spawning; start the output deadline after this readiness signal.
+  const spawned = Deferred.makeUnsafe<void>()
   const processGroup = { value: undefined as ShellProcessGroup | undefined }
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
   const signalling = ChildProcessSpawner.make((command) =>
@@ -1542,6 +1544,7 @@ const sigtermResistant = Effect.fn("ShellToolTest.sigtermResistant")(function* (
           })
         })(),
       ),
+      Effect.tap(() => Deferred.succeed(spawned, undefined)),
     ),
   )
   const tool = yield* Tool.init(
@@ -1552,6 +1555,7 @@ const sigtermResistant = Effect.fn("ShellToolTest.sigtermResistant")(function* (
   return {
     tool,
     consumed,
+    spawned,
     processGroup,
     command: `exec ${bin} -e ${squote(program)}`,
     alive: pid.pipe(
@@ -1602,7 +1606,17 @@ describe("tool.shell teardown", () => {
               refusing({ abort: controller.signal, refuse: () => controller.signal.aborted, refused }),
             )
             .pipe(Effect.exit, Effect.forkDetach)
-          yield* Deferred.await(shell.consumed).pipe(Effect.timeout("5 seconds"))
+          const spawned = yield* Effect.raceAll([
+            Deferred.await(shell.spawned).pipe(Effect.as("spawned" as const)),
+            Fiber.await(execution).pipe(Effect.as("finished" as const)),
+          ])
+          expect(spawned).toBe("spawned")
+          const ready = yield* Deferred.await(shell.consumed).pipe(Effect.timeoutOption("5 seconds"))
+          if (ready._tag === "None") {
+            controller.abort()
+            const cleanup = yield* Fiber.await(execution).pipe(Effect.timeoutOption("12 seconds"))
+            throw new Error(`Shell command did not emit output after spawn; cleanup=${cleanup._tag}`)
+          }
           controller.abort()
           const completion = yield* Fiber.await(execution).pipe(Effect.timeoutOption("12 seconds"))
           expect({
@@ -1636,7 +1650,17 @@ describe("tool.shell teardown", () => {
               refusing({ abort: new AbortController().signal, refuse: () => interrupting, refused }),
             )
             .pipe(Effect.forkDetach)
-          yield* Deferred.await(shell.consumed).pipe(Effect.timeout("5 seconds"))
+          const spawned = yield* Effect.raceAll([
+            Deferred.await(shell.spawned).pipe(Effect.as("spawned" as const)),
+            Fiber.await(execution).pipe(Effect.as("finished" as const)),
+          ])
+          expect(spawned).toBe("spawned")
+          const ready = yield* Deferred.await(shell.consumed).pipe(Effect.timeoutOption("5 seconds"))
+          if (ready._tag === "None") {
+            interrupting = true
+            const cleanup = yield* Fiber.interrupt(execution).pipe(Effect.timeoutOption("12 seconds"))
+            throw new Error(`Shell command did not emit output after spawn; cleanup=${cleanup._tag}`)
+          }
           interrupting = true
           const completion = yield* Fiber.interrupt(execution).pipe(Effect.timeoutOption("12 seconds"))
           expect({

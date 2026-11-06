@@ -346,7 +346,7 @@ test("Worker tracker and owner stay aligned across rejected or delayed acknowled
       await withTimeout(child.exited, 5_000)
 
       const originalKill = process.kill.bind(process)
-      const forwarded: Array<NodeJS.Signals | number | undefined> = []
+      const forwarded: Array<NodeJS.Signals | number | string | undefined> = []
       const patchedKill: typeof process.kill = (pid, signal) => {
         if (pid === -identity.pid) {
           if (signal === 0) return true

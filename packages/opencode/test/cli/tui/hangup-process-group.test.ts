@@ -55,7 +55,7 @@ function groupAlive(pgid: number) {
   }
 }
 
-async function waitForFile(file: string, parse: (value: string) => unknown) {
+async function waitForFile<T>(file: string, parse: (value: string) => T | undefined): Promise<T> {
   const deadline = Date.now() + 30_000
   while (Date.now() < deadline) {
     try {
@@ -123,14 +123,14 @@ test(
     try {
       if (!launcher?.bootID || !launcher.startTicks)
         throw new Error("TUI terminal launcher has no start identity; cleanup skipped")
-      const groupReady = await waitForFile(groupReadyFile, (value) => JSON.parse(value))
-      const signalReady = await waitForFile(signalReadyFile, (value) => {
+      const groupReady = await waitForFile<unknown>(groupReadyFile, (value) => JSON.parse(value))
+      const signalReady = await waitForFile<number>(signalReadyFile, (value) => {
         const pid = Number(value)
         return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined
       })
-      group = await waitForFile(recordFile, (value) => processGroupFixture(JSON.parse(value)))
+      group = await waitForFile<ProcessGroupFixture>(recordFile, (value) => processGroupFixture(JSON.parse(value)))
       if (!group) throw new Error("Worker did not record its group identities")
-      tui = EventWriter.readIdentity(signalReady as number)
+      tui = EventWriter.readIdentity(signalReady)
       if (!tui?.bootID || !tui.startTicks) throw new Error("TUI owner did not retain its start identity")
       if (typeof groupReady !== "object" || groupReady === null || !("pgid" in groupReady))
         throw new Error("TUI owner did not publish its Worker group identity")
@@ -140,7 +140,7 @@ test(
       expect(sameProcess(tui)).toBe(true)
 
       process.kill(tui.pid, "SIGHUP")
-      await waitForFile(stoppedFile, (value) => (value.trim() === "stopped" ? value : undefined))
+      await waitForFile<string>(stoppedFile, (value) => (value.trim() === "stopped" ? value : undefined))
       const deadline = Date.now() + 10_000
       while (sameProcess(group.leader) || sameProcess(group.descendant)) {
         if (Date.now() >= deadline) throw new Error(`terminal SIGHUP left Worker group ${group.pgid} alive`)
