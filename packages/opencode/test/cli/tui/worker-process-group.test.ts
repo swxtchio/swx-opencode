@@ -452,16 +452,9 @@ test("real Core cleanup publication beats a delayed initial acquire acknowledgem
       throw new Error(`pending owner exited ${ownerExit}: ${stdout}\n${stderr}`)
     }
     const result: unknown = await Bun.file(resultFile).json()
-    if (
-      typeof result !== "object" ||
-      result === null ||
-      !("descendantAlive" in result) ||
-      typeof result.descendantAlive !== "boolean" ||
-      !("events" in result)
+    const events = ownerGroupEvents(
+      typeof result === "object" && result !== null && "events" in result ? result.events : undefined,
     )
-      throw new Error("cancellation-overlap owner result is missing its descendant and event state")
-    const events = ownerGroupEvents(result.events)
-    expect(result.descendantAlive).toBe(false)
     expect(pendingSeen).toBe(true)
     expect(discoveryHeld).toBe(true)
     expect(events.some((event) => event.cleanupOwed && event.membersPending)).toBe(true)
@@ -588,9 +581,15 @@ test("real cancellation acquire publishes while discovery is held before leader 
       throw new Error(`cancellation-overlap owner exited ${ownerExit}: ${stdout}\n${stderr}`)
     }
     const result: unknown = await Bun.file(resultFile).json()
-    const events = ownerGroupEvents(
-      typeof result === "object" && result !== null && "events" in result ? result.events : undefined,
+    if (
+      typeof result !== "object" ||
+      result === null ||
+      !("descendantAlive" in result) ||
+      typeof result.descendantAlive !== "boolean" ||
+      !("events" in result)
     )
+      throw new Error("cancellation-overlap owner result is missing its boolean descendant and event state")
+    const events = ownerGroupEvents(result.events)
     const liveIndex = events.findIndex((event) => event.action === "acquire" && event.cleanupOwed && !event.membersPending)
     const exitedIndex = events.findIndex(
       (event, index) => index > liveIndex && event.action === "acquire" && event.cleanupOwed && event.membersPending,
