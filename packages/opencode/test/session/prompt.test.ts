@@ -599,6 +599,7 @@ const gates = {
   queuePrepared: undefined as
     | undefined
     | { sessionID: SessionID; entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+  queueAnswers: undefined as undefined | { sessionID: SessionID; replies: SessionV1.WithParts[] },
   queuePark: undefined as
     | undefined
     | {
@@ -618,6 +619,7 @@ const gates = {
   presetErrorUpdateFailure: undefined as
     | undefined
     | { name: "ContentFilterError" | "StructuredOutputError"; triggered: boolean },
+  compactionTerminalWrite: undefined as undefined | { sessionID: SessionID; triggered: boolean },
   setModelFailure: undefined as undefined | { sessionID: SessionID; triggered: boolean },
   outcomeFailure: undefined as undefined | { triggered: boolean },
   noReplyAdmission: undefined as
@@ -656,6 +658,17 @@ const gatedSession = LayerNode.make({
               presetErrorFailure.triggered = true
               gates.presetErrorUpdateFailure = undefined
               return yield* Effect.die(new Error(`injected ${presetErrorFailure.name} persistence failure`))
+            }
+            const compactionTerminalWrite = gates.compactionTerminalWrite
+            if (
+              compactionTerminalWrite?.sessionID === msg.sessionID &&
+              msg.role === "assistant" &&
+              msg.summary === true &&
+              msg.error?.name === "MessageAbortedError"
+            ) {
+              compactionTerminalWrite.triggered = true
+              // Leave the persisted placeholder behind while allowing the interrupted run to answer its caller.
+              return msg
             }
             const gate = msg.role === "user" && msg.noReply === true ? gates.noReplyWrite : undefined
             if (gate) {
@@ -846,6 +859,12 @@ const gatedQueue = LayerNode.make({
               yield* Deferred.await(gate.release)
             }
             yield* real.prepared(input)
+          }),
+        answer: (sessionID, turn, reply) =>
+          Effect.gen(function* () {
+            const capture = gates.queueAnswers
+            if (capture?.sessionID === sessionID) capture.replies.push(reply)
+            yield* real.answer(sessionID, turn, reply)
           }),
         park: (sessionID, seen) =>
           Effect.gen(function* () {
@@ -6301,11 +6320,15 @@ it.instance(
         "2 seconds",
       )
       expect(Exit.isSuccess(cancelExit)).toBe(true)
-      expect(
-        Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(run), "held tool-step drain did not finish", "2 seconds")),
-      ).toBe(true)
+      const runExit = yield* awaitWithTimeout(Fiber.await(run), "held tool-step drain did not finish", "2 seconds")
+      expect(Exit.isSuccess(runExit)).toBe(true)
       yield* awaitWithTimeout(Deferred.await(stopped), "held subtask fiber did not stop", "2 seconds")
       expect(yield* llm.calls).toBe(1)
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      const subtaskAssistant = messages.findLast(
+        (message) => message.info.role === "assistant" && message.info.parentID === heldID,
+      )
+      if (Exit.isSuccess(runExit)) expect(runExit.value.info.id).toBe(subtaskAssistant?.info.id)
     }),
   60_000,
 )
@@ -15032,6 +15055,88 @@ unix(
       expect(yield* llm.calls).toBe(0)
     }),
   30000,
+)
+
+it.instance(
+  "a manual compaction returns its summary assistant to the completing run",
+  () =>
+    Effect.gen(function* () {
+      const { llm, sessions, chat, task, release } = yield* startHeld({ tool: true })
+      const prompt = yield* SessionPrompt.Service
+      const joined = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      const compaction = yield* SessionCompaction.Service
+      yield* Effect.addFinalizer(() => release.pipe(Effect.ignore))
+      const parentID = yield* compaction.create({ sessionID: chat.id, agent: "build", model: ref, auto: false })
+      yield* llm.text("the final manual summary")
+      yield* release
+      yield* awaitWithTimeout(llm.wait(2), "summary request never started", "10 seconds")
+      const [, result] = yield* finish(task, joined)
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const summary = messages.find((message) => message.info.role === "assistant" && message.info.parentID === parentID)
+      expect(summary?.info).toMatchObject({ role: "assistant", summary: true, finish: "stop" })
+      expect(result?.info.id).toBe(summary?.info.id)
+    }),
+  15_000,
+)
+
+it.instance(
+  "cancellation during compaction returns its terminal assistant",
+  () =>
+    Effect.gen(function* () {
+      const { llm, sessions, chat, task, release } = yield* startHeld({ tool: true })
+      const compaction = yield* SessionCompaction.Service
+      const run = yield* SessionRunState.Service
+      const gate = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(gate, undefined).pipe(Effect.andThen(release), Effect.ignore))
+      const parentID = yield* compaction.create({ sessionID: chat.id, agent: "build", model: ref, auto: false })
+      yield* llm.hold("summary interrupted", deferredAsPromise(gate))
+      yield* release
+      yield* awaitWithTimeout(llm.wait(2), "summary request never started", "10 seconds")
+      yield* run.cancel(chat.id)
+      const [result] = yield* finish(task)
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const summary = messages.find((message) => message.info.role === "assistant" && message.info.parentID === parentID)
+      expect(summary?.info).toMatchObject({ role: "assistant", summary: true, error: { name: "MessageAbortedError" } })
+      expect(result?.info.id).toBe(summary?.info.id)
+    }),
+  15_000,
+)
+
+gated.instance(
+  "a failed compaction terminal write still replies with that run's assistant",
+  () =>
+    Effect.gen(function* () {
+      const { llm, sessions, chat, task, release } = yield* startHeld({ tool: true })
+      const compaction = yield* SessionCompaction.Service
+      const run = yield* SessionRunState.Service
+      const gate = yield* Deferred.make<void>()
+      const terminalWrite = { sessionID: chat.id, triggered: false }
+      const capture = { sessionID: chat.id, replies: [] as SessionV1.WithParts[] }
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          succeedVoid(gate)
+          if (gates.compactionTerminalWrite === terminalWrite) gates.compactionTerminalWrite = undefined
+          if (gates.queueAnswers === capture) gates.queueAnswers = undefined
+        }).pipe(Effect.andThen(release.pipe(Effect.ignore))),
+      )
+      const parentID = yield* compaction.create({ sessionID: chat.id, agent: "build", model: ref, auto: false })
+      yield* llm.hold("summary interrupted", deferredAsPromise(gate))
+      yield* release
+      yield* awaitWithTimeout(llm.wait(2), "summary request never started", "10 seconds")
+      gates.compactionTerminalWrite = terminalWrite
+      gates.queueAnswers = capture
+      const cancelExit = yield* Effect.exit(run.cancel(chat.id))
+      const taskExit = yield* awaitWithTimeout(Fiber.await(task), "interrupted prompt did not settle", "10 seconds")
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const summary = messages.find((message) => message.info.role === "assistant" && message.info.parentID === parentID)
+      expect(terminalWrite.triggered).toBe(true)
+      expect(Exit.isSuccess(cancelExit)).toBe(true)
+      expect(summary?.info.role).toBe("assistant")
+      expect(capture.replies.at(-1)?.info.id).toBe(summary?.info.id)
+      if (summary?.info.role === "assistant") expect(summary.info.time.completed).toBeUndefined()
+      expect(Exit.isSuccess(taskExit)).toBe(true)
+    }),
+  15_000,
 )
 
 gated.instance(

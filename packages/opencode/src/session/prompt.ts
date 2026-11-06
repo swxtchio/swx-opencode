@@ -389,14 +389,17 @@ const layer = Layer.effect(
       sessionID: SessionID
       session: Session.Info
       msgs: SessionV1.WithParts[]
+      onAssistant: (assistantID: MessageID) => void
     }) {
       const { task, model, lastUser, sessionID, session, msgs } = input
       const ctx = yield* InstanceState.context
       const promptOps = yield* ops()
       const { task: taskTool } = yield* registry.named()
       const taskModel = task.model ? yield* getModel(task.model.providerID, task.model.modelID, sessionID) : model
+      const assistantMessageID = MessageID.ascending()
+      input.onAssistant(assistantMessageID)
       const assistantMessage: SessionV1.Assistant = yield* sessions.updateMessage({
-        id: MessageID.ascending(),
+        id: assistantMessageID,
         role: "assistant",
         parentID: lastUser.id,
         sessionID,
@@ -1527,11 +1530,12 @@ const layer = Layer.effect(
         })
       }).pipe(Effect.orDie)
 
-    const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID, assistantID?: MessageID) {
-      if (assistantID) {
+    type RunAssistant = { assistantID: MessageID | undefined }
+    const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID, run?: RunAssistant) {
+      if (run?.assistantID) {
         // A failed terminal write can leave this run's assistant placeholder; do not answer it with a prior run.
         const active = yield* sessions
-          .findMessage(sessionID, (message) => message.info.role === "assistant" && message.info.id === assistantID)
+          .findMessage(sessionID, (message) => message.info.role === "assistant" && message.info.id === run.assistantID)
           .pipe(Effect.orDie)
         if (Option.isSome(active)) return active.value
       }
@@ -1550,7 +1554,7 @@ const layer = Layer.effect(
         sessionID: SessionID,
         rootMessageID: MessageID | undefined,
         retryFailedRoot: boolean,
-        run: { assistantID: MessageID | undefined },
+        run: RunAssistant,
       ) {
         const ctx = yield* InstanceState.context
         let structured: unknown
@@ -1744,7 +1748,17 @@ const layer = Layer.effect(
           const task = SessionQueue.openTasks(msgs, selection).pop()
 
           if (task?.type === "subtask") {
-            yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
+            yield* handleSubtask({
+              task,
+              model,
+              lastUser,
+              sessionID,
+              session,
+              msgs,
+              onAssistant: (assistantID) => {
+                run.assistantID = assistantID
+              },
+            })
             continue
           }
 
@@ -1760,6 +1774,9 @@ const layer = Layer.effect(
                 auto: task.auto,
                 overflow: task.overflow,
                 resume: task.resume,
+                onAssistant: (assistantID) => {
+                  run.assistantID = assistantID
+                },
               }),
             )
             deferredCompactionTrigger = undefined
@@ -2039,12 +2056,12 @@ const layer = Layer.effect(
         // Any other exit stops the task; the joiner re-check must not restart it.
         if (!settled) yield* queue.park(sessionID, seen)
         yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
-        return yield* endRun(sessionID, run.assistantID)
+        return yield* endRun(sessionID, run)
       },
       // So does an interrupt, such as instance disposal cancelling the run.
       (effect, sessionID, _rootMessageID, _retryFailedRoot, run) =>
         effect.pipe(
-          Effect.onInterrupt(() => queue.park(sessionID).pipe(Effect.andThen(endRun(sessionID, run.assistantID)))),
+          Effect.onInterrupt(() => queue.park(sessionID).pipe(Effect.andThen(endRun(sessionID, run)))),
         ),
     )
     const runLoop: (
@@ -2053,15 +2070,15 @@ const layer = Layer.effect(
       retryFailedRoot?: boolean,
     ) => Effect.Effect<SessionV1.WithParts> = (sessionID, rootMessageID, retryFailedRoot) =>
       Effect.suspend(() => {
-        const run = { assistantID: undefined as MessageID | undefined }
+        const run: RunAssistant = { assistantID: undefined }
         return runLoopEffect(sessionID, rootMessageID, retryFailedRoot ?? false, run)
       })
 
     // A run's final message ends the turn it belongs to, so it answers that turn's
     // prompts before any later run can. A turn the loop finished was answered as
     // it ended; this answers one the run stopped on, by an error, abort or interrupt.
-    const endRun = Effect.fnUntraced(function* (sessionID: SessionID, assistantID?: MessageID) {
-      const final = yield* lastAssistant(sessionID, assistantID)
+    const endRun = Effect.fnUntraced(function* (sessionID: SessionID, run: RunAssistant) {
+      const final = yield* lastAssistant(sessionID, run)
       if (final.info.role === "assistant") yield* queue.answer(sessionID, final.info.parentID, final)
       return final
     })
