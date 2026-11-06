@@ -4,9 +4,11 @@
 // `opencode.run(message, opts?)` to spawn `bun src/index.ts run ...` with
 // `OPENCODE_CONFIG_CONTENT` providing the test provider config inline.
 import { describe, expect } from "bun:test"
-import { Effect } from "effect"
+import { createOpencodeClient } from "@opencode-ai/sdk/v2"
+import { Effect, Fiber } from "effect"
 import { reply } from "../../lib/llm-server"
 import { cliIt, deadline } from "../../lib/cli-process"
+import { testProviderConfig } from "../../lib/test-provider"
 
 describe("opencode run (non-interactive subprocess)", () => {
   // Happy path: prompt completes, output reaches stdout, process exits 0.
@@ -127,6 +129,74 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(result.exitCode).toBeGreaterThan(0)
         expect(result.stderr).toContain('Unknown effort "no-such-effort"')
         expect(result.stderr).not.toContain("Unexpected server error")
+      }),
+    deadline(60_000),
+  )
+
+  cliIt.live(
+    "attached run survives an injected short Bun idle timeout while the provider permits the request",
+    ({ home, llm, opencode }) =>
+      Effect.gen(function* () {
+        const release = Promise.withResolvers<void>()
+        yield* Effect.addFinalizer(() => Effect.sync(() => release.resolve()))
+        const idleTimeoutEnv = { BUN_CONFIG_HTTP_IDLE_TIMEOUT: "2" }
+        const config = testProviderConfig(llm.url)
+        Object.assign(config.provider.test.options, {
+          chunkTimeout: 600_000,
+          headerTimeout: 600_000,
+        })
+        const server = yield* opencode.serve({
+          env: { OPENCODE_CONFIG_CONTENT: JSON.stringify(config) },
+          readyTimeoutMs: 60_000,
+        })
+        const sdk = createOpencodeClient({ baseUrl: server.url, directory: home })
+        const created = yield* Effect.promise(() => sdk.session.create({ title: "long attached response" }))
+        const sessionID = created.data?.id
+        if (!sessionID) throw new Error("could not create the attached-run session")
+        yield* llm.hold("attached response after long idle", release.promise)
+        const run = yield* opencode.startRun("wait for the attached provider", {
+          extraArgs: ["--attach", server.url, "--session", sessionID, "--"],
+          env: idleTimeoutEnv,
+        })
+        const resultFiber = yield* run.result.pipe(Effect.forkChild)
+        let hits = yield* llm.hits
+        while (!hits.some((hit) => !JSON.stringify(hit.body).includes("Generate a title for this conversation"))) {
+          const progress = yield* Effect.race(
+            llm.wait(hits.length + 1).pipe(Effect.as({ type: "hit" as const })),
+            Fiber.join(resultFiber).pipe(Effect.map((result) => ({ type: "completed" as const, result }))),
+          ).pipe(Effect.timeout("20 seconds"))
+          if (progress.type === "completed")
+            return yield* Effect.fail(new Error(`attached run ended before the provider request: ${progress.result.stderr}`))
+          hits = yield* llm.hits
+        }
+
+        const outcome = yield* Effect.race(
+          Fiber.join(resultFiber).pipe(
+            Effect.map((result) => ({ type: "completed" as const, result })),
+          ),
+          Effect.sleep("12 seconds").pipe(Effect.as({ type: "waited" as const })),
+        )
+        if (outcome.type === "completed")
+          return yield* Effect.fail(new Error(`attached run ended before the held provider response: ${outcome.result.stderr}`))
+
+        release.resolve()
+        const result = yield* Fiber.join(resultFiber).pipe(Effect.timeout("45 seconds"))
+        opencode.expectExit(result, 0)
+        const response = yield* Effect.promise(async () => {
+          const deadline = Date.now() + 30_000
+          while (Date.now() < deadline) {
+            const messages = await sdk.session.messages({ sessionID })
+            const text =
+              messages.data
+                ?.flatMap((message) => message.parts.map((part) => (part.type === "text" ? part.text : "")))
+                .join("\n") ?? ""
+            const status = await sdk.session.status()
+            if (text.includes("attached response after long idle") && status.data?.[sessionID] === undefined) return text
+            await new Promise((resolve) => setTimeout(resolve, 50))
+          }
+          throw new Error("attached provider response was not persisted before the session became idle")
+        })
+        expect(response).toContain("attached response after long idle")
       }),
     deadline(60_000),
   )

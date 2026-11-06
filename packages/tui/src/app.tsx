@@ -34,6 +34,7 @@ import { ProjectProvider, useProject } from "./context/project"
 import { EditorContextProvider } from "./context/editor"
 import { useEvent } from "./context/event"
 import { SDKProvider, useSDK } from "./context/sdk"
+import { registerTerminalSighup } from "./terminal-signal"
 import { StartupLoading } from "./component/startup-loading"
 import { SyncProvider, useSync } from "./context/sync"
 import { DataProvider } from "./context/data"
@@ -233,10 +234,18 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
       const shutdown = yield* Deferred.make<unknown>()
       const onSighup = () => destroyRenderer(renderer)
       yield* Effect.acquireRelease(
-        Effect.sync(() => process.on("SIGHUP", onSighup)),
-        () => Effect.sync(() => process.off("SIGHUP", onSighup)),
+        Effect.sync(() => registerTerminalSighup(onSighup)),
+        (unregister) => Effect.sync(unregister),
       )
       renderer.once("destroy", () => Deferred.doneUnsafe(shutdown, Effect.void))
+      const sighupReadyFile = process.env.SWX_TUI_SIGHUP_READY_FILE
+      if (
+        process.env.OPENCODE_TEST_HOME &&
+        process.env.SWX_TUI_GROUP_TUI_TEST === "1" &&
+        sighupReadyFile &&
+        (process.stdin.isTTY || process.stdout.isTTY)
+      )
+        void Bun.write(sighupReadyFile, String(process.pid)).catch(() => {})
       const pluginRuntime = createPluginRuntime()
 
       yield* Effect.tryPromise(async () => {

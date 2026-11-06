@@ -1,5 +1,6 @@
 import type { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { noTimeoutFetch } from "@opencode-ai/core/no-timeout-fetch"
 // CLI entry point for `opencode run` and `opencode --mini`.
 //
 // Handles three modes:
@@ -364,6 +365,7 @@ export const RunCommand = effectCmd({
           baseUrl: args.attach!,
           directory: dir,
           headers: attachHeaders,
+          fetch: noTimeoutFetch,
         })
       }
 

@@ -25,8 +25,192 @@ import {
 import * as NodeChildProcess from "node:child_process"
 import { PassThrough } from "node:stream"
 import launch from "cross-spawn"
+import { EventWriter } from "./event/writer"
+import {
+  decideGroupOwnership,
+  hasIdentity,
+  isLiveProcess,
+  readGroupMembers,
+  signalGroup,
+} from "./process-group"
 import { makeGlobalNode } from "./effect/app-node"
 import { filesystem, path } from "./effect/app-node-platform"
+
+// An abrupt owner exit skips scoped finalizers, so keep detached groups until cleanup completes or their leader releases them.
+type OwnedProcessGroup = {
+  pid: number
+  identity: EventWriter.ProcessIdentity
+  cleanupOwed: boolean
+  members: EventWriter.ProcessIdentity[]
+  membersPending: boolean
+  membersSnapshotComplete: boolean
+  membersUnavailable: boolean
+  generation: number
+}
+type GroupOwner = { value: OwnedProcessGroup | undefined }
+type CleanupRequest = { value: { killSignal: NodeJS.Signals; forceKillAfter: Duration.Input } | undefined }
+export type ProcessGroupEvent = {
+  readonly action: "acquire" | "release"
+  readonly pgid: number
+  readonly cleanupOwed: boolean
+  readonly identity: EventWriter.ProcessIdentity
+  readonly members?: ReadonlyArray<EventWriter.ProcessIdentity>
+  readonly membersPending?: boolean
+  readonly membersSnapshotComplete?: boolean
+  readonly membersUnavailable?: boolean
+  readonly generation?: number
+}
+type ProcessGroupObserver = (event: ProcessGroupEvent) => Promise<void>
+
+const groups = new Set<OwnedProcessGroup>()
+let exitHooked = false
+let processGroupObserver: ProcessGroupObserver | undefined
+const killGroups = () =>
+  groups.forEach((group) => {
+    const decision = signalGroup(groupOwnershipInput(group), "SIGKILL")
+    if (decision.action === "prune") groups.delete(group)
+  })
+
+export function setProcessGroupObserver(observer: ProcessGroupObserver | undefined) {
+  processGroupObserver = observer
+}
+
+function notifyProcessGroup(event: ProcessGroupEvent) {
+  const observer = processGroupObserver
+  if (!observer) return
+  // Publish synchronously so the owner records the group before local signals; awaiting the acknowledgement remains a caller decision.
+  let notification: Promise<void>
+  try {
+    notification = observer(event)
+  } catch (error) {
+    notification = Promise.reject(error)
+  }
+  void notification.catch(() => {})
+  return notification
+}
+
+function processGroupEvent(group: OwnedProcessGroup, action: ProcessGroupEvent["action"]): ProcessGroupEvent {
+  return {
+    action,
+    pgid: group.pid,
+    cleanupOwed: group.cleanupOwed,
+    identity: group.identity,
+    members: group.members,
+    membersPending: group.membersPending,
+    membersSnapshotComplete: group.membersSnapshotComplete,
+    membersUnavailable: group.membersUnavailable,
+    generation: group.generation,
+  }
+}
+
+function groupOwnershipInput(group: OwnedProcessGroup) {
+  return {
+    pgid: group.pid,
+    identities: [group.identity, ...group.members],
+    cleanupOwed: group.cleanupOwed,
+    membersPending: group.membersPending,
+    membersUnavailable: group.membersUnavailable,
+  }
+}
+
+function releaseGroup(group: OwnedProcessGroup) {
+  if (!groups.delete(group)) return
+  group.cleanupOwed = false
+  group.membersPending = false
+  group.membersUnavailable = false
+  group.generation++
+  return notifyProcessGroup(processGroupEvent(group, "release"))
+}
+
+async function rememberGroupMembers(group: OwnedProcessGroup, generation: number) {
+  const pendingLeader = group.cleanupOwed && hasIdentity(group.identity) && !isLiveProcess(group.identity)
+  group.membersPending = pendingLeader
+  group.membersSnapshotComplete = false
+  group.membersUnavailable = false
+  const discovered = await readGroupMembers(group.pid, group.identity).catch(() => ({ members: [], complete: false }))
+  if (!groups.has(group) || group.generation !== generation) return { action: "prune", evidence: "gone" } as const
+  const members = new Map(group.members.map((member) => [member.pid, member] as const))
+  discovered.members.forEach((member) => members.set(member.pid, member))
+  group.members = [...members.values()]
+  group.membersPending = false
+  group.membersSnapshotComplete = discovered.complete
+  group.membersUnavailable = !discovered.complete
+  return decideGroupOwnership(groupOwnershipInput(group))
+}
+
+export async function shutdownOwnedProcessGroups() {
+  if (globalThis.process.platform === "win32") return
+  const owned = [...groups]
+  if (!owned.length) return
+  const releaseNotifications: Promise<void>[] = []
+  const announcements = owned.map((group) => {
+    group.cleanupOwed = true
+    group.generation++
+    group.membersPending = hasIdentity(group.identity) && !isLiveProcess(group.identity)
+    group.membersSnapshotComplete = false
+    group.membersUnavailable = false
+    const ownership = {
+      pgid: group.pid,
+      identities: [group.identity, ...group.members],
+      cleanupOwed: group.cleanupOwed,
+      membersPending: group.membersPending,
+    }
+    const decision = decideGroupOwnership(ownership)
+    const announcement = notifyProcessGroup(processGroupEvent(group, "acquire"))
+    if (decision.action === "prune") {
+      const release = releaseGroup(group)
+      if (release) releaseNotifications.push(release.catch(() => {}))
+    }
+    if (decision.action === "signal" && decision.evidence === "pending") signalGroup(ownership, "SIGKILL")
+    return { group, generation: group.generation, decision, ownership, announcement }
+  })
+  await Promise.all(
+    announcements.map(async (item) => {
+      await item.announcement?.catch(() => {})
+      if (!groups.has(item.group) || item.group.generation !== item.generation) return
+      if (item.decision.action === "prune") return
+      if (item.decision.evidence !== "pending") {
+        const decision = signalGroup(item.ownership, "SIGKILL")
+        if (decision.action === "prune") {
+          await releaseGroup(item.group)?.catch(() => {})
+          return
+        }
+      }
+      const snapshot = await rememberGroupMembers(item.group, item.generation).catch(() => {
+        item.group.membersPending = false
+        item.group.membersUnavailable = true
+        return decideGroupOwnership(groupOwnershipInput(item.group))
+      })
+      if (!groups.has(item.group) || item.group.generation !== item.generation) return
+      if (snapshot.action === "prune") {
+        await releaseGroup(item.group)?.catch(() => {})
+        return
+      }
+      const resolved = signalGroup(groupOwnershipInput(item.group), "SIGKILL")
+      if (resolved.action === "prune") await releaseGroup(item.group)?.catch(() => {})
+    }),
+  )
+  const deadline = Date.now() + 5_000
+  while (true) {
+    const survivors = (
+      await Promise.all(
+        owned.map(async (group) => {
+          if (!groups.has(group)) return undefined
+          if (decideGroupOwnership(groupOwnershipInput(group)).action === "prune") {
+            await releaseGroup(group)?.catch(() => {})
+            return undefined
+          }
+          return group
+        }),
+      )
+    ).filter((group): group is OwnedProcessGroup => group !== undefined)
+    if (!survivors.length) break
+    if (Date.now() >= deadline)
+      throw new Error(`Worker process groups survived shutdown: ${survivors.map((group) => group.pid).join(", ")}`)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  await Promise.all([...releaseNotifications, ...owned.map((group) => releaseGroup(group)?.catch(() => {}))])
+}
 
 const toError = (err: unknown): Error => (err instanceof globalThis.Error ? err : new globalThis.Error(String(err)))
 
@@ -271,7 +455,12 @@ export const make = Effect.gen(function* () {
     return { stdout, stderr, all: Stream.merge(stdout, stderr) }
   }
 
-  const spawn = (command: ChildProcess.StandardCommand, opts: NodeChildProcess.SpawnOptions) =>
+  const spawn = (
+    command: ChildProcess.StandardCommand,
+    opts: NodeChildProcess.SpawnOptions,
+    cleanupRequest: CleanupRequest,
+    groupOwner: GroupOwner,
+  ) =>
     Effect.callback<readonly [NodeChildProcess.ChildProcess, ExitSignal], PlatformError.PlatformError>((resume) => {
       const signal = Deferred.makeUnsafe<readonly [code: number | null, signal: NodeJS.Signals | null]>()
       const proc = launch(command.command, command.args, opts)
@@ -281,6 +470,31 @@ export const make = Effect.gen(function* () {
         resume(Effect.fail(toPlatformError("spawn", err, command)))
       })
       proc.on("exit", (...args) => {
+        const group = groupOwner.value
+        if (group) {
+          const abnormal = args[1] !== null || (args[0] !== null && args[0] !== 0)
+          group.cleanupOwed ||=
+            cleanupRequest.value !== undefined ||
+            (Predicate.isNotUndefined(command.options.forceKillAfter) && abnormal)
+          if (group.cleanupOwed) {
+            group.generation++
+            group.membersPending = hasIdentity(group.identity) && !isLiveProcess(group.identity)
+            group.membersSnapshotComplete = false
+            group.membersUnavailable = false
+            const generation = group.generation
+            const notification = notifyProcessGroup(processGroupEvent(group, "acquire"))
+            if (notification) void notification.catch(() => {})
+            void rememberGroupMembers(group, generation)
+              .then((decision) => {
+                if (!groups.has(group) || group.generation !== generation) return
+                if (decision.action === "prune") {
+                  releaseGroup(group)
+                  return
+                }
+              })
+              .catch(() => {})
+          } else releaseGroup(group)
+        }
         exit = args
       })
       proc.on("close", (...args) => {
@@ -289,6 +503,86 @@ export const make = Effect.gen(function* () {
         Deferred.doneUnsafe(signal, Exit.succeed(exit ?? args))
       })
       proc.on("spawn", () => {
+        if (opts.detached && globalThis.process.platform !== "win32" && proc.pid !== undefined) {
+          const group = {
+            pid: proc.pid,
+            identity: EventWriter.readIdentity(proc.pid) ?? { pid: proc.pid, bootID: null, startTicks: null },
+            cleanupOwed: false,
+            members: [],
+            membersPending: false,
+            membersSnapshotComplete: false,
+            membersUnavailable: false,
+            generation: 0,
+          }
+          groupOwner.value = group
+          groups.add(group)
+          if (!exitHooked) {
+            globalThis.process.once("exit", killGroups)
+            exitHooked = true
+          }
+          const notification = notifyProcessGroup(processGroupEvent(group, "acquire"))
+          if (notification) {
+            void notification.then(
+              () => resume(Effect.succeed([proc, signal])),
+              async (error) => {
+                if (!groups.has(group)) {
+                  resume(Effect.fail(toPlatformError("spawn", toError(error), command)))
+                  return
+                }
+                group.cleanupOwed = true
+                group.generation++
+                group.membersPending = hasIdentity(group.identity) && !isLiveProcess(group.identity)
+                group.membersSnapshotComplete = false
+                group.membersUnavailable = false
+                groups.add(group)
+                const generation = group.generation
+                const ownership = groupOwnershipInput(group)
+                const decision = decideGroupOwnership(ownership)
+                const announcement = notifyProcessGroup(processGroupEvent(group, "acquire"))
+                if (decision.action === "prune") {
+                  releaseGroup(group)
+                  resume(Effect.fail(toPlatformError("spawn", toError(error), command)))
+                  return
+                }
+                if (decision.evidence === "pending") {
+                  signalGroup(ownership, "SIGKILL")
+                } else {
+                  await announcement?.catch(() => {})
+                  const signalled = signalGroup(ownership, "SIGKILL")
+                  if (signalled.action === "prune") {
+                    releaseGroup(group)
+                    resume(Effect.fail(toPlatformError("spawn", toError(error), command)))
+                    return
+                  }
+                }
+                const snapshot = await rememberGroupMembers(group, generation).catch(() => {
+                  group.membersPending = false
+                  group.membersUnavailable = true
+                  return decideGroupOwnership(groupOwnershipInput(group))
+                })
+                if (!groups.has(group) || group.generation !== generation) {
+                  resume(Effect.fail(toPlatformError("spawn", toError(error), command)))
+                  return
+                }
+                if (snapshot.action === "prune") {
+                  releaseGroup(group)
+                  resume(Effect.fail(toPlatformError("spawn", toError(error), command)))
+                  return
+                }
+                const resolved = signalGroup(groupOwnershipInput(group), "SIGKILL")
+                if (resolved.action === "prune") releaseGroup(group)
+                void Effect.runPromise(waitForGroup(group.pid, Duration.seconds(5))).then(
+                  (gone) => {
+                    if (gone) releaseGroup(group)
+                    resume(Effect.fail(toPlatformError("spawn", toError(error), command)))
+                  },
+                  () => resume(Effect.fail(toPlatformError("spawn", toError(error), command))),
+                )
+              },
+            ).catch((error) => resume(Effect.fail(toPlatformError("spawn", toError(error), command))))
+            return
+          }
+        }
         resume(Effect.succeed([proc, signal]))
       })
       return Effect.sync(() => {
@@ -408,8 +702,26 @@ export const make = Effect.gen(function* () {
     exitSignal: ExitSignal,
     killSignal: NodeJS.Signals,
     forceKillAfter: Duration.Input,
+    groupOwner: GroupOwner,
     afterSignal = Effect.void,
   ) => {
+    const group = groupOwner.value
+    if (group) {
+      group.cleanupOwed = true
+      group.generation++
+      group.membersPending = hasIdentity(group.identity) && !isLiveProcess(group.identity)
+      group.membersSnapshotComplete = false
+      group.membersUnavailable = false
+      groups.add(group)
+      const generation = group.generation
+      notifyProcessGroup(processGroupEvent(group, "acquire"))
+      void rememberGroupMembers(group, generation)
+        .then((decision) => {
+          if (!groups.has(group) || group.generation !== generation) return
+          if (decision.action === "prune") releaseGroup(group)
+        })
+        .catch(() => {})
+    }
     const send = (next: NodeJS.Signals) => {
       if (process.platform === "win32") return killGroup(command, proc, next)
       if (command.options.detached === false) return killOne(command, proc, next)
@@ -421,7 +733,10 @@ export const make = Effect.gen(function* () {
       if (process.platform !== "win32" && command.options.detached !== false) yield* waitForGroup(proc.pid!)
       yield* Deferred.await(exitSignal)
     }).pipe(Effect.asVoid)
-    const attempt = sendIgnoringErrors(killSignal).pipe(Effect.andThen(afterSignal), Effect.andThen(wait))
+    const attempt = sendIgnoringErrors(killSignal).pipe(
+      Effect.andThen(afterSignal),
+      Effect.andThen(wait),
+    )
     return Effect.timeoutOrElse(attempt, {
       duration: forceKillAfter,
       orElse: () =>
@@ -429,7 +744,9 @@ export const make = Effect.gen(function* () {
           Effect.andThen(waitForCleanupAfterKill(command, proc, exitSignal)),
           Effect.asVoid,
         ),
-    })
+    }).pipe(
+      Effect.andThen(Effect.sync(() => (group ? releaseGroup(group) : undefined))),
+    )
   }
 
   const killOne = (
@@ -490,19 +807,23 @@ export const make = Effect.gen(function* () {
           const serr = stdio(command.options, "stderr")
           const extra = fds(command.options)
           const dir = yield* cwd(command.options)
-          const cleanupRequest: {
-            value: { killSignal: NodeJS.Signals; forceKillAfter: Duration.Input } | undefined
-          } = { value: undefined }
+          const cleanupRequest: CleanupRequest = { value: undefined }
+          const groupOwner: GroupOwner = { value: undefined }
 
           const [proc, signal] = yield* Effect.acquireRelease(
-            spawn(command, {
-              cwd: dir,
-              env: env(command.options),
-              stdio: stdios(sin, sout, serr, extra),
-              detached: command.options.detached ?? process.platform !== "win32",
-              shell: command.options.shell,
-              windowsHide: process.platform === "win32",
-            }),
+            spawn(
+              command,
+              {
+                cwd: dir,
+                env: env(command.options),
+                stdio: stdios(sin, sout, serr, extra),
+                detached: command.options.detached ?? process.platform !== "win32",
+                shell: command.options.shell,
+                windowsHide: process.platform === "win32",
+              },
+              cleanupRequest,
+              groupOwner,
+            ),
             Effect.fnUntraced(function* ([proc, signal]) {
               const done = yield* Deferred.isDone(signal)
               const kill = timeout(proc, command, command.options)
@@ -511,7 +832,14 @@ export const make = Effect.gen(function* () {
                 if (process.platform === "win32") return yield* Effect.void
                 const requested = cleanupRequest.value
                 if (requested)
-                  return yield* cleanupGroup(command, proc, signal, requested.killSignal, requested.forceKillAfter)
+                  return yield* cleanupGroup(
+                    command,
+                    proc,
+                    signal,
+                    requested.killSignal,
+                    requested.forceKillAfter,
+                    groupOwner,
+                  )
                 if (Predicate.isNull(code) && Predicate.isNotNull(exitSignal)) {
                   const forceKillAfter = command.options.forceKillAfter
                   if (Predicate.isUndefined(forceKillAfter))
@@ -522,6 +850,7 @@ export const make = Effect.gen(function* () {
                     signal,
                     command.options.killSignal ?? "SIGTERM",
                     forceKillAfter,
+                    groupOwner,
                   )
                 }
                 if (code !== 0 && Predicate.isNotNull(code)) {
@@ -533,6 +862,7 @@ export const make = Effect.gen(function* () {
                     signal,
                     command.options.killSignal ?? "SIGTERM",
                     forceKillAfter,
+                    groupOwner,
                   )
                 }
                 return yield* Effect.void
@@ -556,7 +886,7 @@ export const make = Effect.gen(function* () {
                 )
                 return yield* Effect.ignore(leader)
               }
-              return yield* cleanupGroup(command, proc, signal, sig, forceKillAfter, detach)
+              return yield* cleanupGroup(command, proc, signal, sig, forceKillAfter, groupOwner, detach)
             }),
           )
 
@@ -591,7 +921,7 @@ export const make = Effect.gen(function* () {
                 return send(sig).pipe(Effect.andThen(Deferred.await(signal)), Effect.asVoid)
               }
               cleanupRequest.value = { killSignal: sig, forceKillAfter }
-              return cleanupGroup(command, proc, signal, sig, forceKillAfter)
+              return cleanupGroup(command, proc, signal, sig, forceKillAfter, groupOwner)
             },
             unref: Effect.sync(() => {
               if (ref) {

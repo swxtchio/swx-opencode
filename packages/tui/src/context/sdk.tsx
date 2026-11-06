@@ -1,6 +1,7 @@
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import type { GlobalEvent } from "@opencode-ai/sdk/v2"
 import { Flag } from "@opencode-ai/core/flag/flag"
+import { noTimeoutFetch } from "@opencode-ai/core/no-timeout-fetch"
 import { createSimpleContext } from "./helper"
 import { batch, onCleanup, onMount } from "solid-js"
 
@@ -18,6 +19,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
     events?: EventSource
   }) => {
     const abort = new AbortController()
+    const fetch = props.fetch ?? noTimeoutFetch
     let sse: AbortController | undefined
 
     function createSDK() {
@@ -25,7 +27,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
         baseUrl: props.url,
         signal: abort.signal,
         directory: props.directory,
-        fetch: props.fetch,
+        fetch,
         headers: props.headers,
       })
     }
@@ -144,7 +146,7 @@ export const { use: useSDK, provider: SDKProvider } = createSimpleContext({
       },
       directory: props.directory,
       event: emitter,
-      fetch: props.fetch ?? fetch,
+      fetch,
       url: props.url,
     }
   },
