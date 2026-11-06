@@ -35,6 +35,7 @@ GlobalBus.on("event", (event) => {
 let server: Awaited<ReturnType<typeof Server.listen>> | undefined
 let testShutdownGate: Promise<void> | undefined
 const testSpawnerRuntimes = new Set<unknown>()
+const testGroupCancellations = new Map<number, { request: () => void; completion: Promise<void> }>()
 
 const groupDiscoveryHoldFile = process.env.OPENCODE_TEST_HOME
   ? process.env.SWX_TUI_GROUP_DISCOVERY_HOLD_FILE
@@ -65,7 +66,7 @@ export const rpc = {
   async testSpawnProcessGroup(input: {
     resistTerm: boolean
     blockShutdown: boolean
-    exitMode?: "long" | "cleanup-owed" | "release"
+    exitMode?: "long" | "cleanup-owed" | "release" | "cancel-overlap"
   }) {
     // The private Worker probe exists only in isolated test homes to make group lifecycle cases deterministic.
     const recordFile = process.env.SWX_TUI_GROUP_RECORD_FILE
@@ -84,7 +85,7 @@ export const rpc = {
     const finish =
       exitMode === "long"
         ? "wait"
-        : `while [ ! -e ${quote(leaderExitFile)} ]; do sleep 0.02; done; exit ${exitMode === "cleanup-owed" ? "1" : "0"}`
+        : `while [ ! -e ${quote(leaderExitFile)} ]; do sleep 0.02; done; exit ${exitMode === "cleanup-owed" || exitMode === "cancel-overlap" ? "1" : "0"}`
     const command = `${input.resistTerm ? "trap '' TERM; " : ""}${launch}; ${finish}`
     const runtime = ManagedRuntime.make(LayerNode.compile(CrossSpawnSpawner.node))
     testSpawnerRuntimes.add(runtime)
@@ -122,8 +123,22 @@ export const rpc = {
         if (!descendant?.bootID || !descendant.startTicks)
           throw new Error("Worker process-group descendant has no identity")
         yield* Effect.promise(() => Bun.write(recordFile, JSON.stringify({ leader: identity, descendant, pgid })))
+        const cancellationRequest = Promise.withResolvers<void>()
+        const cancellationComplete = Promise.withResolvers<void>()
+        testGroupCancellations.set(pgid, {
+          request: cancellationRequest.resolve,
+          completion: cancellationComplete.promise,
+        })
         spawned.resolve({ pgid, identity })
-        yield* Effect.never
+        yield* Effect.promise(() => cancellationRequest.promise)
+        yield* child.kill({ forceKillAfter: "30 seconds" }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              testGroupCancellations.delete(pgid)
+              cancellationComplete.resolve()
+            }),
+          ),
+        )
       }),
     ).pipe(
       Effect.catchCause((cause) =>
@@ -132,6 +147,13 @@ export const rpc = {
     )
     void runtime.runFork(task)
     return await spawned.promise
+  },
+  testCancelProcessGroup(input: { pgid: number }) {
+    if (!process.env.OPENCODE_TEST_HOME) throw new Error("test process-group fixture is not configured")
+    const cancellation = testGroupCancellations.get(input.pgid)
+    if (!cancellation) throw new Error(`no cancellable test process group ${input.pgid}`)
+    cancellation.request()
+    return cancellation.completion
   },
   async testCompletedProcessGroups(input: { count: number }) {
     if (!process.env.OPENCODE_TEST_HOME || !Number.isSafeInteger(input.count) || input.count < 1 || input.count > 64)

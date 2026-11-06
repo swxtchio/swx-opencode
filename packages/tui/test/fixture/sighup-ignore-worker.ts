@@ -8,13 +8,16 @@ if (!readyFile || !resultFile || !acknowledgementFile) throw new Error("SIGHUP f
 const pipeWriterFile = process.env.SWX_TUI_SIGHUP_PIPE_WRITER_FILE
 
 if (pipeWriterFile) {
-  const writer = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
+  const writer = Bun.spawn(["python3", "-c", "import time; time.sleep(10**6)"], {
     stdin: "ignore",
     stdout: "inherit",
     stderr: "inherit",
     detached: true,
   })
-  await Bun.write(pipeWriterFile, String(writer.pid))
+  const writerIdentity = EventWriter.readIdentity(writer.pid)
+  if (!writerIdentity?.bootID || !writerIdentity.startTicks)
+    throw new Error("SIGHUP pipe writer has no start identity")
+  await Bun.write(pipeWriterFile, JSON.stringify(writerIdentity))
 }
 
 const identity = EventWriter.readIdentity(process.pid)

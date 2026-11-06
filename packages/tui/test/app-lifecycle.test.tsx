@@ -9,7 +9,7 @@ import path from "node:path"
 import { tmpdir } from "./fixture/fixture"
 import { createTuiResolvedConfig } from "./fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "./fixture/tui-sdk"
-import { processGroupMember, sameProcess } from "../../core/test/fixture/process-group"
+import { processGroupMember, processIdentity, sameIdentity, sameProcess } from "../../core/test/fixture/process-group"
 
 type SighupFixtureMode = "terminal" | "nohup" | "non-tty"
 type SighupFixtureResult =
@@ -365,24 +365,31 @@ test("runSighupFixture fails inside its drain bound when a writer outlives the l
       ),
       12_000,
     )
-    const writerPID = Number((await Bun.file(writerPIDFile).text().catch(() => "")).trim())
-    if (Number.isSafeInteger(writerPID) && writerPID > 0) writerIdentity = EventWriter.readIdentity(writerPID)
+    const writerRecord: unknown = await Bun.file(writerPIDFile).json().catch(() => undefined)
+    writerIdentity = processIdentity(writerRecord)
+    if (!writerIdentity?.bootID || !writerIdentity.startTicks)
+      throw new Error("SIGHUP fixture did not record the pipe writer's start identity")
     expect(result?.type).toBe("rejected")
     if (result?.type === "rejected")
       expect(result.message).toContain("SIGHUP launcher exited while a writer still held stdout/stderr open")
   } finally {
-    if (writerIdentity && sameProcess(writerIdentity)) {
-      try {
-        process.kill(writerIdentity.pid, "SIGKILL")
-      } catch {}
-    }
-    if (writerIdentity)
-      await bounded(
-        (async () => {
-          while (sameProcess(writerIdentity!)) await Bun.sleep(20)
-        })(),
-        5_000,
-      )
+    if (!writerIdentity?.bootID || !writerIdentity.startTicks)
+      throw new Error("SIGHUP pipe writer ownership could not be established for cleanup")
+    const currentWriterIdentity = EventWriter.readIdentity(writerIdentity.pid)
+    if (!currentWriterIdentity || !sameIdentity(writerIdentity, currentWriterIdentity))
+      throw new Error("SIGHUP pipe writer identity changed before cleanup; refusing to signal it")
+    process.kill(writerIdentity.pid, "SIGKILL")
+    const gone = await bounded(
+      (async () => {
+        while (true) {
+          const current = EventWriter.readIdentity(writerIdentity.pid)
+          if (!current || !sameIdentity(writerIdentity, current)) return true
+          await Bun.sleep(20)
+        }
+      })(),
+      5_000,
+    )
+    if (!gone) throw new Error("owned SIGHUP pipe writer did not exit after SIGKILL")
   }
 }, 20_000)
 

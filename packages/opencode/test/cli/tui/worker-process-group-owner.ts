@@ -18,6 +18,7 @@ const cleanupAcquireEventFile = process.env.SWX_TUI_GROUP_CLEANUP_ACQUIRE_EVENT_
 const initialAckStartedFile = process.env.SWX_TUI_GROUP_INITIAL_ACK_STARTED_FILE
 const initialAckReleaseFile = process.env.SWX_TUI_GROUP_INITIAL_ACK_RELEASE_FILE
 const ownerExitFile = process.env.SWX_TUI_OWNER_EXIT_FILE
+const cancelExitFile = process.env.SWX_TUI_GROUP_CANCEL_EXIT_FILE
 if (!action || !recordFile || !resultFile || !ownerStartFile)
   throw new Error("TUI process-group owner fixture inputs are missing")
 const ownerIdentity = EventWriter.readIdentity(process.pid)
@@ -137,7 +138,7 @@ if (action === "retire-many") {
 const startedCall = client.call("testSpawnProcessGroup", {
   resistTerm: process.env.SWX_TUI_GROUP_RESIST_TERM === "1",
   blockShutdown: process.env.SWX_TUI_BLOCK_SHUTDOWN === "1",
-  exitMode: process.env.SWX_TUI_GROUP_EXIT_MODE as "long" | "cleanup-owed" | "release" | undefined,
+  exitMode: process.env.SWX_TUI_GROUP_EXIT_MODE as "long" | "cleanup-owed" | "release" | "cancel-overlap" | undefined,
 })
 if (action === "pending-owner-exit") {
   if (!ownerExitFile) throw new Error("pending owner-exit control path is missing")
@@ -153,6 +154,22 @@ if (record.pgid !== started.pgid || !sameIdentity(record.leader, started.identit
 const pgid = record.pgid
 if (action === "cleanup-owed" || action === "discovery-failure" || action.startsWith("release"))
   await Bun.write(`${recordFile}.exit`, "exit")
+
+if (action === "cancel-overlap") {
+  if (!cancelExitFile) throw new Error("cancellation-overlap control path is missing")
+  const cancellation = client.call("testCancelProcessGroup", { pgid })
+  await waitFor(() => Bun.file(cancelExitFile).exists(), "cancellation-overlap leader exit trigger")
+  if (!worker.onerror) throw new Error("production owner did not install its Worker error hook")
+  worker.onerror(new ErrorEvent("error", { message: "simulated Worker error after cancellation overlap" }))
+  await waitFor(() => !sameProcess(record.descendant), "cancellation-overlap group signal")
+  await cancellation
+  await owner.stop()
+  await Bun.write(
+    resultFile,
+    JSON.stringify({ ownerSize: owner.size, descendantAlive: sameProcess(record.descendant), events }),
+  )
+  process.exit(0)
+}
 
 if (action === "exit") {
   void owner.stop()

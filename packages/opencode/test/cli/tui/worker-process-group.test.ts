@@ -471,6 +471,133 @@ test("real Core cleanup publication beats a delayed initial acquire acknowledgem
   }
 }, 30_000)
 
+test("real cancellation acquire publishes while discovery is held before leader exit", async () => {
+  if (process.platform !== "linux") return
+  await using directory = await tmpdir()
+  const home = directory.path
+  const recordFile = path.join(home, "cancel-overlap-group.json")
+  const resultFile = path.join(home, "cancel-overlap-result.json")
+  const ownerStartFile = path.join(home, "cancel-overlap-owner.json")
+  const discoveryHoldFile = path.join(home, "cancel-overlap-discovery")
+  const cleanupAcquireEventFile = path.join(home, "cancel-overlap-live-acquire.json")
+  const pendingEventFile = path.join(home, "cancel-overlap-pending-acquire.json")
+  const cancelExitFile = path.join(home, "cancel-overlap-trigger-worker-error")
+  const ownerFile = path.join(import.meta.dir, "worker-process-group-owner.ts")
+  const ownerProcess = Bun.spawn([process.execPath, ownerFile], {
+    cwd: process.cwd(),
+    env: Object.fromEntries(
+      Object.entries({
+        ...process.env,
+        HOME: home,
+        OPENCODE_TEST_HOME: home,
+        OPENCODE_DB: ":memory:",
+        OPENCODE_CONFIG_CONTENT: "{}",
+        OPENCODE_DISABLE_PROJECT_CONFIG: "1",
+        OPENCODE_DISABLE_AUTOUPDATE: "1",
+        OPENCODE_DISABLE_AUTOCOMPACT: "1",
+        OPENCODE_DISABLE_MODELS_FETCH: "1",
+        SWX_TUI_GROUP_RECORD_FILE: recordFile,
+        SWX_TUI_GROUP_RESIST_TERM: "1",
+        SWX_TUI_GROUP_EXIT_MODE: "cancel-overlap",
+        SWX_TUI_GROUP_DISCOVERY_FAILURE: undefined,
+        SWX_TUI_GROUP_DISCOVERY_HOLD_FILE: discoveryHoldFile,
+        SWX_TUI_GROUP_CLEANUP_ACQUIRE_EVENT_FILE: cleanupAcquireEventFile,
+        SWX_TUI_GROUP_PENDING_EVENT_FILE: pendingEventFile,
+        SWX_TUI_GROUP_CANCEL_EXIT_FILE: cancelExitFile,
+        SWX_TUI_OWNER_ACTION: "cancel-overlap",
+        SWX_TUI_OWNER_START_FILE: ownerStartFile,
+        SWX_TUI_OWNER_RESULT_FILE: resultFile,
+      }).filter((entry): entry is [string, string] => entry[1] !== undefined),
+    ),
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    detached: true,
+  })
+  const output = Promise.all([new Response(ownerProcess.stdout).text(), new Response(ownerProcess.stderr).text()])
+  const ownerIdentity = processIdentity(ownerProcess.pid)
+  let fixture: ProcessGroupFixture | undefined
+
+  try {
+    fixture = await waitForRecord(recordFile)
+    expect(isGroupMember(fixture.pgid, fixture.leader)).toBe(true)
+    expect(isGroupMember(fixture.pgid, fixture.descendant)).toBe(true)
+    await withTimeout(
+      (async () => {
+        while (!(await Bun.file(cleanupAcquireEventFile).exists())) await Bun.sleep(20)
+      })(),
+      5_000,
+    )
+    const liveAcquire: unknown = await Bun.file(cleanupAcquireEventFile).json()
+    if (
+      typeof liveAcquire !== "object" ||
+      liveAcquire === null ||
+      !("action" in liveAcquire) ||
+      !("cleanupOwed" in liveAcquire) ||
+      !("membersPending" in liveAcquire)
+    )
+      throw new Error("cancellation did not publish its live cleanup acquire")
+    expect(liveAcquire.action).toBe("acquire")
+    expect(liveAcquire.cleanupOwed).toBe(true)
+    expect(liveAcquire.membersPending).toBe(false)
+    await withTimeout(
+      (async () => {
+        while (!(await Bun.file(`${discoveryHoldFile}.started`).exists())) await Bun.sleep(20)
+      })(),
+      5_000,
+    )
+    expect(isGroupMember(fixture.pgid, fixture.leader)).toBe(true)
+    expect(isGroupMember(fixture.pgid, fixture.descendant)).toBe(true)
+
+    await Bun.write(`${recordFile}.exit`, "exit")
+    const pendingPublished = await withTimeout(
+      (async () => {
+        while (!(await Bun.file(pendingEventFile).exists())) await Bun.sleep(20)
+        return true
+      })(),
+      5_000,
+    ).then(
+      () => true,
+      () => false,
+    )
+    expect(pendingPublished).toBe(true)
+    await Bun.write(cancelExitFile, "worker-error")
+    const ownerExit = await withTimeout(ownerProcess.exited, 15_000)
+    if (ownerExit !== 0) {
+      const [stdout, stderr] = await withTimeout(output, 2_000)
+      throw new Error(`cancellation-overlap owner exited ${ownerExit}: ${stdout}\n${stderr}`)
+    }
+    const result: unknown = await Bun.file(resultFile).json()
+    const events = ownerGroupEvents(
+      typeof result === "object" && result !== null && "events" in result ? result.events : undefined,
+    )
+    const liveIndex = events.findIndex((event) => event.action === "acquire" && event.cleanupOwed && !event.membersPending)
+    const exitedIndex = events.findIndex(
+      (event, index) => index > liveIndex && event.action === "acquire" && event.cleanupOwed && event.membersPending,
+    )
+    expect(liveIndex).toBeGreaterThanOrEqual(0)
+    expect(events[liveIndex]?.groupAlive).toBe(true)
+    expect(exitedIndex).toBeGreaterThan(liveIndex)
+    expect("descendantAlive" in result && result.descendantAlive).toBe(false)
+    expect(isGroupMember(fixture.pgid, fixture.descendant)).toBe(false)
+  } finally {
+    await Bun.write(`${recordFile}.exit`, "exit").catch(() => {})
+    await Bun.write(`${discoveryHoldFile}.release`, "release").catch(() => {})
+    await Bun.write(cancelExitFile, "worker-error").catch(() => {})
+    if (fixture && (isGroupMember(fixture.pgid, fixture.leader) || isGroupMember(fixture.pgid, fixture.descendant))) {
+      try {
+        process.kill(-fixture.pgid, "SIGKILL")
+      } catch {}
+    }
+    if (ownerIdentity && sameProcess(ownerIdentity)) {
+      try {
+        process.kill(ownerProcess.pid, "SIGKILL")
+      } catch {}
+    }
+    await withTimeout(ownerProcess.exited, 5_000).catch(() => undefined)
+  }
+}, 35_000)
+
 test("owner uses the live-PGID fallback when process identity is unavailable", async () => {
   if (process.platform === "win32") return
   const child = Bun.spawn([process.execPath, "-e", 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)'], {
@@ -491,6 +618,7 @@ test("owner uses the live-PGID fallback when process identity is unavailable", a
     members: [],
     membersPending: false,
     membersSnapshotComplete: false,
+    membersUnavailable: false,
     generation: 1,
     ownershipSequence: 1,
   }
@@ -600,7 +728,8 @@ test("Worker tracker and owner stay aligned across rejected or delayed acknowled
       expect(owner.has(group.pgid)).toBe(false)
       await expect(tracker.observe({ ...group, action: "release", cleanupOwed: false })).rejects.toThrow()
       expect(owner.has(group.pgid)).toBe(false)
-      expect(events.map((event) => event.identity)).toEqual([identity, identity, identity, identity, identity])
+      // A pruned acquire for a gone group owes no resolved event.
+      expect(events.map((event) => event.identity)).toEqual([identity, identity, identity, identity])
     } finally {
       if (sameProcess(identity)) {
         try {
@@ -679,6 +808,11 @@ test("owner does not signal a live PGID using another process group's recorded i
       cleanupOwed: false,
       identity: secondIdentity,
       members: [],
+      membersPending: false,
+      membersSnapshotComplete: true,
+      membersUnavailable: false,
+      generation: 1,
+      ownershipSequence: 1,
     })
     const originalKill = process.kill.bind(process)
     const forwarded: Array<NodeJS.Signals | number | undefined> = []
@@ -746,7 +880,9 @@ test("stop prunes a refuted live PGID without waiting for its deadline", async (
           members: [],
           membersPending: false,
           membersSnapshotComplete: true,
+          membersUnavailable: false,
           generation: 1,
+          ownershipSequence: 1,
         })
         return () => {}
       },
@@ -800,6 +936,7 @@ test("owner prunes a refuted live leader even while cleanup discovery is pending
     members: [],
     membersPending: true,
     membersSnapshotComplete: false,
+    membersUnavailable: false,
     generation: 1,
     ownershipSequence: 1,
   }
@@ -920,14 +1057,25 @@ test("release then reacquire uses recorded descendant identity after the leader 
       await expect(tracker.observe({ action: "release", ...group })).rejects.toThrow()
       expect(owner.has(group.pgid)).toBe(false)
       await expect(tracker.observe({ ...group, action: "acquire", cleanupOwed: true })).rejects.toThrow()
-      expect(
+      const hasDescendant = () =>
         owner.get(group.pgid)?.members.some(
           (member) =>
             member.pid === descendant.pid &&
             member.bootID === descendant.bootID &&
             member.startTicks === descendant.startTicks,
-        ),
-      ).toBe(true)
+        ) === true
+      await withTimeout(
+        (async () => {
+          const deadline = Date.now() + 5_000
+          while (Date.now() < deadline) {
+            if (hasDescendant()) return
+            await Bun.sleep(20)
+          }
+          throw new Error("reacquire did not publish the recorded descendant identity")
+        })(),
+        5_500,
+      )
+      expect(hasDescendant()).toBe(true)
 
       worker.onerror?.(new ErrorEvent("error", { message: "simulated owner exit after reacquire" }))
       await withTimeout(
