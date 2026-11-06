@@ -233,7 +233,7 @@ async function runOwnerCase(input: (typeof cases)[number]) {
         `TUI owner fixture for ${input.action} exited ${ownerResultState.exitCode} before publishing a result: ${result}\n${stdout}\n${stderr}`,
       )
     }
-    const ownerResult =
+    const ownerResult: unknown =
       ownerResultState.type === "result"
         ? ownerResultState.result
         : await Bun.file(resultFile).json().catch(() => undefined)
@@ -1288,7 +1288,7 @@ test("Core-spawned completed commands retire Worker tracker ownership", async ()
       const [stdout, stderr] = await withTimeout(output, 5_000)
       throw new Error(`retirement owner exited ${result.code}: ${stdout}\n${stderr}`)
     }
-    const resultValue =
+    const resultValue: unknown =
       result.type === "result" ? result.value : await Bun.file(resultFile).json().catch(() => undefined)
     if (typeof resultValue !== "object" || resultValue === null || !("sizes" in resultValue))
       throw new Error("retirement owner returned no tracker size list")
