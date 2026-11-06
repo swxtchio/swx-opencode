@@ -406,19 +406,27 @@ const layer = Layer.effect(
     const preparations = new Map<string, symbol>()
     const parked = new Set<SessionID>()
     const wakes = new Map<SessionID, number>()
+    const parkEpochs = new Map<SessionID, number>()
     const running = new Set<SessionID>()
     // Items this process admitted as `preparing` whose sender has not finished
     // with them, each with the signal that it has. A preparing row missing here
     // was left by a stopped process.
     const preparing = new Map<ItemID, Deferred.Deferred<void>>()
+    // A preparation that finishes after a later park is not a new wake for the stopped run.
+    const preparingParkEpochs = new Map<ItemID, number>()
     // Ends an item's preparation here, so it bounds no admission from now on;
     // its waiters are told once the change it makes is committed.
     const endPreparing = (itemID: ItemID) => {
       const done = preparing.get(itemID)
       preparing.delete(itemID)
-      return Effect.sync(() => {
-        if (done) Deferred.doneUnsafe(done, Effect.void)
-      })
+      const parkEpoch = preparingParkEpochs.get(itemID)
+      preparingParkEpochs.delete(itemID)
+      return {
+        parkEpoch,
+        notify: Effect.sync(() => {
+          if (done) Deferred.doneUnsafe(done, Effect.void)
+        }),
+      }
     }
     // Waiting callers' answer channels, by item: the message the item became,
     // then the final reply of the turn that message joined.
@@ -992,7 +1000,10 @@ const layer = Layer.effect(
         if (result.replacement.into) retire([item.id], result.replacement.into)
         finish(result.replacement.finished)
       }
-      if (result.row.time_preparing !== null && !preparing.has(item.id)) preparing.set(item.id, Deferred.makeUnsafe())
+      if (result.row.time_preparing !== null && !preparing.has(item.id)) {
+        preparing.set(item.id, Deferred.makeUnsafe())
+        preparingParkEpochs.set(item.id, parkEpochs.get(input.sessionID) ?? 0)
+      }
       if (!result.row.time_promoted && result.row.time_preparing === null) wake(input.sessionID)
       yield* publish(input.sessionID)
       return item
@@ -1534,14 +1545,19 @@ const layer = Layer.effect(
               return [...own, ...(yield* readmit(tx, input.sessionID, row.id, input.markers))]
             }),
           ).pipe(Effect.orDie)
-          yield* ended
+          yield* ended.notify
           if (!admitted) return
           admitted.forEach((admission) => {
             retire(admission.retired, admission.id)
             if (admission.into) retire([admission.id], admission.into)
             finish(admission.finished)
           })
-          wake(input.sessionID)
+          if (
+            !parked.has(input.sessionID) ||
+            ended.parkEpoch === undefined ||
+            ended.parkEpoch === (parkEpochs.get(input.sessionID) ?? 0)
+          )
+            wake(input.sessionID)
           yield* publish(input.sessionID)
         }),
       )
@@ -1560,7 +1576,7 @@ const layer = Layer.effect(
           const readmitted = yield* writable(sessionID, (tx) => readmit(tx, sessionID, itemID, markers)).pipe(
             Effect.orDie,
           )
-          yield* ended
+          yield* ended.notify
           readmitted.forEach((admission) => {
             retire(admission.retired, admission.id)
             if (admission.into) retire([admission.id], admission.into)
@@ -3063,7 +3079,12 @@ const layer = Layer.effect(
       exclusive(
         sessionID,
         Effect.sync(() => {
-          if (seen === undefined || (wakes.get(sessionID) ?? 0) === seen) parked.add(sessionID)
+          if (seen === undefined || (wakes.get(sessionID) ?? 0) === seen) {
+            if (!parked.has(sessionID)) {
+              parked.add(sessionID)
+              parkEpochs.set(sessionID, (parkEpochs.get(sessionID) ?? 0) + 1)
+            }
+          }
         }),
       )
 

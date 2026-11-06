@@ -6,6 +6,8 @@ export interface Runner<A, E = never> {
   readonly ensureRunning: (work: Effect.Effect<A, E>) => Effect.Effect<A, E>
   readonly startShell: (work: Effect.Effect<A, E>, ready?: Latch.Latch) => Effect.Effect<A, E | Busy>
   readonly cancel: Effect.Effect<void>
+  /** Keeps a running task owned until its interruption cleanup exits. */
+  readonly cancelWithoutRestart: Effect.Effect<void>
 }
 
 export class Cancelled extends Schema.TaggedErrorClass<Cancelled>()("RunnerCancelled", {}) {}
@@ -168,38 +170,39 @@ export const make = <A, E = never>(
       }),
     ).pipe(Effect.flatten)
 
-  const cancel = SynchronizedRef.modify(ref, (st) => {
-    switch (st._tag) {
-      case "Idle":
-        return [Effect.void, st] as const
-      case "Running":
-        return [
-          Effect.gen(function* () {
-            yield* Fiber.interrupt(st.run.fiber)
-            yield* Deferred.fail(st.run.done, new Cancelled()).pipe(Effect.asVoid)
-            yield* idleIfCurrent()
-          }),
-          { _tag: "Idle" } as const,
-        ] as const
-      case "Shell":
-        return [
-          Effect.gen(function* () {
-            yield* stopShell(st.shell)
-            yield* idleIfCurrent()
-          }),
-          { _tag: "Idle" } as const,
-        ] as const
-      case "ShellThenRun":
-        return [
-          Effect.gen(function* () {
-            yield* stopShell(st.shell)
-            yield* Deferred.fail(st.run.done, new Cancelled()).pipe(Effect.asVoid)
-            yield* idleIfCurrent()
-          }),
-          { _tag: "Idle" } as const,
-        ] as const
-    }
-  }).pipe(Effect.flatten)
+  const cancel = (keepRunning: boolean) =>
+    SynchronizedRef.modify(ref, (st) => {
+      switch (st._tag) {
+        case "Idle":
+          return [Effect.void, st] as const
+        case "Running":
+          return [
+            Effect.gen(function* () {
+              yield* Fiber.interrupt(st.run.fiber)
+              yield* Deferred.fail(st.run.done, new Cancelled()).pipe(Effect.asVoid)
+              if (!keepRunning) yield* idleIfCurrent()
+            }),
+            keepRunning ? st : ({ _tag: "Idle" } as const),
+          ] as const
+        case "Shell":
+          return [
+            Effect.gen(function* () {
+              yield* stopShell(st.shell)
+              yield* idleIfCurrent()
+            }),
+            { _tag: "Idle" } as const,
+          ] as const
+        case "ShellThenRun":
+          return [
+            Effect.gen(function* () {
+              yield* stopShell(st.shell)
+              yield* Deferred.fail(st.run.done, new Cancelled()).pipe(Effect.asVoid)
+              yield* idleIfCurrent()
+            }),
+            { _tag: "Idle" } as const,
+          ] as const
+      }
+    }).pipe(Effect.flatten)
 
   return {
     get state() {
@@ -210,7 +213,8 @@ export const make = <A, E = never>(
     },
     ensureRunning,
     startShell,
-    cancel,
+    cancel: cancel(false),
+    cancelWithoutRestart: cancel(true),
   }
 }
 

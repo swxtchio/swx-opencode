@@ -596,6 +596,15 @@ const gates = {
   commandBefore: undefined as undefined | Effect.Effect<void, unknown>,
   messagesTransform: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
   queueSelection: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+  queuePrepared: undefined as
+    | undefined
+    | { sessionID: SessionID; entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+  queueStart: undefined as
+    | undefined
+    | { sessionID: SessionID; entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+  queuePark: undefined as
+    | undefined
+    | { sessionID: SessionID; entered: Deferred.Deferred<void>; completed: Deferred.Deferred<void> },
   finishingRead: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
   nextEnsureRunning: undefined as
     | undefined
@@ -807,6 +816,61 @@ const gatedRunState = LayerNode.make({
   deps: [BackgroundJob.node, SessionStatus.node],
 })
 
+const gatedQueue = LayerNode.make({
+  service: SessionQueue.Service,
+  layer: Layer.effect(
+    SessionQueue.Service,
+    Effect.gen(function* () {
+      const real = yield* SessionQueue.Service
+      return SessionQueue.Service.of({
+        ...real,
+        exclusive: <A, E, R>(sessionID: SessionID, effect: Effect.Effect<A, E, R>) =>
+          real.exclusive(
+            sessionID,
+            Effect.gen(function* () {
+              const gate = gates.queueStart
+              if (gate?.sessionID === sessionID) {
+                gates.queueStart = undefined
+                yield* Deferred.succeed(gate.entered, undefined)
+                yield* Deferred.await(gate.release)
+              }
+              return yield* effect
+            }),
+          ),
+        prepared: (input) =>
+          Effect.gen(function* () {
+            const gate = gates.queuePrepared
+            if (gate?.sessionID === input.sessionID) {
+              gates.queuePrepared = undefined
+              yield* Deferred.succeed(gate.entered, undefined)
+              yield* Deferred.await(gate.release)
+            }
+            yield* real.prepared(input)
+          }),
+        park: (sessionID, seen) =>
+          Effect.gen(function* () {
+            const gate = gates.queuePark
+            if (gate?.sessionID === sessionID) {
+              gates.queuePark = undefined
+              yield* Deferred.succeed(gate.entered, undefined)
+            }
+            yield* real.park(sessionID, seen)
+            if (gate?.sessionID === sessionID) yield* Deferred.succeed(gate.completed, undefined)
+          }),
+      })
+    }),
+  ).pipe(
+    Layer.provide(
+      SessionQueue.node.implementation as Layer.Layer<
+        SessionQueue.Service,
+        never,
+        Database.Service | EventV2Bridge.Service
+      >,
+    ),
+  ),
+  deps: [Database.node, EventV2Bridge.node],
+})
+
 const gatedPlugin = LayerNode.make({
   service: Plugin.Service,
   layer: Layer.effect(
@@ -872,6 +936,7 @@ const gated = promptTests(
     [RuntimeFlags.node, runtimeFlags],
     [EventV2Bridge.node, gatedEventV2Bridge],
     [Session.node, gatedSession],
+    [SessionQueue.node, gatedQueue],
     [SessionRunState.node, gatedRunState],
     [Plugin.node, gatedPlugin],
   ]),
@@ -9986,19 +10051,119 @@ it.instance(
   15_000,
 )
 
-it.instance(
+gated.instance(
   "a run interrupted without a prompt cancel, as instance disposal does, also parks pending prompts",
   () =>
     Effect.gen(function* () {
       const run = yield* SessionRunState.Service
       const { llm, queue, chat, task, send } = yield* startHeld()
+      const gate = {
+        sessionID: chat.id,
+        entered: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>(),
+      }
+      gates.queuePrepared = gate
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (gates.queuePrepared === gate) gates.queuePrepared = undefined
+          succeedVoid(gate.release)
+        }),
+      )
       const held = yield* send("parked by the interrupt", { delivery: "queue" })
-      yield* queued(chat.id, 1)
+      yield* awaitWithTimeout(Deferred.await(gate.entered), "queued prompt never reached prepared", "10 seconds")
+      const items = yield* queued(chat.id, 1)
+      expect(items.map((item) => item.input.parts)).toEqual([said("parked by the interrupt")])
+      const database = yield* Database.Service
+      const preparing = yield* database.db
+        .select({ id: SessionPromptQueueTable.id, time_preparing: SessionPromptQueueTable.time_preparing })
+        .from(SessionPromptQueueTable)
+        .where(eq(SessionPromptQueueTable.session_id, chat.id))
+        .get()
+      expect(preparing).toBeDefined()
+      expect(preparing?.time_preparing).toBeTypeOf("number")
 
       yield* run.cancel(chat.id)
+      expect(yield* queue.isParked(chat.id)).toBe(true)
+      const beforePreparationFinishes = yield* llm.inputs
+      expect(beforePreparationFinishes.map(lastUser)).toEqual([{ role: "user", content: "start the task" }])
+      yield* Deferred.succeed(gate.release, undefined)
       yield* finish(task, held)
       expect(yield* llm.calls).toBe(1)
+      const providerInputs = yield* llm.inputs
+      expect(providerInputs.map(lastUser)).toEqual([{ role: "user", content: "start the task" }])
       expect((yield* queue.list(chat.id)).map((item) => item.input.parts)).toEqual([said("parked by the interrupt")])
+      expect(yield* queue.isParked(chat.id)).toBe(true)
+    }),
+  15_000,
+)
+
+gated.instance(
+  "a queued prompt cannot start a replacement run while cancellation parks its session",
+  () =>
+    Effect.gen(function* () {
+      const run = yield* SessionRunState.Service
+      const { llm, queue, chat, task, send } = yield* startHeld()
+      const prepared = {
+        sessionID: chat.id,
+        entered: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>(),
+      }
+      const start = { sessionID: chat.id, entered: yield* Deferred.make<void>(), release: yield* Deferred.make<void>() }
+      const park = { sessionID: chat.id, entered: yield* Deferred.make<void>(), completed: yield* Deferred.make<void>() }
+      gates.queuePrepared = prepared
+      gates.queueStart = start
+      gates.queuePark = park
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (gates.queuePrepared === prepared) gates.queuePrepared = undefined
+          if (gates.queueStart === start) gates.queueStart = undefined
+          if (gates.queuePark === park) gates.queuePark = undefined
+          succeedVoid(prepared.release)
+          succeedVoid(start.release)
+        }),
+      )
+      const held = yield* send("parked before cancellation", { delivery: "queue" })
+      yield* awaitWithTimeout(Deferred.await(prepared.entered), "queued prompt never reached prepared", "10 seconds")
+      expect((yield* queue.list(chat.id)).map((item) => item.input.parts)).toEqual([said("parked before cancellation")])
+      yield* Deferred.succeed(prepared.release, undefined)
+      yield* awaitWithTimeout(
+        Deferred.await(start.entered),
+        "queued prompt never reached the serialized run start",
+        "5 seconds",
+      )
+      const items = yield* queued(chat.id, 1)
+      expect(items.map((item) => item.input.parts)).toEqual([said("parked before cancellation")])
+      const database = yield* Database.Service
+      const ready = yield* database.db
+        .select({ time_preparing: SessionPromptQueueTable.time_preparing })
+        .from(SessionPromptQueueTable)
+        .where(eq(SessionPromptQueueTable.session_id, chat.id))
+        .get()
+      expect(ready?.time_preparing).toBeNull()
+
+      const cancelled = yield* run.cancel(chat.id).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(park.entered), "run interruption never tried to park the queue", "10 seconds")
+      const runnerAtPark = (yield* run.current(chat.id))?._tag
+      const beforeStartRelease = yield* llm.inputs
+      expect(beforeStartRelease.map(lastUser)).toEqual([{ role: "user", content: "start the task" }])
+      expect(yield* queue.isParked(chat.id)).toBe(false)
+      yield* Deferred.succeed(start.release, undefined)
+      yield* awaitWithTimeout(Deferred.await(park.completed), "cancellation did not commit the queue park", "10 seconds")
+      yield* awaitWithTimeout(Fiber.join(cancelled), "run cancellation never finished", "10 seconds")
+      expect(yield* queue.isParked(chat.id)).toBe(true)
+      const currentAfterCancel = yield* run.current(chat.id)
+      if (currentAfterCancel) yield* run.cancel(chat.id)
+      yield* finish(task, held)
+      expect(runnerAtPark).toBe("Running")
+      expect(currentAfterCancel).toBeUndefined()
+
+      expect(yield* llm.calls).toBe(1)
+      const providerInputs = yield* llm.inputs
+      expect(providerInputs.map(lastUser)).toEqual([{ role: "user", content: "start the task" }])
+      expect((yield* queue.list(chat.id)).map((item) => item.input.parts)).toEqual([
+        said("parked before cancellation"),
+      ])
+      expect(yield* queue.isParked(chat.id)).toBe(true)
     }),
   15_000,
 )

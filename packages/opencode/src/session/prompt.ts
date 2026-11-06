@@ -43,7 +43,7 @@ import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
-import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Semaphore, Types } from "effect"
+import { Cause, Effect, Exit, Fiber, Latch, Layer, Option, Scope, Context, Schema, Semaphore, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
@@ -2120,19 +2120,29 @@ const layer = Layer.effect(
           return yield* new SessionQueue.WithdrawnError({ sessionID, itemID: own })
         if (yield* queue.empty(sessionID)) return yield* withdrawn.pipe(Effect.andThen(lastAssistant(sessionID)))
       }
-      // A cancel that parked the session after this prompt was admitted leaves it
-      // pending, as it would have had this caller joined the run the cancel stopped.
-      if (
-        own &&
-        Exit.isSuccess(yield* state.assertNotBusy(sessionID).pipe(Effect.exit)) &&
-        (yield* queue.isParked(sessionID))
-      )
-        return yield* withdrawn.pipe(Effect.andThen(lastAssistant(sessionID)))
-      let result = yield* state.ensureRunning(
-        sessionID,
-        lastAssistant(sessionID),
-        runLoop(sessionID, rootMessageID, retryFailedRoot),
-      )
+      const ensureRun = (work: Effect.Effect<SessionV1.WithParts>) =>
+        Effect.gen(function* () {
+          const waiting = yield* queue.exclusive(
+            sessionID,
+            Effect.gen(function* () {
+              const idle = own && Exit.isSuccess(yield* state.assertNotBusy(sessionID).pipe(Effect.exit))
+              const parked = own ? yield* queue.isParked(sessionID) : false
+              if (own && idle && parked) return undefined
+              return yield* state
+                .ensureRunning(sessionID, lastAssistant(sessionID), work)
+                .pipe(Effect.forkChild({ startImmediately: true }))
+            }),
+          )
+          if (!waiting)
+            return {
+              parked: true as const,
+              result: yield* withdrawn.pipe(Effect.andThen(lastAssistant(sessionID))),
+            }
+          return { parked: false as const, result: yield* Fiber.join(waiting) }
+        })
+      const firstRun = yield* ensureRun(runLoop(sessionID, rootMessageID, retryFailedRoot))
+      if (firstRun.parked) return firstRun.result
+      let result = firstRun.result
       const attemptedCompactions = new Set<MessageID>()
       while (true) {
         const history = yield* MessageV2.snapshot(sessionID).pipe(Effect.provideService(Database.Service, database))
@@ -2145,7 +2155,9 @@ const layer = Layer.effect(
         )
         if (!pending || attemptedCompactions.has(pending.messageID)) break
         attemptedCompactions.add(pending.messageID)
-        result = yield* state.ensureRunning(sessionID, lastAssistant(sessionID), runLoop(sessionID))
+        const resumed = yield* ensureRun(runLoop(sessionID))
+        if (resumed.parked) return resumed.result
+        result = resumed.result
       }
       // Work admitted after the joined run's last history read would otherwise
       // wait for another prompt. This caller stays with the drains until one has
