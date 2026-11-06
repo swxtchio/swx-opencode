@@ -6335,7 +6335,10 @@ gated.instance(
       const subtaskAssistant = messages.findLast(
         (message) => message.info.role === "assistant" && message.info.parentID === heldID,
       )
-      expect(answers.replies.at(-1)?.info.id).toBe(subtaskAssistant?.info.id)
+      const answer = answers.replies.at(-1)
+      if (!subtaskAssistant) throw new Error("subtask assistant was not found")
+      if (!answer) throw new Error("subtask cancellation did not answer its queued caller")
+      expect(answer.info.id).toBe(subtaskAssistant.info.id)
     }),
   60_000,
 )
@@ -15080,8 +15083,10 @@ it.instance(
       const [, result] = yield* finish(task, joined)
       const messages = yield* sessions.messages({ sessionID: chat.id })
       const summary = messages.find((message) => message.info.role === "assistant" && message.info.parentID === parentID)
-      expect(summary?.info).toMatchObject({ role: "assistant", summary: true, finish: "stop" })
-      expect(result?.info.id).toBe(summary?.info.id)
+      if (!summary) throw new Error("manual compaction summary was not found")
+      if (!result) throw new Error("manual compaction run returned no assistant")
+      expect(summary.info).toMatchObject({ role: "assistant", summary: true, finish: "stop" })
+      expect(result.info.id).toBe(summary.info.id)
     }),
   15_000,
 )
@@ -15103,8 +15108,10 @@ it.instance(
       const [result] = yield* finish(task)
       const messages = yield* sessions.messages({ sessionID: chat.id })
       const summary = messages.find((message) => message.info.role === "assistant" && message.info.parentID === parentID)
-      expect(summary?.info).toMatchObject({ role: "assistant", summary: true, error: { name: "MessageAbortedError" } })
-      expect(result?.info.id).toBe(summary?.info.id)
+      if (!summary) throw new Error("cancelled compaction summary was not found")
+      if (!result) throw new Error("cancelled compaction run returned no assistant")
+      expect(summary.info).toMatchObject({ role: "assistant", summary: true, error: { name: "MessageAbortedError" } })
+      expect(result.info.id).toBe(summary.info.id)
     }),
   15_000,
 )
@@ -15138,9 +15145,12 @@ gated.instance(
       const summary = messages.find((message) => message.info.role === "assistant" && message.info.parentID === parentID)
       expect(terminalWrite.triggered).toBe(true)
       expect(Exit.isSuccess(cancelExit)).toBe(true)
-      expect(summary?.info.role).toBe("assistant")
-      expect(capture.replies.at(-1)?.info.id).toBe(summary?.info.id)
-      if (summary?.info.role === "assistant") expect(summary.info.time.completed).toBeUndefined()
+      const answer = capture.replies.at(-1)
+      if (!summary) throw new Error("interrupted compaction summary was not found")
+      if (!answer) throw new Error("interrupted compaction did not answer its caller")
+      expect(summary.info.role).toBe("assistant")
+      expect(answer.info.id).toBe(summary.info.id)
+      if (summary.info.role === "assistant") expect(summary.info.time.completed).toBeUndefined()
       expect(Exit.isSuccess(taskExit)).toBe(true)
     }),
   15_000,
