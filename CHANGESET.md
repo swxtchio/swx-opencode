@@ -140,7 +140,7 @@ Newest first. Each entry names the upstream range brought in.
 
 ### Runtime fixes
 
-- **#419** Keep interrupted V1 sessions parked while queued-prompt preparation completes, and prevent a drain from starting replacement work during cancellation (swxtchio/swx-opencode#418). _Fork-only._
+- **#419** Track queued admissions across preparation so repeated cancellation keeps in-flight prompts parked, normal stops still deliver later admissions, and cleanup does not answer a new prompt with a prior assistant (swxtchio/swx-opencode#418). _Fork-only._
 - **#406** Backport `anomalyco/opencode#54023` (`94353780cf289dcecee2866322dbbe1f34d51641`) to coordinate provider OAuth refresh across concurrent callers. The required provider-refresh behavior is complete; donor payload is partial.
   - Adapt `packages/core/src/credential.ts` to add `Credential.lock` to the fork's global service and use its existing `EffectFlock`; keep `packages/core/src/integration.ts`'s `Integration.connection.resolve` Location-owned, re-read stored state inside the lock, and preserve key, environment, missing-credential, fresh-token and no-refresh behavior. MCP SDK refresh and provider-401 recovery remain out of scope.
   - Omit the donor's upstream-only `CredentialLegacy`, Bus and ErrorSummary plumbing and interface-only updates to upstream config/MCP OAuth test doubles; do not restore the deleted MCP OAuth suite or config fixture.

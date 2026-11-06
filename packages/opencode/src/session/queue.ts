@@ -405,6 +405,7 @@ const layer = Layer.effect(
     const order = new Map<SessionID, Semaphore.Semaphore>()
     const preparations = new Map<string, symbol>()
     const parked = new Set<SessionID>()
+    // The turn's consume snapshots admissions as well as completed wakes.
     const wakes = new Map<SessionID, number>()
     const parkEpochs = new Map<SessionID, number>()
     const running = new Set<SessionID>()
@@ -1003,6 +1004,7 @@ const layer = Layer.effect(
       if (result.row.time_preparing !== null && !preparing.has(item.id)) {
         preparing.set(item.id, Deferred.makeUnsafe())
         preparingParkEpochs.set(item.id, parkEpochs.get(input.sessionID) ?? 0)
+        wakes.set(input.sessionID, (wakes.get(input.sessionID) ?? 0) + 1)
       }
       if (!result.row.time_promoted && result.row.time_preparing === null) wake(input.sessionID)
       yield* publish(input.sessionID)
@@ -3075,16 +3077,15 @@ const layer = Layer.effect(
       return yield* Effect.failCause(exit.cause).pipe(Effect.orDie)
     })
 
+    // A normal stop parks only if no prompt arrived since its consume. Each
+    // unconditional cancellation starts a new park boundary, even when already parked.
     const park = (sessionID: SessionID, seen?: number) =>
       exclusive(
         sessionID,
         Effect.sync(() => {
-          if (seen === undefined || (wakes.get(sessionID) ?? 0) === seen) {
-            if (!parked.has(sessionID)) {
-              parked.add(sessionID)
-              parkEpochs.set(sessionID, (parkEpochs.get(sessionID) ?? 0) + 1)
-            }
-          }
+          if (seen !== undefined && (wakes.get(sessionID) ?? 0) !== seen) return
+          parked.add(sessionID)
+          parkEpochs.set(sessionID, (parkEpochs.get(sessionID) ?? 0) + 1)
         }),
       )
 

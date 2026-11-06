@@ -40,7 +40,7 @@ const layer = Layer.effect(
         const runners = new Map<SessionID, Runner.Runner<SessionV1.WithParts>>()
         yield* Effect.addFinalizer(
           Effect.fnUntraced(function* () {
-            yield* Effect.forEach(runners.values(), (runner) => runner.cancelWithoutRestart, {
+            yield* Effect.forEach(runners.values(), (runner) => runner.cancel, {
               concurrency: "unbounded",
               discard: true,
             })
@@ -90,7 +90,7 @@ const layer = Layer.effect(
         if (locallyObserved.has(sessionID)) yield* status.set(sessionID, { type: "idle" })
         return
       }
-      yield* existing.cancelWithoutRestart
+      yield* existing.cancel
     })
 
     const ensureRunning = Effect.fn("SessionRunState.ensureRunning")(function* (
