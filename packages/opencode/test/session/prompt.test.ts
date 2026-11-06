@@ -6224,7 +6224,7 @@ it.instance(
   30_000,
 )
 
-it.instance(
+gated.instance(
   "cancels a held drain during a subtask tool step through runner cancellation",
   () =>
     Effect.gen(function* () {
@@ -6313,6 +6313,13 @@ it.instance(
       yield* Deferred.succeed(taskGate, void 0)
       yield* awaitWithTimeout(Deferred.await(ready), "held subtask did not start", "10 seconds")
 
+      const answers = { sessionID: session.id, replies: [] as SessionV1.WithParts[] }
+      gates.queueAnswers = answers
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (gates.queueAnswers === answers) gates.queueAnswers = undefined
+        }),
+      )
       cancellation = yield* runState.cancel(session.id).pipe(Effect.forkChild)
       const cancelExit = yield* awaitWithTimeout(
         Fiber.await(cancellation),
@@ -6328,7 +6335,7 @@ it.instance(
       const subtaskAssistant = messages.findLast(
         (message) => message.info.role === "assistant" && message.info.parentID === heldID,
       )
-      if (Exit.isSuccess(runExit)) expect(runExit.value.info.id).toBe(subtaskAssistant?.info.id)
+      expect(answers.replies.at(-1)?.info.id).toBe(subtaskAssistant?.info.id)
     }),
   60_000,
 )
