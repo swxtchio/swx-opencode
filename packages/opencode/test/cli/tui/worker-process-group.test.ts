@@ -4,13 +4,8 @@ import { ProcessGroup } from "../../../src/cli/tui/process-group"
 import { tmpdir } from "../../fixture/fixture"
 import path from "node:path"
 import { withTimeout } from "../../../src/util/timeout"
-
-type ProcessIdentity = EventWriter.ProcessIdentity
-type ProcessGroupFixture = {
-  readonly leader: ProcessIdentity
-  readonly descendant: ProcessIdentity
-  readonly pgid: number
-}
+import { groupAlive, processGroupFixture, processIdentity, sameProcess } from "../../../../core/test/fixture/process-group"
+import type { ProcessGroupFixture, ProcessIdentity } from "../../../../core/test/fixture/process-group"
 type OwnerGroupEvent = { readonly action: string; readonly cleanupOwed: boolean; readonly groupAlive: boolean }
 
 const cases = [
@@ -53,22 +48,6 @@ const cases = [
   { action: "stop-confirmed", name: "stop-confirmed", resistTerm: false, blockShutdown: false, exitMode: "long", result: "gone" },
 ] as const
 
-function processIdentity(value: unknown): ProcessIdentity | undefined {
-  if (typeof value !== "object" || value === null || !("pid" in value) || typeof value.pid !== "number") return
-  if (!("bootID" in value) || !("startTicks" in value)) return
-  if (value.bootID !== null && typeof value.bootID !== "string") return
-  if (value.startTicks !== null && typeof value.startTicks !== "string") return
-  return { pid: value.pid, bootID: value.bootID, startTicks: value.startTicks }
-}
-
-function processGroupFixture(value: unknown): ProcessGroupFixture | undefined {
-  if (typeof value !== "object" || value === null || !("pgid" in value) || typeof value.pgid !== "number") return
-  const leader = "leader" in value ? processIdentity(value.leader) : undefined
-  const descendant = "descendant" in value ? processIdentity(value.descendant) : undefined
-  if (!leader || !descendant) return
-  return { leader, descendant, pgid: value.pgid }
-}
-
 function ownerGroupEvents(value: unknown): OwnerGroupEvent[] {
   if (!Array.isArray(value)) return []
   return value.filter(
@@ -82,12 +61,6 @@ function ownerGroupEvents(value: unknown): OwnerGroupEvent[] {
       "groupAlive" in event &&
       typeof event.groupAlive === "boolean",
   )
-}
-
-function sameProcess(identity: ProcessIdentity) {
-  if (!identity.bootID || !identity.startTicks) return false
-  const current = EventWriter.readIdentity(identity.pid)
-  return current?.bootID === identity.bootID && current.startTicks === identity.startTicks
 }
 
 async function waitForRecord(file: string) {
@@ -179,7 +152,9 @@ async function runOwnerCase(input: (typeof cases)[number]) {
     )
     if (startup.type === "exit") {
       const [stdout, stderr] = await withTimeout(output, 5_000)
-      throw new Error(`TUI owner fixture exited ${startup.exitCode} before recording its group: ${stdout}\n${stderr}`)
+      throw new Error(
+        `TUI owner fixture for ${input.action} exited ${startup.exitCode} before recording its group: ${stdout}\n${stderr}`,
+      )
     }
     fixture = startup.fixture
     expect(fixture.pgid).toBe(fixture.leader.pid)
@@ -203,7 +178,10 @@ async function runOwnerCase(input: (typeof cases)[number]) {
     )
     if (ownerResultState.type === "exit") {
       const [stdout, stderr] = await withTimeout(output, 5_000)
-      throw new Error(`TUI owner fixture exited ${ownerResultState.exitCode} before publishing a result: ${stdout}\n${stderr}`)
+      const result = await Bun.file(resultFile).text().catch(() => "<missing>")
+      throw new Error(
+        `TUI owner fixture for ${input.action} exited ${ownerResultState.exitCode} before publishing a result: ${result}\n${stdout}\n${stderr}`,
+      )
     }
     const ownerResult = ownerResultState.result
     await withTimeout(
@@ -284,15 +262,61 @@ test(
   "TUI owner uses production process-group wiring across exit, release, and Worker-failure paths",
   async () => {
     if (process.platform !== "linux") return
-    const selected = cases.filter(
-      (scenario) => !process.env.SWX_TUI_GROUP_CASE || process.env.SWX_TUI_GROUP_CASE === scenario.action,
-    )
-    await Promise.all(selected.slice(0, 3).map(runOwnerCase))
-    await Promise.all(selected.slice(3, 6).map(runOwnerCase))
-    await Promise.all(selected.slice(6).map(runOwnerCase))
+    const selectedActions = process.env.SWX_TUI_GROUP_CASE?.split(",")
+    const selected = cases.filter((scenario) => !selectedActions || selectedActions.includes(scenario.action))
+    for (const scenario of selected) await runOwnerCase(scenario)
   },
   120_000,
 )
+
+test("owner uses the live-PGID fallback when process identity is unavailable", async () => {
+  if (process.platform === "win32") return
+  const child = Bun.spawn([process.execPath, "-e", 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)'], {
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "ignore",
+    detached: true,
+  })
+  const identity = processIdentity(child.pid)
+  if (!identity) throw new Error("identity fallback fixture has no process identity for cleanup")
+  const unavailable = { pid: child.pid, bootID: null, startTicks: null }
+  const event: ProcessGroup.Event = {
+    eventID: 0,
+    action: "acquire",
+    pgid: child.pid,
+    cleanupOwed: true,
+    identity: unavailable,
+    members: [],
+  }
+  const worker = { onerror: null as ((event: ErrorEvent) => unknown) | null, terminate: () => {} }
+  const owner = ProcessGroup.makeOwner({
+    client: {
+      subscribe(handler) {
+        handler(event)
+        return () => {}
+      },
+      acknowledge: async () => undefined,
+      shutdown: async () => {
+        throw new Error("injected unconfirmed shutdown")
+      },
+    },
+    worker,
+  })
+  try {
+    expect(owner.has(child.pid)).toBe(true)
+    await owner.stop()
+    await withTimeout(child.exited, 5_000)
+    expect(groupAlive(child.pid)).toBe(false)
+  } finally {
+    if (sameProcess(identity)) {
+      try {
+        process.kill(-child.pid, "SIGKILL")
+      } catch {}
+    }
+    await withTimeout(child.exited, 5_000)
+    await owner.stop()
+  }
+})
 
 test("Worker tracker and owner stay aligned across rejected or delayed acknowledgements and group reuse", async () => {
   if (process.platform !== "linux") return

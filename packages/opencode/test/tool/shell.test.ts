@@ -4,7 +4,6 @@ import { afterEach, describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
-import { EventWriter } from "@opencode-ai/core/event/writer"
 import { EventTable } from "@opencode-ai/core/event/sql"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -16,7 +15,6 @@ import type { TestClock } from "effect/testing/TestClock"
 import { ChildProcessSpawner } from "effect/unstable/process"
 import type * as Scope from "effect/Scope"
 import fs from "node:fs/promises"
-import { readFileSync, readdirSync } from "node:fs"
 import os from "os"
 import path from "path"
 import { Config } from "@/config/config"
@@ -47,6 +45,7 @@ import { SessionTools } from "@/session/tools"
 import { ToolRegistry } from "@/tool/registry"
 import { ShellID } from "@/tool/shell/id"
 import { TestLLMServer } from "../lib/llm-server"
+import { ownsStartIdentity, processGroupMembers, startIdentity } from "../../../core/test/fixture/process-group"
 
 const shellLayer = Layer.mergeAll(
   LayerNode.compile(
@@ -275,47 +274,10 @@ type ShellProcessGroup = {
   observed: boolean
 }
 
-const ownsProcessIdentity = (recorded: string | undefined, current: string | undefined) =>
-  recorded !== undefined && current !== undefined && recorded === current
-
 const shellProcessGroups = new Map<number, ShellProcessGroup>()
 
-const startIdentity = (pid: number) => {
-  const identity = EventWriter.readIdentity(pid)
-  if (identity?.bootID && identity.startTicks) return `${identity.bootID}:${identity.startTicks}`
-  const result = Bun.spawnSync(["ps", "-p", String(pid), "-o", "lstart="])
-  const started = result.stdout.toString().trim()
-  return result.exitCode === 0 && started ? started : undefined
-}
-
-const processGroupMembers = (pgid: number) => {
-  if (process.platform === "linux") {
-    return readdirSync("/proc").flatMap((entry) => {
-      if (!/^\d+$/.test(entry)) return []
-      const pid = Number(entry)
-      let stat: string
-      try {
-        stat = readFileSync(`/proc/${pid}/stat`, "utf8")
-      } catch {
-        return []
-      }
-      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ")
-      return Number(fields[2]) === pgid ? [pid] : []
-    })
-  }
-  const result = Bun.spawnSync(["ps", "-e", "-o", "pid=,pgid="])
-  if (result.exitCode !== 0) throw new Error(`could not inspect process group ${pgid}`)
-  return result.stdout
-    .toString()
-    .split("\n")
-    .flatMap((line) => {
-      const [pid, group] = line.trim().split(/\s+/).map(Number)
-      return pid && group === pgid ? [pid] : []
-    })
-}
-
 const observeProcessGroup = (group: ShellProcessGroup, members = processGroupMembers(group.pgid)) => {
-  if (!members.some((pid) => ownsProcessIdentity(group.members.get(pid), startIdentity(pid)))) return
+  if (!members.some((pid) => ownsStartIdentity(group.members.get(pid), startIdentity(pid)))) return
   for (const pid of members) {
     if (group.members.has(pid)) continue
     const identity = startIdentity(pid)
@@ -348,7 +310,7 @@ const recordProcessGroup = (pid: number) => {
 }
 
 const ownedProcessGroupMembers = (group: ShellProcessGroup, members = processGroupMembers(group.pgid)) =>
-  members.filter((pid) => ownsProcessIdentity(group.members.get(pid), startIdentity(pid)))
+  members.filter((pid) => ownsStartIdentity(group.members.get(pid), startIdentity(pid)))
 
 const waitForProcessGroupExit = async (group: ShellProcessGroup, timeout = 250) => {
   const deadline = Date.now() + timeout
@@ -397,11 +359,11 @@ afterEach(async () => {
 it.live(
   "does not own a process without a matching recorded start identity",
   Effect.sync(() => {
-    expect(ownsProcessIdentity(undefined, undefined)).toBe(false)
-    expect(ownsProcessIdentity(undefined, "current-start")).toBe(false)
-    expect(ownsProcessIdentity("recorded-start", undefined)).toBe(false)
-    expect(ownsProcessIdentity("recorded-start", "different-start")).toBe(false)
-    expect(ownsProcessIdentity("recorded-start", "recorded-start")).toBe(true)
+    expect(ownsStartIdentity(undefined, undefined)).toBe(false)
+    expect(ownsStartIdentity(undefined, "current-start")).toBe(false)
+    expect(ownsStartIdentity("recorded-start", undefined)).toBe(false)
+    expect(ownsStartIdentity("recorded-start", "different-start")).toBe(false)
+    expect(ownsStartIdentity("recorded-start", "recorded-start")).toBe(true)
   }),
 )
 
@@ -1609,8 +1571,14 @@ describe("tool.shell teardown", () => {
           const spawned = yield* Effect.raceAll([
             Deferred.await(shell.spawned).pipe(Effect.as("spawned" as const)),
             Fiber.await(execution).pipe(Effect.as("finished" as const)),
-          ])
-          expect(spawned).toBe("spawned")
+          ]).pipe(Effect.timeoutOption("10 seconds"))
+          if (spawned._tag === "None") {
+            controller.abort()
+            yield* Fiber.interrupt(execution).pipe(Effect.timeoutOption("5 seconds"))
+            yield* Effect.promise(() => CrossSpawnSpawner.shutdownOwnedProcessGroups())
+            throw new Error("Shell command did not spawn within 10 seconds")
+          }
+          expect(spawned.value).toBe("spawned")
           const ready = yield* Deferred.await(shell.consumed).pipe(Effect.timeoutOption("5 seconds"))
           if (ready._tag === "None") {
             controller.abort()
@@ -1653,8 +1621,14 @@ describe("tool.shell teardown", () => {
           const spawned = yield* Effect.raceAll([
             Deferred.await(shell.spawned).pipe(Effect.as("spawned" as const)),
             Fiber.await(execution).pipe(Effect.as("finished" as const)),
-          ])
-          expect(spawned).toBe("spawned")
+          ]).pipe(Effect.timeoutOption("10 seconds"))
+          if (spawned._tag === "None") {
+            interrupting = true
+            yield* Fiber.interrupt(execution).pipe(Effect.timeoutOption("5 seconds"))
+            yield* Effect.promise(() => CrossSpawnSpawner.shutdownOwnedProcessGroups())
+            throw new Error("Shell command did not spawn within 10 seconds")
+          }
+          expect(spawned.value).toBe("spawned")
           const ready = yield* Deferred.await(shell.consumed).pipe(Effect.timeoutOption("5 seconds"))
           if (ready._tag === "None") {
             interrupting = true

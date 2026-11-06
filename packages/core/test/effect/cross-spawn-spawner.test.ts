@@ -1,6 +1,5 @@
 import { afterEach, describe, expect } from "bun:test"
 import fs from "node:fs/promises"
-import { readFileSync, readdirSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { Cause, Deferred, Duration, Effect, Exit, Fiber, Option, Stream } from "effect"
@@ -8,9 +7,11 @@ import type * as PlatformError from "effect/PlatformError"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import type { ChildProcessHandle } from "effect/unstable/process/ChildProcessSpawner"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { ProcessGroup } from "@opencode-ai/core/process-group"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventWriter } from "@opencode-ai/core/event/writer"
 import { testEffect } from "../lib/effect"
+import { groupAlive, processChildren, processGroupMembers, processIdentity, sameProcess } from "../fixture/process-group"
 
 const live = LayerNode.compile(CrossSpawnSpawner.node)
 const fx = testEffect(live)
@@ -62,15 +63,6 @@ async function gone(pid: number, timeout = 5_000) {
   return !alive(pid)
 }
 
-function groupAlive(pgid: number) {
-  try {
-    process.kill(-pgid, 0)
-    return true
-  } catch (error) {
-    return !(error instanceof Error && "code" in error && error.code === "ESRCH")
-  }
-}
-
 async function groupGone(pgid: number, timeout = 5_000) {
   const end = Date.now() + timeout
   while (Date.now() < end) {
@@ -78,15 +70,6 @@ async function groupGone(pgid: number, timeout = 5_000) {
     await new Promise((resolve) => setTimeout(resolve, 20))
   }
   return !groupAlive(pgid)
-}
-
-function processIdentity(pid: number) {
-  const identity = EventWriter.readIdentity(pid)
-  if (identity?.bootID && identity.startTicks) return identity
-  const started = Bun.spawnSync(["ps", "-p", String(pid), "-o", "lstart="])
-    .stdout.toString()
-    .trim()
-  return started ? { pid, bootID: "ps", startTicks: started } : undefined
 }
 
 const writeAtomically = (filename: string, contents: string) =>
@@ -108,14 +91,8 @@ const ownerProbe = (value: unknown): { pgid: number; child: number } | undefined
 
 const processIdentityRecord = (value: unknown): value is EventWriter.ProcessIdentity => {
   if (typeof value !== "object" || value === null) return false
-  const result = value as Record<string, unknown>
-  return (
-    positivePID(result.pid) &&
-    typeof result.bootID === "string" &&
-    result.bootID.length > 0 &&
-    typeof result.startTicks === "string" &&
-    result.startTicks.length > 0
-  )
+  const identity = processIdentity(value)
+  return Boolean(identity?.bootID && identity.startTicks)
 }
 
 const identityProbe = (value: unknown): { pgid: number; members: EventWriter.ProcessIdentity[] } | undefined => {
@@ -169,11 +146,6 @@ const readReadySignal = async (filename: string, timeout = 5_000) => {
   throw new Error("fixture ready signal was not atomically published")
 }
 
-function sameProcess(identity: EventWriter.ProcessIdentity) {
-  const current = processIdentity(identity.pid)
-  return current?.bootID === identity.bootID && current?.startTicks === identity.startTicks
-}
-
 async function processExited(identity: EventWriter.ProcessIdentity, timeout = 5_000) {
   const end = Date.now() + timeout
   while (Date.now() < end) {
@@ -210,58 +182,6 @@ const recordProcess = (pgid: number, identity: EventWriter.ProcessIdentity) => {
   const group = ownedProcessGroups.get(pgid) ?? { pgid, members: new Map<number, EventWriter.ProcessIdentity>() }
   ownedProcessGroups.set(pgid, group)
   group.members.set(identity.pid, identity)
-}
-
-const processGroupMembers = (pgid: number) => {
-  if (process.platform === "linux") {
-    return readdirSync("/proc").flatMap((entry) => {
-      if (!/^\d+$/.test(entry)) return []
-      const pid = Number(entry)
-      let stat: string
-      try {
-        stat = readFileSync(`/proc/${pid}/stat`, "utf8")
-      } catch {
-        return []
-      }
-      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ")
-      return Number(fields[2]) === pgid ? [pid] : []
-    })
-  }
-  const result = Bun.spawnSync(["ps", "-e", "-o", "pid=,pgid="])
-  if (result.exitCode !== 0) throw new Error(`could not inspect process group ${pgid}`)
-  return result.stdout
-    .toString()
-    .split("\n")
-    .flatMap((line) => {
-      const [pid, group] = line.trim().split(/\s+/).map(Number)
-      return pid && group === pgid ? [pid] : []
-    })
-}
-
-const processChildren = (parentPID: number) => {
-  if (process.platform === "linux") {
-    return readdirSync("/proc").flatMap((entry) => {
-      if (!/^\d+$/.test(entry)) return []
-      const pid = Number(entry)
-      let stat: string
-      try {
-        stat = readFileSync(`/proc/${pid}/stat`, "utf8")
-      } catch {
-        return []
-      }
-      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ")
-      return Number(fields[1]) === parentPID ? [pid] : []
-    })
-  }
-  const result = Bun.spawnSync(["ps", "-e", "-o", "pid=,ppid="])
-  if (result.exitCode !== 0) throw new Error(`could not inspect children of process ${parentPID}`)
-  return result.stdout
-    .toString()
-    .split("\n")
-    .flatMap((line) => {
-      const [pid, parent] = line.trim().split(/\s+/).map(Number)
-      return pid && parent === parentPID ? [pid] : []
-    })
 }
 
 const recoverDetachedChild = (parent: EventWriter.ProcessIdentity, group: RecordedProcessGroup) =>
@@ -779,6 +699,35 @@ describe("cross-spawn spawner", () => {
   })
 
   describe("process control", () => {
+    fx.live(
+      "signals a live process group when its identity reader is unavailable",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+
+        const recorded: RecordedProcessGroup = { pgid: undefined, members: [] }
+        yield* Effect.addFinalizer(() => cleanupRecordedProcessGroup(recorded))
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+        const handle = yield* spawner.spawn(
+          js('process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)', {
+            detached: true,
+            stdin: "ignore",
+            stdout: "ignore",
+            stderr: "ignore",
+            forceKillAfter: "3 seconds",
+          }),
+        )
+        const pgid = Number(handle.pid)
+        recorded.pgid = pgid
+        const identity = processIdentity(pgid)
+        if (!identity) throw new Error("identity fallback fixture has no process identity")
+        recorded.members.push(identity)
+        recordProcess(pgid, identity)
+
+        expect(ProcessGroup.signalGroup(pgid, [identity], "SIGKILL", () => undefined)).toBe(true)
+        expect(yield* Effect.promise(() => groupGone(pgid))).toBe(true)
+      }),
+    )
+
     fx.effect(
       "kills a running process",
       Effect.gen(function* () {

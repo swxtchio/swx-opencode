@@ -1,28 +1,10 @@
 import { expect } from "bun:test"
 import { EventWriter } from "@opencode-ai/core/event/writer"
 import { Effect, Option } from "effect"
-import { readFileSync } from "node:fs"
 import path from "node:path"
 import { cliIt, deadline } from "../../lib/cli-process"
 import { withTimeout } from "../../../src/util/timeout"
-
-function sameProcess(identity: EventWriter.ProcessIdentity) {
-  if (!identity.bootID || !identity.startTicks) return false
-  const current = EventWriter.readIdentity(identity.pid)
-  return current?.bootID === identity.bootID && current.startTicks === identity.startTicks
-}
-
-function processGroupMember(pgid: number, identity: EventWriter.ProcessIdentity | undefined) {
-  if (!identity || !sameProcess(identity)) return false
-  try {
-    const stat = readFileSync(`/proc/${identity.pid}/stat`, "utf8")
-    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ")
-    const current = EventWriter.readIdentity(identity.pid)
-    return current?.bootID === identity.bootID && current.startTicks === identity.startTicks && Number(fields[2]) === pgid
-  } catch {
-    return false
-  }
-}
+import { processGroupMember, processIdentity, sameProcess } from "../../../../core/test/fixture/process-group"
 
 cliIt.live(
   "runMini completes a held attached request beyond Bun's idle timeout",
@@ -379,25 +361,8 @@ cliIt.live(
         while (Date.now() < deadline) {
           try {
             const value: unknown = await Bun.file(identityFile).json()
-            if (
-              typeof value === "object" &&
-              value !== null &&
-              "pid" in value &&
-              typeof value.pid === "number" &&
-              "bootID" in value &&
-              typeof value.bootID === "string" &&
-              "startTicks" in value &&
-              typeof value.startTicks === "string"
-            ) {
-              const current = EventWriter.readIdentity(value.pid)
-              if (
-                current?.bootID &&
-                current.startTicks &&
-                current.bootID === value.bootID &&
-                current.startTicks === value.startTicks
-              )
-                return current
-            }
+            const identity = processIdentity(value)
+            if (identity?.bootID && identity.startTicks && sameProcess(identity)) return identity
           } catch {}
           await Bun.sleep(20)
         }

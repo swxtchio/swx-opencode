@@ -4,46 +4,8 @@ import type { rpc } from "../../../src/cli/tui/worker"
 import { Rpc } from "../../../src/util/rpc"
 import { withTimeout } from "../../../src/util/timeout"
 import path from "node:path"
-
-type ProcessGroupFixture = {
-  readonly leader: EventWriter.ProcessIdentity
-  readonly descendant: EventWriter.ProcessIdentity
-  readonly pgid: number
-}
-
-function processIdentity(value: unknown): EventWriter.ProcessIdentity | undefined {
-  if (typeof value !== "object" || value === null || !("pid" in value) || typeof value.pid !== "number") return
-  if (!("bootID" in value) || !("startTicks" in value)) return
-  if (value.bootID !== null && typeof value.bootID !== "string") return
-  if (value.startTicks !== null && typeof value.startTicks !== "string") return
-  return { pid: value.pid, bootID: value.bootID, startTicks: value.startTicks }
-}
-
-function processGroupFixture(value: unknown): ProcessGroupFixture | undefined {
-  if (typeof value !== "object" || value === null || !("pgid" in value) || typeof value.pgid !== "number") return
-  const leader = "leader" in value ? processIdentity(value.leader) : undefined
-  const descendant = "descendant" in value ? processIdentity(value.descendant) : undefined
-  if (!leader || !descendant) return
-  return { leader, descendant, pgid: value.pgid }
-}
-
-function sameProcess(identity: EventWriter.ProcessIdentity) {
-  const current = EventWriter.readIdentity(identity.pid)
-  return current?.bootID === identity.bootID && current.startTicks === identity.startTicks
-}
-
-function sameIdentity(left: EventWriter.ProcessIdentity, right: EventWriter.ProcessIdentity) {
-  return left.pid === right.pid && left.bootID === right.bootID && left.startTicks === right.startTicks
-}
-
-function groupAlive(pgid: number) {
-  try {
-    process.kill(-pgid, 0)
-    return true
-  } catch (error) {
-    return !(error instanceof Error && "code" in error && error.code === "ESRCH")
-  }
-}
+import { groupAlive, processGroupFixture, sameIdentity, sameProcess } from "../../../../core/test/fixture/process-group"
+import type { ProcessGroupFixture } from "../../../../core/test/fixture/process-group"
 
 const action = process.env.SWX_TUI_OWNER_ACTION
 const recordFile = process.env.SWX_TUI_GROUP_RECORD_FILE

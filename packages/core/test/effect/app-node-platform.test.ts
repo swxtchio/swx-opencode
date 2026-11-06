@@ -1,6 +1,5 @@
 import { expect } from "bun:test"
 import { RequestExecutor } from "@opencode-ai/llm/route"
-import { EventWriter } from "@opencode-ai/core/event/writer"
 import { Effect, Fiber, Exit, Option } from "effect"
 import { FetchHttpClient, HttpClientRequest } from "effect/unstable/http"
 import { createServer } from "node:http"
@@ -8,6 +7,7 @@ import path from "node:path"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { LayerNodePlatform } from "@opencode-ai/core/effect/app-node-platform"
 import { testEffect } from "../lib/effect"
+import { processIdentity, sameProcess } from "../fixture/process-group"
 
 const it = testEffect(LayerNode.compile(LayerNodePlatform.requestExecutor))
 const nativeIdleTestName = "native provider requests survive a short Bun idle timeout while its control expires"
@@ -32,7 +32,7 @@ it.live(
           detached: true,
         },
       )
-      const identity = EventWriter.readIdentity(child.pid)
+      const identity = processIdentity(child.pid)
       const output = Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()])
       try {
         if (!identity?.bootID || !identity.startTicks)
@@ -42,13 +42,10 @@ it.live(
         expect(exitCode).toBe(0)
         if (exitCode !== 0) throw new Error(`${stdout}\n${stderr}`)
       } finally {
-        if (identity?.bootID && identity.startTicks) {
-          const current = EventWriter.readIdentity(identity.pid)
-          if (current?.bootID === identity.bootID && current.startTicks === identity.startTicks) {
-            try {
-              process.kill(-identity.pid, "SIGKILL")
-            } catch {}
-          }
+        if (identity && sameProcess(identity)) {
+          try {
+            process.kill(-identity.pid, "SIGKILL")
+          } catch {}
         }
         const stopped = yield* Effect.promise(() => child.exited).pipe(Effect.timeoutOption("5 seconds"))
         const drained = yield* Effect.promise(() => output).pipe(Effect.timeoutOption("5 seconds"))

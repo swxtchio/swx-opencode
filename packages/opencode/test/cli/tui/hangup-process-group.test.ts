@@ -1,59 +1,16 @@
 import { expect, test } from "bun:test"
 import { EventWriter } from "@opencode-ai/core/event/writer"
-import { readFileSync } from "node:fs"
 import { tmpdir } from "../../fixture/fixture"
 import { withTimeout } from "../../../src/util/timeout"
 import path from "node:path"
-
-type ProcessIdentity = EventWriter.ProcessIdentity
-type ProcessGroupFixture = {
-  readonly leader: ProcessIdentity
-  readonly descendant: ProcessIdentity
-  readonly pgid: number
-}
-
-function processIdentity(value: unknown): ProcessIdentity | undefined {
-  if (typeof value !== "object" || value === null || !("pid" in value) || typeof value.pid !== "number") return
-  if (!("bootID" in value) || !("startTicks" in value)) return
-  if (value.bootID !== null && typeof value.bootID !== "string") return
-  if (value.startTicks !== null && typeof value.startTicks !== "string") return
-  return { pid: value.pid, bootID: value.bootID, startTicks: value.startTicks }
-}
-
-function processGroupFixture(value: unknown): ProcessGroupFixture | undefined {
-  if (typeof value !== "object" || value === null || !("pgid" in value) || typeof value.pgid !== "number") return
-  const leader = "leader" in value ? processIdentity(value.leader) : undefined
-  const descendant = "descendant" in value ? processIdentity(value.descendant) : undefined
-  if (!leader || !descendant) return
-  return { leader, descendant, pgid: value.pgid }
-}
-
-function sameProcess(identity: ProcessIdentity) {
-  if (!identity.bootID || !identity.startTicks) return false
-  const current = EventWriter.readIdentity(identity.pid)
-  return current?.bootID === identity.bootID && current.startTicks === identity.startTicks
-}
-
-function processGroupMember(pgid: number, identity: ProcessIdentity | undefined) {
-  if (!identity || !sameProcess(identity)) return false
-  try {
-    const stat = readFileSync(`/proc/${identity.pid}/stat`, "utf8")
-    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ")
-    const current = EventWriter.readIdentity(identity.pid)
-    return current?.bootID === identity.bootID && current.startTicks === identity.startTicks && Number(fields[2]) === pgid
-  } catch {
-    return false
-  }
-}
-
-function groupAlive(pgid: number) {
-  try {
-    process.kill(-pgid, 0)
-    return true
-  } catch (error) {
-    return !(error instanceof Error && "code" in error && error.code === "ESRCH")
-  }
-}
+import {
+  groupAlive,
+  processGroupFixture,
+  processGroupMember,
+  processIdentity,
+  sameProcess,
+} from "../../../../core/test/fixture/process-group"
+import type { ProcessGroupFixture, ProcessIdentity } from "../../../../core/test/fixture/process-group"
 
 async function waitForFile<T>(file: string, parse: (value: string) => T | undefined): Promise<T> {
   const deadline = Date.now() + 30_000

@@ -26,11 +26,17 @@ import * as NodeChildProcess from "node:child_process"
 import { PassThrough } from "node:stream"
 import launch from "cross-spawn"
 import { EventWriter } from "./event/writer"
+import { isAlive, readGroupMembers, signalGroup } from "./process-group"
 import { makeGlobalNode } from "./effect/app-node"
 import { filesystem, path } from "./effect/app-node-platform"
 
 // An abrupt owner exit skips scoped finalizers, so keep detached groups until cleanup completes or their leader releases them.
-type OwnedProcessGroup = { pid: number; identity: EventWriter.ProcessIdentity; cleanupOwed: boolean }
+type OwnedProcessGroup = {
+  pid: number
+  identity: EventWriter.ProcessIdentity
+  cleanupOwed: boolean
+  members: EventWriter.ProcessIdentity[]
+}
 type GroupOwner = { value: OwnedProcessGroup | undefined }
 type CleanupRequest = { value: { killSignal: NodeJS.Signals; forceKillAfter: Duration.Input } | undefined }
 export type ProcessGroupEvent = {
@@ -45,11 +51,7 @@ const groups = new Set<OwnedProcessGroup>()
 let exitHooked = false
 let processGroupObserver: ProcessGroupObserver | undefined
 const killGroups = () =>
-  groups.forEach((group) => {
-    try {
-      globalThis.process.kill(-group.pid, "SIGKILL")
-    } catch {}
-  })
+  groups.forEach((group) => signalGroup(group.pid, [group.identity, ...group.members], "SIGKILL"))
 
 export function setProcessGroupObserver(observer: ProcessGroupObserver | undefined) {
   processGroupObserver = observer
@@ -79,29 +81,27 @@ function releaseGroup(group: OwnedProcessGroup) {
   notifyProcessGroup(processGroupEvent(group, "release"))
 }
 
+async function rememberGroupMembers(group: OwnedProcessGroup) {
+  const discovered = await readGroupMembers(group.pid, group.identity)
+  const members = new Map(group.members.map((member) => [member.pid, member] as const))
+  discovered.forEach((member) => members.set(member.pid, member))
+  group.members = [...members.values()]
+}
+
 export async function shutdownOwnedProcessGroups() {
   if (globalThis.process.platform === "win32") return
   const owned = [...groups]
   if (!owned.length) return
-  owned.forEach((group) => {
+  const announcements = owned.map((group) => {
     group.cleanupOwed = true
-    notifyProcessGroup(processGroupEvent(group, "acquire"))
+    return notifyProcessGroup(processGroupEvent(group, "acquire"))
   })
-  owned.forEach((group) => {
-    try {
-      globalThis.process.kill(-group.pid, "SIGKILL")
-    } catch {}
-  })
+  await Promise.all(announcements.map((notification) => notification?.catch(() => {})))
+  await Promise.all(owned.map((group) => rememberGroupMembers(group).catch(() => {})))
+  owned.forEach((group) => signalGroup(group.pid, [group.identity, ...group.members], "SIGKILL"))
   const deadline = Date.now() + 5_000
   while (true) {
-    const survivors = owned.filter((group) => {
-      try {
-        globalThis.process.kill(-group.pid, 0)
-        return true
-      } catch (error) {
-        return !(error instanceof globalThis.Error && "code" in error && error.code === "ESRCH")
-      }
-    })
+    const survivors = owned.filter((group) => isAlive(group.pid))
     if (!survivors.length) break
     if (Date.now() >= deadline)
       throw new Error(`Worker process groups survived shutdown: ${survivors.map((group) => group.pid).join(", ")}`)
@@ -377,6 +377,7 @@ export const make = Effect.gen(function* () {
           if (group.cleanupOwed) {
             const notification = notifyProcessGroup(processGroupEvent(group, "acquire"))
             if (notification) void notification.catch(() => {})
+            void rememberGroupMembers(group).catch(() => {})
           } else releaseGroup(group)
         }
         exit = args
@@ -392,6 +393,7 @@ export const make = Effect.gen(function* () {
             pid: proc.pid,
             identity: EventWriter.readIdentity(proc.pid) ?? { pid: proc.pid, bootID: null, startTicks: null },
             cleanupOwed: false,
+            members: [],
           }
           groupOwner.value = group
           groups.add(group)
@@ -403,7 +405,7 @@ export const make = Effect.gen(function* () {
           if (notification) {
             void notification.then(
               () => resume(Effect.succeed([proc, signal])),
-              (error) => {
+              async (error) => {
                 if (!groups.has(group)) {
                   resume(Effect.fail(toPlatformError("spawn", toError(error), command)))
                   return
@@ -411,9 +413,8 @@ export const make = Effect.gen(function* () {
                 group.cleanupOwed = true
                 groups.add(group)
                 notifyProcessGroup(processGroupEvent(group, "acquire"))
-                try {
-                  globalThis.process.kill(-group.pid, "SIGKILL")
-                } catch {}
+                await rememberGroupMembers(group).catch(() => {})
+                signalGroup(group.pid, [group.identity, ...group.members], "SIGKILL")
                 void Effect.runPromise(waitForGroup(group.pid, Duration.seconds(5))).then(
                   (gone) => {
                     if (gone) releaseGroup(group)
@@ -422,7 +423,7 @@ export const make = Effect.gen(function* () {
                   () => resume(Effect.fail(toPlatformError("spawn", toError(error), command))),
                 )
               },
-            )
+            ).catch((error) => resume(Effect.fail(toPlatformError("spawn", toError(error), command))))
             return
           }
         }
