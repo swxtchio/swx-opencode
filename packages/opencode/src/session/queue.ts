@@ -81,6 +81,10 @@ export type PromotedInput = SessionPromptQueue.QueuedInput & {
   readonly messageID: MessageID
   readonly group?: SessionPromptQueue.Group
 }
+export type ConsumeSnapshot = {
+  readonly wakes: number
+  readonly itemIDs: readonly ItemID[]
+}
 
 /** A prompt's own item was withdrawn, by an editor, before it could be delivered. */
 export class WithdrawnError extends Schema.TaggedErrorClass<WithdrawnError>()("SessionQueueWithdrawnError", {
@@ -285,21 +289,20 @@ export interface Interface {
     readonly markers?: ConfigV1.Info["machine_message_markers"]
   }) => Effect.Effect<boolean, E>
   /**
-   * Called by a drain before it reads history; returns the wake count that read
-   * reflects, for `park`. A promoted row outlives its promotion until then so
-   * that a joiner of a finishing run can see the prompt still needs a drain.
+   * Called by a drain before it reads history; snapshots its pending items and
+   * completed wakes for `park`. A promoted row outlives its promotion until then
+   * so that a joiner of a finishing run can see the prompt still needs a drain.
    * Another connection's write lock can outlast one attempt: an attempt whose
    * transaction never began, on the lock or past its acquisition backstop, is
    * made again, and the last such attempt dies with ConsumeLockedError.
    */
-  readonly consume: (sessionID: SessionID) => Effect.Effect<number>
+  readonly consume: (sessionID: SessionID) => Effect.Effect<ConsumeSnapshot>
   /**
-   * A run that stopped on an abort or error must not restart until something
-   * wakes the session. Given the wake count its last history read reflected, it
-   * parks only if nothing has woken the session since, so an admission its
-   * decision never saw is not parked by it.
+   * A run that stopped on an abort or error parks only the pending items its
+   * consume saw. Preparing admissions made after that boundary wake when they
+   * finish, without preventing earlier items from being parked.
    */
-  readonly park: (sessionID: SessionID, seen?: number) => Effect.Effect<void>
+  readonly park: (sessionID: SessionID, seen?: ConsumeSnapshot) => Effect.Effect<void>
   /** Whether a stopped run parked the session and nothing has woken it since. */
   readonly isParked: (sessionID: SessionID) => Effect.Effect<boolean>
   /** The joiner re-check's signal: admitted work no drain has read yet, on a session that is not parked. */
@@ -405,20 +408,30 @@ const layer = Layer.effect(
     const order = new Map<SessionID, Semaphore.Semaphore>()
     const preparations = new Map<string, symbol>()
     const parked = new Set<SessionID>()
+    // A turn's consume snapshots completed wakes and the exact pending item IDs.
     const wakes = new Map<SessionID, number>()
+    const parkEpochs = new Map<SessionID, number>()
     const running = new Set<SessionID>()
     // Items this process admitted as `preparing` whose sender has not finished
     // with them, each with the signal that it has. A preparing row missing here
     // was left by a stopped process.
     const preparing = new Map<ItemID, Deferred.Deferred<void>>()
+    // The park epoch that covers each preparing item; later items are advanced
+    // across a conditional park so their completion still wakes the session.
+    const preparingParkEpochs = new Map<ItemID, number>()
     // Ends an item's preparation here, so it bounds no admission from now on;
     // its waiters are told once the change it makes is committed.
     const endPreparing = (itemID: ItemID) => {
       const done = preparing.get(itemID)
       preparing.delete(itemID)
-      return Effect.sync(() => {
-        if (done) Deferred.doneUnsafe(done, Effect.void)
-      })
+      const parkEpoch = preparingParkEpochs.get(itemID)
+      preparingParkEpochs.delete(itemID)
+      return {
+        parkEpoch,
+        notify: Effect.sync(() => {
+          if (done) Deferred.doneUnsafe(done, Effect.void)
+        }),
+      }
     }
     // Waiting callers' answer channels, by item: the message the item became,
     // then the final reply of the turn that message joined.
@@ -471,7 +484,7 @@ const layer = Layer.effect(
 
     const exclusive: Interface["exclusive"] = (sessionID, effect) => semaphore(locks, sessionID).withPermit(effect)
 
-    // Admission, restore and send-now wake the session; called under its lock.
+    // Ready admission, restore and send-now wake the session; called under its lock.
     const wake = (sessionID: SessionID) => {
       parked.delete(sessionID)
       wakes.set(sessionID, (wakes.get(sessionID) ?? 0) + 1)
@@ -992,7 +1005,10 @@ const layer = Layer.effect(
         if (result.replacement.into) retire([item.id], result.replacement.into)
         finish(result.replacement.finished)
       }
-      if (result.row.time_preparing !== null && !preparing.has(item.id)) preparing.set(item.id, Deferred.makeUnsafe())
+      if (result.row.time_preparing !== null && !preparing.has(item.id)) {
+        preparing.set(item.id, Deferred.makeUnsafe())
+        preparingParkEpochs.set(item.id, parkEpochs.get(input.sessionID) ?? 0)
+      }
       if (!result.row.time_promoted && result.row.time_preparing === null) wake(input.sessionID)
       yield* publish(input.sessionID)
       return item
@@ -1534,14 +1550,17 @@ const layer = Layer.effect(
               return [...own, ...(yield* readmit(tx, input.sessionID, row.id, input.markers))]
             }),
           ).pipe(Effect.orDie)
-          yield* ended
-          if (!admitted) return
+          yield* ended.notify
+          if (!admitted?.length) return
+          if (ended.parkEpoch === undefined)
+            return yield* Effect.die(new Error(`Prepared queue item ${input.itemID} has no admission park epoch`))
           admitted.forEach((admission) => {
             retire(admission.retired, admission.id)
             if (admission.into) retire([admission.id], admission.into)
             finish(admission.finished)
           })
-          wake(input.sessionID)
+          if (!parked.has(input.sessionID) || ended.parkEpoch === (parkEpochs.get(input.sessionID) ?? 0))
+            wake(input.sessionID)
           yield* publish(input.sessionID)
         }),
       )
@@ -1560,7 +1579,7 @@ const layer = Layer.effect(
           const readmitted = yield* writable(sessionID, (tx) => readmit(tx, sessionID, itemID, markers)).pipe(
             Effect.orDie,
           )
-          yield* ended
+          yield* ended.notify
           readmitted.forEach((admission) => {
             retire(admission.retired, admission.id)
             if (admission.into) retire([admission.id], admission.into)
@@ -3034,16 +3053,23 @@ const layer = Layer.effect(
             Effect.suspend(() => {
               if (state.abandoned) return Effect.interrupt
               state.began = true
-              return tx
-                .delete(SessionPromptQueueTable)
-                .where(
-                  and(
-                    eq(SessionPromptQueueTable.session_id, sessionID),
-                    isNotNull(SessionPromptQueueTable.time_promoted),
-                  ),
-                )
-                .run()
-                .pipe(Effect.map(() => wakes.get(sessionID) ?? 0))
+              return Effect.gen(function* () {
+                yield* tx
+                  .delete(SessionPromptQueueTable)
+                  .where(
+                    and(
+                      eq(SessionPromptQueueTable.session_id, sessionID),
+                      isNotNull(SessionPromptQueueTable.time_promoted),
+                    ),
+                  )
+                  .run()
+                const items = yield* tx
+                  .select({ id: SessionPromptQueueTable.id })
+                  .from(SessionPromptQueueTable)
+                  .where(pending(sessionID))
+                  .all()
+                return { wakes: wakes.get(sessionID) ?? 0, itemIDs: items.map((item) => item.id) }
+              })
             }),
           ),
         ),
@@ -3059,11 +3085,32 @@ const layer = Layer.effect(
       return yield* Effect.failCause(exit.cause).pipe(Effect.orDie)
     })
 
-    const park = (sessionID: SessionID, seen?: number) =>
+    // Normal stops park the pending items present at consume. A later preparation
+    // is exempted from that epoch so its completion can wake the parked session.
+    const park = (sessionID: SessionID, seen?: ConsumeSnapshot) =>
       exclusive(
         sessionID,
-        Effect.sync(() => {
-          if (seen === undefined || (wakes.get(sessionID) ?? 0) === seen) parked.add(sessionID)
+        Effect.gen(function* () {
+          // A completed wake already resumes the session; a preparation alone does not increment this count.
+          if (seen && (wakes.get(sessionID) ?? 0) !== seen.wakes) return
+          const items =
+            seen === undefined
+              ? undefined
+              : yield* db
+                  .select({ id: SessionPromptQueueTable.id, time_preparing: SessionPromptQueueTable.time_preparing })
+                  .from(SessionPromptQueueTable)
+                  .where(pending(sessionID))
+                  .all()
+                  .pipe(Effect.orDie)
+          const seenItems = new Set(seen?.itemIDs)
+          if (items && !items.some((item) => seenItems.has(item.id))) return
+          const epoch = (parkEpochs.get(sessionID) ?? 0) + 1
+          parked.add(sessionID)
+          parkEpochs.set(sessionID, epoch)
+          items?.forEach((item) => {
+            if (item.time_preparing !== null && !seenItems.has(item.id) && preparing.has(item.id))
+              preparingParkEpochs.set(item.id, epoch)
+          })
         }),
       )
 

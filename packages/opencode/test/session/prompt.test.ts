@@ -596,6 +596,18 @@ const gates = {
   commandBefore: undefined as undefined | Effect.Effect<void, unknown>,
   messagesTransform: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
   queueSelection: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+  queuePrepared: undefined as
+    | undefined
+    | { sessionID: SessionID; entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+  queueAnswers: undefined as undefined | { sessionID: SessionID; replies: SessionV1.WithParts[] },
+  queuePark: undefined as
+    | undefined
+    | {
+        sessionID: SessionID
+        entered: Deferred.Deferred<void>
+        release: Deferred.Deferred<void>
+        completed: Deferred.Deferred<void>
+      },
   finishingRead: undefined as undefined | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
   nextEnsureRunning: undefined as
     | undefined
@@ -607,6 +619,8 @@ const gates = {
   presetErrorUpdateFailure: undefined as
     | undefined
     | { name: "ContentFilterError" | "StructuredOutputError"; triggered: boolean },
+  compactionTerminalWrite: undefined as undefined | { sessionID: SessionID; triggered: boolean },
+  setModelFailure: undefined as undefined | { sessionID: SessionID; triggered: boolean },
   outcomeFailure: undefined as undefined | { triggered: boolean },
   noReplyAdmission: undefined as
     | undefined
@@ -645,6 +659,17 @@ const gatedSession = LayerNode.make({
               gates.presetErrorUpdateFailure = undefined
               return yield* Effect.die(new Error(`injected ${presetErrorFailure.name} persistence failure`))
             }
+            const compactionTerminalWrite = gates.compactionTerminalWrite
+            if (
+              compactionTerminalWrite?.sessionID === msg.sessionID &&
+              msg.role === "assistant" &&
+              msg.summary === true &&
+              msg.error?.name === "MessageAbortedError"
+            ) {
+              compactionTerminalWrite.triggered = true
+              // Leave the persisted placeholder behind while allowing the interrupted run to answer its caller.
+              return msg
+            }
             const gate = msg.role === "user" && msg.noReply === true ? gates.noReplyWrite : undefined
             if (gate) {
               gates.noReplyWrite = undefined
@@ -652,6 +677,16 @@ const gatedSession = LayerNode.make({
               yield* Deferred.await(gate.release)
             }
             return yield* real.updateMessage(msg)
+          }),
+        setModel: (input) =>
+          Effect.gen(function* () {
+            const failure = gates.setModelFailure
+            if (failure?.sessionID === input.sessionID) {
+              failure.triggered = true
+              gates.setModelFailure = undefined
+              return yield* Effect.die(new Error("injected prompt preparation failure"))
+            }
+            return yield* real.setModel(input)
           }),
         findMessage: (sessionID, predicate) =>
           Effect.gen(function* () {
@@ -807,6 +842,55 @@ const gatedRunState = LayerNode.make({
   deps: [BackgroundJob.node, SessionStatus.node],
 })
 
+const gatedQueue = LayerNode.make({
+  service: SessionQueue.Service,
+  layer: Layer.effect(
+    SessionQueue.Service,
+    Effect.gen(function* () {
+      const real = yield* SessionQueue.Service
+      return SessionQueue.Service.of({
+        ...real,
+        prepared: (input) =>
+          Effect.gen(function* () {
+            const gate = gates.queuePrepared
+            if (gate?.sessionID === input.sessionID) {
+              gates.queuePrepared = undefined
+              yield* Deferred.succeed(gate.entered, undefined)
+              yield* Deferred.await(gate.release)
+            }
+            yield* real.prepared(input)
+          }),
+        answer: (sessionID, turn, reply) =>
+          Effect.gen(function* () {
+            const capture = gates.queueAnswers
+            if (capture?.sessionID === sessionID) capture.replies.push(reply)
+            yield* real.answer(sessionID, turn, reply)
+          }),
+        park: (sessionID, seen) =>
+          Effect.gen(function* () {
+            const gate = gates.queuePark
+            if (gate?.sessionID === sessionID) {
+              gates.queuePark = undefined
+              yield* Deferred.succeed(gate.entered, undefined)
+              yield* Deferred.await(gate.release)
+            }
+            yield* real.park(sessionID, seen)
+            if (gate?.sessionID === sessionID) yield* Deferred.succeed(gate.completed, undefined)
+          }),
+      })
+    }),
+  ).pipe(
+    Layer.provide(
+      SessionQueue.node.implementation as Layer.Layer<
+        SessionQueue.Service,
+        never,
+        Database.Service | EventV2Bridge.Service
+      >,
+    ),
+  ),
+  deps: [Database.node, EventV2Bridge.node],
+})
+
 const gatedPlugin = LayerNode.make({
   service: Plugin.Service,
   layer: Layer.effect(
@@ -872,6 +956,7 @@ const gated = promptTests(
     [RuntimeFlags.node, runtimeFlags],
     [EventV2Bridge.node, gatedEventV2Bridge],
     [Session.node, gatedSession],
+    [SessionQueue.node, gatedQueue],
     [SessionRunState.node, gatedRunState],
     [Plugin.node, gatedPlugin],
   ]),
@@ -6139,7 +6224,7 @@ it.instance(
   30_000,
 )
 
-it.instance(
+gated.instance(
   "cancels a held drain during a subtask tool step through runner cancellation",
   () =>
     Effect.gen(function* () {
@@ -6228,6 +6313,13 @@ it.instance(
       yield* Deferred.succeed(taskGate, void 0)
       yield* awaitWithTimeout(Deferred.await(ready), "held subtask did not start", "10 seconds")
 
+      const answers = { sessionID: session.id, replies: [] as SessionV1.WithParts[] }
+      gates.queueAnswers = answers
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (gates.queueAnswers === answers) gates.queueAnswers = undefined
+        }),
+      )
       cancellation = yield* runState.cancel(session.id).pipe(Effect.forkChild)
       const cancelExit = yield* awaitWithTimeout(
         Fiber.await(cancellation),
@@ -6235,11 +6327,18 @@ it.instance(
         "2 seconds",
       )
       expect(Exit.isSuccess(cancelExit)).toBe(true)
-      expect(
-        Exit.isSuccess(yield* awaitWithTimeout(Fiber.await(run), "held tool-step drain did not finish", "2 seconds")),
-      ).toBe(true)
+      const runExit = yield* awaitWithTimeout(Fiber.await(run), "held tool-step drain did not finish", "2 seconds")
+      expect(Exit.isSuccess(runExit)).toBe(true)
       yield* awaitWithTimeout(Deferred.await(stopped), "held subtask fiber did not stop", "2 seconds")
       expect(yield* llm.calls).toBe(1)
+      const messages = yield* sessions.messages({ sessionID: session.id })
+      const subtaskAssistant = messages.findLast(
+        (message) => message.info.role === "assistant" && message.info.parentID === heldID,
+      )
+      const answer = answers.replies.at(-1)
+      if (!subtaskAssistant) throw new Error("subtask assistant was not found")
+      if (!answer) throw new Error("subtask cancellation did not answer its queued caller")
+      expect(answer.info.id).toBe(subtaskAssistant.info.id)
     }),
   60_000,
 )
@@ -9651,39 +9750,213 @@ it.instance(
 )
 
 gated.instance(
-  "a prompt admitted while a stopping turn is still in flight is not parked by that stop",
+  "a prompt admitted after a stop's consume while still preparing is delivered",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
       const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
       const sessions = yield* Session.Service
       const chat = yield* sessions.create({ title: "Pinned" })
-      const gate = yield* Deferred.make<void>()
-      yield* llm.push(reply().wait(deferredAsPromise(gate)).contentFilter())
+      const stop = yield* Deferred.make<void>()
+      yield* llm.push(reply().wait(deferredAsPromise(stop)).contentFilter())
       yield* llm.text("after the stop")
-      yield* Effect.addFinalizer(() => Effect.sync(() => void (gates.nextEnsureRunning = undefined)))
 
       const task = yield* prompt
         .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("start the task") })
         .pipe(Effect.forkChild)
       yield* awaitWithTimeout(llm.wait(1), "first provider call never started", "10 seconds")
-      // Admitted after the stopping turn's last history read, it joins that turn's
-      // run before the stop lands: the stop never saw it.
-      const joined = { reached: yield* Deferred.make<void>(), startedRun: false }
-      gates.nextEnsureRunning = joined
-      const late = yield* prompt
-        .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("admitted before the stop landed") })
+      const gate = {
+        sessionID: chat.id,
+        entered: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>(),
+      }
+      gates.queuePrepared = gate
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (gates.queuePrepared === gate) gates.queuePrepared = undefined
+          succeedVoid(stop)
+          succeedVoid(gate.release)
+        }),
+      )
+      const held = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          delivery: "queue",
+          parts: said("admitted after consume"),
+        })
         .pipe(Effect.forkChild)
-      yield* awaitWithTimeout(Deferred.await(joined.reached), "late prompt never reached the running turn")
-      expect(joined.startedRun).toBe(false)
-      yield* Deferred.succeed(gate, void 0)
+      yield* awaitWithTimeout(Deferred.await(gate.entered), "queued prompt never reached preparation", "10 seconds")
+      expect((yield* queue.list(chat.id)).map((item) => item.input.parts)).toEqual([said("admitted after consume")])
+      const database = yield* Database.Service
+      const preparing = yield* database.db
+        .select({ time_preparing: SessionPromptQueueTable.time_preparing })
+        .from(SessionPromptQueueTable)
+        .where(eq(SessionPromptQueueTable.session_id, chat.id))
+        .get()
+      expect(preparing?.time_preparing).toBeTypeOf("number")
 
-      const [, answer] = yield* finish(task, late)
+      yield* Deferred.succeed(stop, undefined)
+      yield* awaitWithTimeout(Fiber.await(task), "stopping turn did not finish", "10 seconds")
+      expect(yield* queue.isParked(chat.id)).toBe(false)
+      expect(yield* llm.calls).toBe(1)
+      yield* Deferred.succeed(gate.release, undefined)
+      yield* awaitWithTimeout(llm.wait(2), "prompt admitted after consume was not delivered", "10 seconds")
+      const [, answer] = yield* finish(task, held)
       expect(yield* llm.calls).toBe(2)
-      expect(lastUser((yield* llm.inputs)[1])).toEqual({ role: "user", content: "admitted before the stop landed" })
-      expect(answer?.parts.some((part) => part.type === "text" && part.text === "after the stop")).toBe(true)
+      expect(lastUser((yield* llm.inputs)[1])).toEqual({ role: "user", content: "admitted after consume" })
+      expect(answered(answer)).toEqual({
+        parentID: yield* asked(chat.id, "admitted after consume"),
+        texts: ["after the stop"],
+        error: undefined,
+      })
+      expect(yield* queue.isParked(chat.id)).toBe(false)
     }),
   15_000,
+)
+
+gated.instance(
+  "a normal stop parks seen queue items while a later prompt is preparing",
+  () =>
+    Effect.gen(function* () {
+      const stop = yield* Deferred.make<void>()
+      const { llm, queue, chat, task, send, release } = yield* startHeld({ tool: true })
+      const laterGate = {
+        sessionID: chat.id,
+        entered: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>(),
+      }
+      yield* llm.push(reply().wait(deferredAsPromise(stop)).text("filtered step").contentFilter())
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (gates.queuePrepared === laterGate) gates.queuePrepared = undefined
+          succeedVoid(laterGate.release)
+          succeedVoid(stop)
+        }).pipe(Effect.andThen(release.pipe(Effect.ignore))),
+      )
+
+      const earlier = yield* send("seen before consume", { delivery: "queue" })
+      const [earlierItem] = yield* queued(chat.id, 1)
+      const database = yield* Database.Service
+      yield* pollWithTimeout(
+        database.db
+          .select({ time_preparing: SessionPromptQueueTable.time_preparing })
+          .from(SessionPromptQueueTable)
+          .where(eq(SessionPromptQueueTable.id, earlierItem!.id))
+          .get()
+          .pipe(Effect.map((row) => (row?.time_preparing === null ? true : undefined))),
+        "earlier prompt never finished preparation",
+        "10 seconds",
+      )
+
+      yield* release
+      yield* awaitWithTimeout(llm.wait(2), "tool continuation never reached its provider step", "10 seconds")
+      expect(mentions((yield* llm.inputs)[1], "seen before consume")).toBe(false)
+      gates.queuePrepared = laterGate
+      const later = yield* send("preparing after consume", { delivery: "queue" })
+      yield* awaitWithTimeout(Deferred.await(laterGate.entered), "later prompt never reached preparation", "10 seconds")
+      const items = yield* queued(chat.id, 2)
+      expect(itemTexts(items)).toEqual(["seen before consume", "preparing after consume"])
+      const preparing = yield* database.db
+        .select({ time_preparing: SessionPromptQueueTable.time_preparing })
+        .from(SessionPromptQueueTable)
+        .where(eq(SessionPromptQueueTable.id, items[1]!.id))
+        .get()
+      expect(preparing?.time_preparing).toBeTypeOf("number")
+
+      succeedVoid(stop)
+      const stopped = yield* awaitWithTimeout(Fiber.join(task), "content-filter stop did not finish", "10 seconds")
+      expect(stopped.info).toMatchObject({ role: "assistant", error: { name: "ContentFilterError" } })
+      expect(yield* queue.isParked(chat.id)).toBe(true)
+      expect(yield* llm.calls).toBe(2)
+      expect(itemTexts(yield* queue.list(chat.id))).toEqual(["seen before consume", "preparing after consume"])
+
+      yield* llm.text("earlier prompt handled")
+      yield* llm.text("later prompt handled")
+      succeedVoid(laterGate.release)
+      yield* awaitWithTimeout(llm.wait(3), "uncovered later preparation did not wake the session", "10 seconds")
+      yield* awaitWithTimeout(llm.wait(4), "the second queued turn did not start", "10 seconds")
+      const [earlierReply, laterReply] = yield* finish(earlier, later)
+      expect(answered(earlierReply)?.texts).toEqual(["earlier prompt handled"])
+      expect(answered(laterReply)?.texts).toEqual(["later prompt handled"])
+    }),
+  20_000,
+)
+
+gated.instance(
+  "a failed later preparation does not prevent a normal stop from parking seen items",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const firstStep = yield* Deferred.make<void>()
+      const stop = yield* Deferred.make<void>()
+      yield* llm.push(
+        reply().wait(deferredAsPromise(firstStep)).text("first partial").finish("length"),
+        reply().wait(deferredAsPromise(stop)).text("filtered step").contentFilter(),
+      )
+      const task = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("start the task") })
+        .pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          succeedVoid(firstStep)
+          succeedVoid(stop)
+        }),
+      )
+      yield* awaitWithTimeout(llm.wait(1), "first provider step never started", "10 seconds")
+      yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, delivery: "queue", parts: said("seen earlier") })
+        .pipe(Effect.forkChild)
+      const [earlierItem] = yield* queued(chat.id, 1)
+      const database = yield* Database.Service
+      yield* pollWithTimeout(
+        database.db
+          .select({ time_preparing: SessionPromptQueueTable.time_preparing })
+          .from(SessionPromptQueueTable)
+          .where(eq(SessionPromptQueueTable.id, earlierItem!.id))
+          .get()
+          .pipe(Effect.map((row) => (row?.time_preparing === null ? true : undefined))),
+        "earlier prompt never finished preparation",
+        "10 seconds",
+      )
+
+      succeedVoid(firstStep)
+      yield* awaitWithTimeout(llm.wait(2), "second provider step never started", "10 seconds")
+      const failure = { sessionID: chat.id, triggered: false }
+      gates.setModelFailure = failure
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (gates.setModelFailure === failure) gates.setModelFailure = undefined
+        }),
+      )
+      const failed = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          delivery: "queue",
+          parts: said("failed after consume"),
+        })
+        .pipe(Effect.forkChild)
+      const failedExit = yield* awaitWithTimeout(Fiber.await(failed), "failed preparation did not settle", "10 seconds")
+      expect(Exit.isFailure(failedExit)).toBe(true)
+      expect(failure.triggered).toBe(true)
+      expect(itemTexts(yield* queue.list(chat.id))).toEqual(["seen earlier"])
+
+      succeedVoid(stop)
+      const stopped = yield* awaitWithTimeout(Fiber.join(task), "content-filter stop did not finish", "10 seconds")
+      expect(stopped.info).toMatchObject({ role: "assistant", error: { name: "ContentFilterError" } })
+      expect(yield* queue.isParked(chat.id)).toBe(true)
+      expect(yield* llm.calls).toBe(2)
+      expect(itemTexts(yield* queue.list(chat.id))).toEqual(["seen earlier"])
+    }),
+  20_000,
 )
 
 gated.instance(
@@ -9986,19 +10259,142 @@ it.instance(
   15_000,
 )
 
-it.instance(
+gated.instance(
   "a run interrupted without a prompt cancel, as instance disposal does, also parks pending prompts",
   () =>
     Effect.gen(function* () {
       const run = yield* SessionRunState.Service
       const { llm, queue, chat, task, send } = yield* startHeld()
+      const gate = {
+        sessionID: chat.id,
+        entered: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>(),
+      }
+      gates.queuePrepared = gate
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (gates.queuePrepared === gate) gates.queuePrepared = undefined
+          succeedVoid(gate.release)
+        }),
+      )
       const held = yield* send("parked by the interrupt", { delivery: "queue" })
-      yield* queued(chat.id, 1)
+      yield* awaitWithTimeout(Deferred.await(gate.entered), "queued prompt never reached prepared", "10 seconds")
+      const items = yield* queued(chat.id, 1)
+      expect(items.map((item) => item.input.parts)).toEqual([said("parked by the interrupt")])
+      const database = yield* Database.Service
+      const preparing = yield* database.db
+        .select({ id: SessionPromptQueueTable.id, time_preparing: SessionPromptQueueTable.time_preparing })
+        .from(SessionPromptQueueTable)
+        .where(eq(SessionPromptQueueTable.session_id, chat.id))
+        .get()
+      expect(preparing).toBeDefined()
+      expect(preparing?.time_preparing).toBeTypeOf("number")
 
       yield* run.cancel(chat.id)
+      expect(yield* queue.isParked(chat.id)).toBe(true)
+      const beforePreparationFinishes = yield* llm.inputs
+      expect(beforePreparationFinishes.map(lastUser)).toEqual([{ role: "user", content: "start the task" }])
+      yield* Deferred.succeed(gate.release, undefined)
       yield* finish(task, held)
       expect(yield* llm.calls).toBe(1)
+      const providerInputs = yield* llm.inputs
+      expect(providerInputs.map(lastUser)).toEqual([{ role: "user", content: "start the task" }])
       expect((yield* queue.list(chat.id)).map((item) => item.input.parts)).toEqual([said("parked by the interrupt")])
+      expect(yield* queue.isParked(chat.id)).toBe(true)
+    }),
+  15_000,
+)
+
+gated.instance(
+  "a second cancel parks a prompt that is still preparing on an already parked session",
+  () =>
+    Effect.gen(function* () {
+      const { llm, prompt, queue, chat, task, send } = yield* startHeld()
+      const run = yield* SessionRunState.Service
+      yield* run.cancel(chat.id)
+      yield* finish(task)
+      expect(yield* llm.calls).toBe(1)
+      expect(yield* queue.isParked(chat.id)).toBe(true)
+
+      const gate = {
+        sessionID: chat.id,
+        entered: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>(),
+      }
+      gates.queuePrepared = gate
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (gates.queuePrepared === gate) gates.queuePrepared = undefined
+          succeedVoid(gate.release)
+        }),
+      )
+      const held = yield* send("cancelled by the second park", { delivery: "queue" })
+      yield* awaitWithTimeout(Deferred.await(gate.entered), "queued prompt never reached prepared", "10 seconds")
+      const items = yield* queued(chat.id, 1)
+      expect(items.map((item) => item.input.parts)).toEqual([said("cancelled by the second park")])
+      const database = yield* Database.Service
+      const preparing = yield* database.db
+        .select({ time_preparing: SessionPromptQueueTable.time_preparing })
+        .from(SessionPromptQueueTable)
+        .where(eq(SessionPromptQueueTable.session_id, chat.id))
+        .get()
+      expect(preparing?.time_preparing).toBeTypeOf("number")
+
+      yield* prompt.cancel(chat.id)
+      expect(yield* queue.isParked(chat.id)).toBe(true)
+      yield* Deferred.succeed(gate.release, undefined)
+      yield* finish(held)
+
+      expect(yield* llm.calls).toBe(1)
+      expect((yield* queue.list(chat.id)).map((item) => item.input.parts)).toEqual([
+        said("cancelled by the second park"),
+      ])
+      expect(yield* queue.isParked(chat.id)).toBe(true)
+    }),
+  15_000,
+)
+
+gated.instance(
+  "a prompt arriving during cancellation cleanup gets its own provider reply",
+  () =>
+    Effect.gen(function* () {
+      const run = yield* SessionRunState.Service
+      const { llm, queue, chat, task, send, release } = yield* startHeld()
+      const park = {
+        sessionID: chat.id,
+        entered: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>(),
+        completed: yield* Deferred.make<void>(),
+      }
+      gates.queuePark = park
+      yield* Effect.addFinalizer(() =>
+        Effect.gen(function* () {
+          yield* release.pipe(Effect.ignore)
+          yield* Effect.sync(() => {
+            if (gates.queuePark === park) gates.queuePark = undefined
+            succeedVoid(park.release)
+          })
+        }),
+      )
+
+      const cancelled = yield* run.cancel(chat.id).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(park.entered), "run interruption never entered queue parking", "10 seconds")
+      expect(yield* queue.isParked(chat.id)).toBe(false)
+      yield* llm.text("handled during cleanup")
+      const arriving = yield* send("arrived during cleanup", { delivery: "steer" })
+      yield* awaitWithTimeout(llm.wait(2), "prompt arriving during cleanup did not reach the provider", "5 seconds")
+      expect(lastUser((yield* llm.inputs)[1])).toEqual({ role: "user", content: "arrived during cleanup" })
+
+      yield* Deferred.succeed(park.release, undefined)
+      yield* awaitWithTimeout(Deferred.await(park.completed), "interrupted run never finished parking", "10 seconds")
+      yield* awaitWithTimeout(Fiber.join(cancelled), "cancellation cleanup never finished", "10 seconds")
+      const [, reply] = yield* finish(task, arriving)
+      expect(yield* llm.calls).toBe(2)
+      expect(answered(reply)).toEqual({
+        parentID: yield* asked(chat.id, "arrived during cleanup"),
+        texts: ["handled during cleanup"],
+        error: undefined,
+      })
     }),
   15_000,
 )
@@ -14669,6 +15065,95 @@ unix(
       expect(yield* llm.calls).toBe(0)
     }),
   30000,
+)
+
+it.instance(
+  "a manual compaction returns its summary assistant to the completing run",
+  () =>
+    Effect.gen(function* () {
+      const { llm, sessions, chat, task, release } = yield* startHeld({ tool: true })
+      const prompt = yield* SessionPrompt.Service
+      const joined = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      const compaction = yield* SessionCompaction.Service
+      yield* Effect.addFinalizer(() => release.pipe(Effect.ignore))
+      const parentID = yield* compaction.create({ sessionID: chat.id, agent: "build", model: ref, auto: false })
+      yield* llm.text("the final manual summary")
+      yield* release
+      yield* awaitWithTimeout(llm.wait(2), "summary request never started", "10 seconds")
+      const [, result] = yield* finish(task, joined)
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const summary = messages.find((message) => message.info.role === "assistant" && message.info.parentID === parentID)
+      if (!summary) throw new Error("manual compaction summary was not found")
+      if (!result) throw new Error("manual compaction run returned no assistant")
+      expect(summary.info).toMatchObject({ role: "assistant", summary: true, finish: "stop" })
+      expect(result.info.id).toBe(summary.info.id)
+    }),
+  15_000,
+)
+
+it.instance(
+  "cancellation during compaction returns its terminal assistant",
+  () =>
+    Effect.gen(function* () {
+      const { llm, sessions, chat, task, release } = yield* startHeld({ tool: true })
+      const compaction = yield* SessionCompaction.Service
+      const run = yield* SessionRunState.Service
+      const gate = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(gate, undefined).pipe(Effect.andThen(release), Effect.ignore))
+      const parentID = yield* compaction.create({ sessionID: chat.id, agent: "build", model: ref, auto: false })
+      yield* llm.hold("summary interrupted", deferredAsPromise(gate))
+      yield* release
+      yield* awaitWithTimeout(llm.wait(2), "summary request never started", "10 seconds")
+      yield* run.cancel(chat.id)
+      const [result] = yield* finish(task)
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const summary = messages.find((message) => message.info.role === "assistant" && message.info.parentID === parentID)
+      if (!summary) throw new Error("cancelled compaction summary was not found")
+      if (!result) throw new Error("cancelled compaction run returned no assistant")
+      expect(summary.info).toMatchObject({ role: "assistant", summary: true, error: { name: "MessageAbortedError" } })
+      expect(result.info.id).toBe(summary.info.id)
+    }),
+  15_000,
+)
+
+gated.instance(
+  "a failed compaction terminal write still replies with that run's assistant",
+  () =>
+    Effect.gen(function* () {
+      const { llm, sessions, chat, task, release } = yield* startHeld({ tool: true })
+      const compaction = yield* SessionCompaction.Service
+      const run = yield* SessionRunState.Service
+      const gate = yield* Deferred.make<void>()
+      const terminalWrite = { sessionID: chat.id, triggered: false }
+      const capture = { sessionID: chat.id, replies: [] as SessionV1.WithParts[] }
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          succeedVoid(gate)
+          if (gates.compactionTerminalWrite === terminalWrite) gates.compactionTerminalWrite = undefined
+          if (gates.queueAnswers === capture) gates.queueAnswers = undefined
+        }).pipe(Effect.andThen(release.pipe(Effect.ignore))),
+      )
+      const parentID = yield* compaction.create({ sessionID: chat.id, agent: "build", model: ref, auto: false })
+      yield* llm.hold("summary interrupted", deferredAsPromise(gate))
+      yield* release
+      yield* awaitWithTimeout(llm.wait(2), "summary request never started", "10 seconds")
+      gates.compactionTerminalWrite = terminalWrite
+      gates.queueAnswers = capture
+      const cancelExit = yield* Effect.exit(run.cancel(chat.id))
+      const taskExit = yield* awaitWithTimeout(Fiber.await(task), "interrupted prompt did not settle", "10 seconds")
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const summary = messages.find((message) => message.info.role === "assistant" && message.info.parentID === parentID)
+      expect(terminalWrite.triggered).toBe(true)
+      expect(Exit.isSuccess(cancelExit)).toBe(true)
+      const answer = capture.replies.at(-1)
+      if (!summary) throw new Error("interrupted compaction summary was not found")
+      if (!answer) throw new Error("interrupted compaction did not answer its caller")
+      expect(summary.info.role).toBe("assistant")
+      expect(answer.info.id).toBe(summary.info.id)
+      if (summary.info.role === "assistant") expect(summary.info.time.completed).toBeUndefined()
+      expect(Exit.isSuccess(taskExit)).toBe(true)
+    }),
+  15_000,
 )
 
 gated.instance(

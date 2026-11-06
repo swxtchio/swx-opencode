@@ -181,6 +181,7 @@ export interface Interface {
     auto: boolean
     overflow?: boolean
     resume?: boolean
+    onAssistant?: (assistantID: MessageID) => void
   }) => Effect.Effect<"continue" | "stop">
   readonly create: (input: {
     sessionID: SessionID
@@ -340,6 +341,7 @@ const layer = Layer.effect(
       auto: boolean
       overflow?: boolean
       resume?: boolean
+      onAssistant?: (assistantID: MessageID) => void
     }) {
       const parent = input.messages.findLast((m) => m.info.id === input.parentID)
       if (!parent || parent.info.role !== "user") {
@@ -448,6 +450,8 @@ const layer = Layer.effect(
           created: Date.now(),
         },
       }
+      // Cancellation cleanup answers this run with the summary, even if its terminal write fails.
+      input.onAssistant?.(msg.id)
       yield* session.updateMessage(msg)
       const processor = yield* processors
         .create({

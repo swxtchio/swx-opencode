@@ -389,14 +389,17 @@ const layer = Layer.effect(
       sessionID: SessionID
       session: Session.Info
       msgs: SessionV1.WithParts[]
+      onAssistant: (assistantID: MessageID) => void
     }) {
       const { task, model, lastUser, sessionID, session, msgs } = input
       const ctx = yield* InstanceState.context
       const promptOps = yield* ops()
       const { task: taskTool } = yield* registry.named()
       const taskModel = task.model ? yield* getModel(task.model.providerID, task.model.modelID, sessionID) : model
+      const assistantMessageID = MessageID.ascending()
+      input.onAssistant(assistantMessageID)
       const assistantMessage: SessionV1.Assistant = yield* sessions.updateMessage({
-        id: MessageID.ascending(),
+        id: assistantMessageID,
         role: "assistant",
         parentID: lastUser.id,
         sessionID,
@@ -1527,8 +1530,18 @@ const layer = Layer.effect(
         })
       }).pipe(Effect.orDie)
 
-    const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
-      const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user").pipe(Effect.orDie)
+    type RunAssistant = { assistantID: MessageID | undefined }
+    const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID, run?: RunAssistant) {
+      if (run?.assistantID) {
+        // A failed terminal write can leave this run's assistant placeholder; do not answer it with a prior run.
+        const active = yield* sessions
+          .findMessage(sessionID, (message) => message.info.role === "assistant" && message.info.id === run.assistantID)
+          .pipe(Effect.orDie)
+        if (Option.isSome(active)) return active.value
+      }
+      const match = yield* sessions
+        .findMessage(sessionID, (message) => message.info.role === "assistant" && message.info.time.completed !== undefined)
+        .pipe(Effect.orDie)
       if (Option.isSome(match)) return match.value
       const msgs = yield* sessions.messages({ sessionID, limit: 1 }).pipe(Effect.orDie)
       if (msgs.length > 0) return msgs[0]
@@ -1536,17 +1549,18 @@ const layer = Layer.effect(
     })
 
     // Root pins bind only when this caller starts the run; a joiner keeps the active run's root.
-    const runLoop: (
-      sessionID: SessionID,
-      rootMessageID?: MessageID,
-      retryFailedRoot?: boolean,
-    ) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
-      function* (sessionID: SessionID, rootMessageID?: MessageID, retryFailedRoot = false) {
+    const runLoopEffect = Effect.fn("SessionPrompt.run")(
+      function* (
+        sessionID: SessionID,
+        rootMessageID: MessageID | undefined,
+        retryFailedRoot: boolean,
+        run: RunAssistant,
+      ) {
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
         let settled = false
-        let seen = 0
+        let seen: SessionQueue.ConsumeSnapshot | undefined
         let deferredCompactionTrigger: SessionV1.CompactionPart["trigger"]
         let initialProviderBoundary = true
         // The drain already selected its initial input. Each provider completion opens one new queue boundary.
@@ -1734,7 +1748,17 @@ const layer = Layer.effect(
           const task = SessionQueue.openTasks(msgs, selection).pop()
 
           if (task?.type === "subtask") {
-            yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
+            yield* handleSubtask({
+              task,
+              model,
+              lastUser,
+              sessionID,
+              session,
+              msgs,
+              onAssistant: (assistantID) => {
+                run.assistantID = assistantID
+              },
+            })
             continue
           }
 
@@ -1750,6 +1774,9 @@ const layer = Layer.effect(
                 auto: task.auto,
                 overflow: task.overflow,
                 resume: task.resume,
+                onAssistant: (assistantID) => {
+                  run.assistantID = assistantID
+                },
               }),
             )
             deferredCompactionTrigger = undefined
@@ -1820,6 +1847,7 @@ const layer = Layer.effect(
             time: { created: Date.now() },
             sessionID,
           }
+          run.assistantID = msg.id
           yield* sessions.updateMessage(msg)
 
           const finalizeInterruptedAssistant = processor.finalizeFailure({
@@ -2028,18 +2056,29 @@ const layer = Layer.effect(
         // Any other exit stops the task; the joiner re-check must not restart it.
         if (!settled) yield* queue.park(sessionID, seen)
         yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
-        return yield* endRun(sessionID)
+        return yield* endRun(sessionID, run)
       },
       // So does an interrupt, such as instance disposal cancelling the run.
-      (effect, sessionID) =>
-        effect.pipe(Effect.onInterrupt(() => queue.park(sessionID).pipe(Effect.andThen(endRun(sessionID))))),
+      (effect, sessionID, _rootMessageID, _retryFailedRoot, run) =>
+        effect.pipe(
+          Effect.onInterrupt(() => queue.park(sessionID).pipe(Effect.andThen(endRun(sessionID, run)))),
+        ),
     )
+    const runLoop: (
+      sessionID: SessionID,
+      rootMessageID?: MessageID,
+      retryFailedRoot?: boolean,
+    ) => Effect.Effect<SessionV1.WithParts> = (sessionID, rootMessageID, retryFailedRoot) =>
+      Effect.suspend(() => {
+        const run: RunAssistant = { assistantID: undefined }
+        return runLoopEffect(sessionID, rootMessageID, retryFailedRoot ?? false, run)
+      })
 
     // A run's final message ends the turn it belongs to, so it answers that turn's
     // prompts before any later run can. A turn the loop finished was answered as
     // it ended; this answers one the run stopped on, by an error, abort or interrupt.
-    const endRun = Effect.fnUntraced(function* (sessionID: SessionID) {
-      const final = yield* lastAssistant(sessionID)
+    const endRun = Effect.fnUntraced(function* (sessionID: SessionID, run: RunAssistant) {
+      const final = yield* lastAssistant(sessionID, run)
       if (final.info.role === "assistant") yield* queue.answer(sessionID, final.info.parentID, final)
       return final
     })
