@@ -5385,6 +5385,57 @@ describe("SessionV2 auxiliary model work", () => {
     }),
   )
 
+  it.effect("uses one identity header set for title and both compaction producers", () =>
+    Effect.gen(function* () {
+      yield* setupNative
+      yield* addTitleAgent
+      yield* addPrimarySmallModel
+      const session = yield* SessionV2.Service
+      const headers = {
+        "x-opencode-session-id": sessionID,
+        "x-session-affinity": sessionID,
+        "X-Session-Id": sessionID,
+      }
+
+      response = fragmentFixture("text", "text-identity-title", ["First answer"]).completeEvents
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "First question" }), resume: false })
+      yield* session.resume(sessionID)
+
+      expect(requests.filter(isTitleRequest)).toHaveLength(1)
+      expect(requests.map((request) => request.http?.headers)).toEqual([headers, headers])
+
+      requests.length = 0
+      response = fragmentFixture("text", "text-identity-manual", ["## Objective\n- Preserve the task"]).completeEvents
+      yield* session.compact({ sessionID })
+      expect(requests.map((request) => request.http?.headers)).toEqual([headers])
+
+      currentModel = model
+      response = fragmentFixture("text", "text-identity-earlier", ["Earlier answer"]).completeEvents
+      yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Earlier question ".repeat(180) }),
+        resume: false,
+      })
+      yield* session.resume(sessionID)
+
+      currentModel = compactModel
+      requests.length = 0
+      responses = [
+        fragmentFixture("text", "text-identity-summary", ["## Objective\n- Preserve the updated task"]).completeEvents,
+        fragmentFixture("text", "text-identity-final", ["Continued"]).completeEvents,
+      ]
+      yield* session.prompt({
+        sessionID,
+        prompt: Prompt.make({ text: "Recent exact request ".repeat(180) }),
+        resume: false,
+      })
+      yield* session.resume(sessionID)
+
+      expect(requests).toHaveLength(2)
+      expect(requests.map((request) => request.http?.headers)).toEqual([headers, headers])
+    }),
+  )
+
   it.effect("titles only a default-titled Session whose first turn has one prompt", () =>
     Effect.gen(function* () {
       yield* setupNative
@@ -5458,7 +5509,11 @@ describe("SessionV2 auxiliary model work", () => {
 
       expect(requests).toHaveLength(1)
       expect(String(requests[0].model.id)).toBe("small")
-      expect(requests[0].http?.headers).toEqual({ "x-session-affinity": sessionID, "X-Session-Id": sessionID })
+      expect(requests[0].http?.headers).toEqual({
+        "x-opencode-session-id": sessionID,
+        "x-session-affinity": sessionID,
+        "X-Session-Id": sessionID,
+      })
       expect(userTexts(requests[0])[0]).toContain("[User]: The question\n\n[Assistant]: The answer\n</conversation>")
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "compaction", reason: "manual", summary: "## Objective\n- Answer the question", recent: "" },
