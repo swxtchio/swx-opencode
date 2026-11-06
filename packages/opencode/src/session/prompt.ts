@@ -1527,8 +1527,14 @@ const layer = Layer.effect(
         })
       }).pipe(Effect.orDie)
 
-    const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
-      // A replacement run can create an assistant placeholder before an interrupted run answers its joiners.
+    const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID, assistantID?: MessageID) {
+      if (assistantID) {
+        // A failed terminal write can leave this run's assistant placeholder; do not answer it with a prior run.
+        const active = yield* sessions
+          .findMessage(sessionID, (message) => message.info.role === "assistant" && message.info.id === assistantID)
+          .pipe(Effect.orDie)
+        if (Option.isSome(active)) return active.value
+      }
       const match = yield* sessions
         .findMessage(sessionID, (message) => message.info.role === "assistant" && message.info.time.completed !== undefined)
         .pipe(Effect.orDie)
@@ -1539,17 +1545,18 @@ const layer = Layer.effect(
     })
 
     // Root pins bind only when this caller starts the run; a joiner keeps the active run's root.
-    const runLoop: (
-      sessionID: SessionID,
-      rootMessageID?: MessageID,
-      retryFailedRoot?: boolean,
-    ) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
-      function* (sessionID: SessionID, rootMessageID?: MessageID, retryFailedRoot = false) {
+    const runLoopEffect = Effect.fn("SessionPrompt.run")(
+      function* (
+        sessionID: SessionID,
+        rootMessageID: MessageID | undefined,
+        retryFailedRoot: boolean,
+        run: { assistantID: MessageID | undefined },
+      ) {
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
         let settled = false
-        let seen = 0
+        let seen: SessionQueue.ConsumeSnapshot | undefined
         let deferredCompactionTrigger: SessionV1.CompactionPart["trigger"]
         let initialProviderBoundary = true
         // The drain already selected its initial input. Each provider completion opens one new queue boundary.
@@ -1823,6 +1830,7 @@ const layer = Layer.effect(
             time: { created: Date.now() },
             sessionID,
           }
+          run.assistantID = msg.id
           yield* sessions.updateMessage(msg)
 
           const finalizeInterruptedAssistant = processor.finalizeFailure({
@@ -2031,18 +2039,29 @@ const layer = Layer.effect(
         // Any other exit stops the task; the joiner re-check must not restart it.
         if (!settled) yield* queue.park(sessionID, seen)
         yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
-        return yield* endRun(sessionID)
+        return yield* endRun(sessionID, run.assistantID)
       },
       // So does an interrupt, such as instance disposal cancelling the run.
-      (effect, sessionID) =>
-        effect.pipe(Effect.onInterrupt(() => queue.park(sessionID).pipe(Effect.andThen(endRun(sessionID))))),
+      (effect, sessionID, _rootMessageID, _retryFailedRoot, run) =>
+        effect.pipe(
+          Effect.onInterrupt(() => queue.park(sessionID).pipe(Effect.andThen(endRun(sessionID, run.assistantID)))),
+        ),
     )
+    const runLoop: (
+      sessionID: SessionID,
+      rootMessageID?: MessageID,
+      retryFailedRoot?: boolean,
+    ) => Effect.Effect<SessionV1.WithParts> = (sessionID, rootMessageID, retryFailedRoot) =>
+      Effect.suspend(() => {
+        const run = { assistantID: undefined as MessageID | undefined }
+        return runLoopEffect(sessionID, rootMessageID, retryFailedRoot ?? false, run)
+      })
 
     // A run's final message ends the turn it belongs to, so it answers that turn's
     // prompts before any later run can. A turn the loop finished was answered as
     // it ended; this answers one the run stopped on, by an error, abort or interrupt.
-    const endRun = Effect.fnUntraced(function* (sessionID: SessionID) {
-      const final = yield* lastAssistant(sessionID)
+    const endRun = Effect.fnUntraced(function* (sessionID: SessionID, assistantID?: MessageID) {
+      const final = yield* lastAssistant(sessionID, assistantID)
       if (final.info.role === "assistant") yield* queue.answer(sessionID, final.info.parentID, final)
       return final
     })

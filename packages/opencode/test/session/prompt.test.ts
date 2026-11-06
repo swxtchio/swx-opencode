@@ -618,6 +618,7 @@ const gates = {
   presetErrorUpdateFailure: undefined as
     | undefined
     | { name: "ContentFilterError" | "StructuredOutputError"; triggered: boolean },
+  setModelFailure: undefined as undefined | { sessionID: SessionID; triggered: boolean },
   outcomeFailure: undefined as undefined | { triggered: boolean },
   noReplyAdmission: undefined as
     | undefined
@@ -663,6 +664,16 @@ const gatedSession = LayerNode.make({
               yield* Deferred.await(gate.release)
             }
             return yield* real.updateMessage(msg)
+          }),
+        setModel: (input) =>
+          Effect.gen(function* () {
+            const failure = gates.setModelFailure
+            if (failure?.sessionID === input.sessionID) {
+              failure.triggered = true
+              gates.setModelFailure = undefined
+              return yield* Effect.die(new Error("injected prompt preparation failure"))
+            }
+            return yield* real.setModel(input)
           }),
         findMessage: (sessionID, predicate) =>
           Effect.gen(function* () {
@@ -9771,6 +9782,148 @@ gated.instance(
       expect(yield* queue.isParked(chat.id)).toBe(false)
     }),
   15_000,
+)
+
+gated.instance(
+  "a normal stop parks seen queue items while a later prompt is preparing",
+  () =>
+    Effect.gen(function* () {
+      const stop = yield* Deferred.make<void>()
+      const { llm, queue, chat, task, send, release } = yield* startHeld({ tool: true })
+      const laterGate = {
+        sessionID: chat.id,
+        entered: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>(),
+      }
+      yield* llm.push(reply().wait(deferredAsPromise(stop)).text("filtered step").contentFilter())
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (gates.queuePrepared === laterGate) gates.queuePrepared = undefined
+          succeedVoid(laterGate.release)
+          succeedVoid(stop)
+        }).pipe(Effect.andThen(release.pipe(Effect.ignore))),
+      )
+
+      const earlier = yield* send("seen before consume", { delivery: "queue" })
+      const [earlierItem] = yield* queued(chat.id, 1)
+      const database = yield* Database.Service
+      yield* pollWithTimeout(
+        database.db
+          .select({ time_preparing: SessionPromptQueueTable.time_preparing })
+          .from(SessionPromptQueueTable)
+          .where(eq(SessionPromptQueueTable.id, earlierItem!.id))
+          .get()
+          .pipe(Effect.map((row) => (row?.time_preparing === null ? true : undefined))),
+        "earlier prompt never finished preparation",
+        "10 seconds",
+      )
+
+      yield* release
+      yield* awaitWithTimeout(llm.wait(2), "tool continuation never reached its provider step", "10 seconds")
+      expect(mentions((yield* llm.inputs)[1], "seen before consume")).toBe(false)
+      gates.queuePrepared = laterGate
+      const later = yield* send("preparing after consume", { delivery: "queue" })
+      yield* awaitWithTimeout(Deferred.await(laterGate.entered), "later prompt never reached preparation", "10 seconds")
+      const items = yield* queued(chat.id, 2)
+      expect(itemTexts(items)).toEqual(["seen before consume", "preparing after consume"])
+      const preparing = yield* database.db
+        .select({ time_preparing: SessionPromptQueueTable.time_preparing })
+        .from(SessionPromptQueueTable)
+        .where(eq(SessionPromptQueueTable.id, items[1]!.id))
+        .get()
+      expect(preparing?.time_preparing).toBeTypeOf("number")
+
+      succeedVoid(stop)
+      const stopped = yield* awaitWithTimeout(Fiber.join(task), "content-filter stop did not finish", "10 seconds")
+      expect(stopped.info).toMatchObject({ role: "assistant", error: { name: "ContentFilterError" } })
+      expect(yield* queue.isParked(chat.id)).toBe(true)
+      expect(yield* llm.calls).toBe(2)
+      expect(itemTexts(yield* queue.list(chat.id))).toEqual(["seen before consume", "preparing after consume"])
+
+      yield* llm.text("earlier prompt handled")
+      yield* llm.text("later prompt handled")
+      succeedVoid(laterGate.release)
+      yield* awaitWithTimeout(llm.wait(3), "uncovered later preparation did not wake the session", "10 seconds")
+      yield* awaitWithTimeout(llm.wait(4), "the second queued turn did not start", "10 seconds")
+      const [earlierReply, laterReply] = yield* finish(earlier, later)
+      expect(answered(earlierReply)?.texts).toEqual(["earlier prompt handled"])
+      expect(answered(laterReply)?.texts).toEqual(["later prompt handled"])
+    }),
+  20_000,
+)
+
+gated.instance(
+  "a failed later preparation does not prevent a normal stop from parking seen items",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const queue = yield* SessionQueue.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const firstStep = yield* Deferred.make<void>()
+      const stop = yield* Deferred.make<void>()
+      yield* llm.push(
+        reply().wait(deferredAsPromise(firstStep)).text("first partial").finish("length"),
+        reply().wait(deferredAsPromise(stop)).text("filtered step").contentFilter(),
+      )
+      const task = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: said("start the task") })
+        .pipe(Effect.forkChild)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          succeedVoid(firstStep)
+          succeedVoid(stop)
+        }),
+      )
+      yield* awaitWithTimeout(llm.wait(1), "first provider step never started", "10 seconds")
+      yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, delivery: "queue", parts: said("seen earlier") })
+        .pipe(Effect.forkChild)
+      const [earlierItem] = yield* queued(chat.id, 1)
+      const database = yield* Database.Service
+      yield* pollWithTimeout(
+        database.db
+          .select({ time_preparing: SessionPromptQueueTable.time_preparing })
+          .from(SessionPromptQueueTable)
+          .where(eq(SessionPromptQueueTable.id, earlierItem!.id))
+          .get()
+          .pipe(Effect.map((row) => (row?.time_preparing === null ? true : undefined))),
+        "earlier prompt never finished preparation",
+        "10 seconds",
+      )
+
+      succeedVoid(firstStep)
+      yield* awaitWithTimeout(llm.wait(2), "second provider step never started", "10 seconds")
+      const failure = { sessionID: chat.id, triggered: false }
+      gates.setModelFailure = failure
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (gates.setModelFailure === failure) gates.setModelFailure = undefined
+        }),
+      )
+      const failed = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          delivery: "queue",
+          parts: said("failed after consume"),
+        })
+        .pipe(Effect.forkChild)
+      const failedExit = yield* awaitWithTimeout(Fiber.await(failed), "failed preparation did not settle", "10 seconds")
+      expect(Exit.isFailure(failedExit)).toBe(true)
+      expect(failure.triggered).toBe(true)
+      expect(itemTexts(yield* queue.list(chat.id))).toEqual(["seen earlier"])
+
+      succeedVoid(stop)
+      const stopped = yield* awaitWithTimeout(Fiber.join(task), "content-filter stop did not finish", "10 seconds")
+      expect(stopped.info).toMatchObject({ role: "assistant", error: { name: "ContentFilterError" } })
+      expect(yield* queue.isParked(chat.id)).toBe(true)
+      expect(yield* llm.calls).toBe(2)
+      expect(itemTexts(yield* queue.list(chat.id))).toEqual(["seen earlier"])
+    }),
+  20_000,
 )
 
 gated.instance(
