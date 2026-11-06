@@ -34,6 +34,11 @@ export function processParentIDFromStat(stat: string) {
   return Number.isSafeInteger(value) && value > 0 ? value : undefined
 }
 
+export function isLiveProcessStat(stat: string) {
+  const state = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0]
+  return state !== "Z" && state !== "X" && state !== "x"
+}
+
 export function processGroupID(pid: number) {
   if (process.platform !== "linux") return
   try {
@@ -58,7 +63,13 @@ export function isGroupMember(
   readIdentity = EventWriter.readIdentity,
 ) {
   if (!hasIdentity(identity) || !sameIdentity(identity, readIdentity(identity.pid))) return false
-  return processGroupID(identity.pid) === pgid
+  if (process.platform !== "linux") return false
+  try {
+    const stat = readFileSync(`/proc/${identity.pid}/stat`, "utf8")
+    return isLiveProcessStat(stat) && processGroupIDFromStat(stat) === pgid
+  } catch {
+    return false
+  }
 }
 
 export function isAlive(pgid: number) {
@@ -71,51 +82,47 @@ export function isAlive(pgid: number) {
   }
 }
 
-export function canSignalGroup(
-  pgid: number,
-  identities: Iterable<EventWriter.ProcessIdentity>,
-  readIdentity = EventWriter.readIdentity,
-) {
-  if (!isAlive(pgid)) return false
-  const recorded = Array.from(identities)
-  const readableRecorded = recorded.filter(hasIdentity)
-  if (readableRecorded.length === 0) return true
-  let identityUnavailable = false
-  for (const identity of readableRecorded) {
-    const current = readIdentity(identity.pid)
-    if (!hasIdentity(current)) {
-      identityUnavailable = true
-      continue
-    }
-    if (!sameIdentity(identity, current)) {
-      identityUnavailable = true
-      continue
-    }
-    const currentGroup = processGroupID(identity.pid)
-    if (currentGroup === pgid) return true
-    if (currentGroup === undefined) identityUnavailable = true
-  }
-  // A live PGID cannot be reused while one of its process-group members remains alive.
-  return identityUnavailable && !hasIdentity(readIdentity(process.pid))
+export type GroupOwnershipEvidence = "confirmed" | "pending" | "unavailable" | "refuted" | "gone"
+export type GroupOwnershipDecision =
+  | { readonly action: "signal"; readonly evidence: "confirmed" | "pending" | "unavailable" }
+  | { readonly action: "prune"; readonly evidence: "refuted" | "gone" }
+export type GroupOwnershipInput = {
+  readonly pgid: number
+  readonly identities: Iterable<EventWriter.ProcessIdentity>
+  readonly cleanupOwed?: boolean
+  readonly membersPending?: boolean
+  readonly readIdentity?: IdentityReader
+}
+export type GroupMembersSnapshot = {
+  readonly members: ReadonlyArray<EventWriter.ProcessIdentity>
+  readonly complete: boolean
 }
 
-export function signalGroup(
-  pgid: number,
-  identities: Iterable<EventWriter.ProcessIdentity>,
-  signal: NodeJS.Signals,
-  readIdentity = EventWriter.readIdentity,
-) {
-  if (!canSignalGroup(pgid, identities, readIdentity)) return false
-  try {
-    process.kill(-pgid, signal)
-    return true
-  } catch {
-    return false
-  }
+export function decideGroupOwnership(input: GroupOwnershipInput): GroupOwnershipDecision {
+  if (!isAlive(input.pgid)) return { action: "prune", evidence: "gone" }
+  const readIdentity = input.readIdentity ?? EventWriter.readIdentity
+  const confirmed = Array.from(input.identities).some(
+    (identity) => hasIdentity(identity) && isGroupMember(input.pgid, identity, readIdentity),
+  )
+  if (confirmed) return { action: "signal", evidence: "confirmed" }
+  if (input.cleanupOwed && input.membersPending) return { action: "signal", evidence: "pending" }
+  if (!hasIdentity(readIdentity(process.pid))) return { action: "signal", evidence: "unavailable" }
+  return { action: "prune", evidence: "refuted" }
 }
 
-export async function readGroupMembers(pgid: number, leaderIdentity: EventWriter.ProcessIdentity) {
-  if (process.platform !== "linux" || !isAlive(pgid)) return []
+export function signalGroup(input: GroupOwnershipInput, signal: NodeJS.Signals) {
+  const decision = decideGroupOwnership(input)
+  if (decision.action === "signal") {
+    try {
+      process.kill(-input.pgid, signal)
+    } catch {}
+  }
+  return decision
+}
+
+export async function readGroupMembers(pgid: number, leaderIdentity: EventWriter.ProcessIdentity): Promise<GroupMembersSnapshot> {
+  if (process.platform !== "linux") return { members: [], complete: false }
+  if (!isAlive(pgid)) return { members: [], complete: true }
   const currentLeader = EventWriter.readIdentity(pgid)
   if (
     hasIdentity(currentLeader) &&
@@ -123,26 +130,47 @@ export async function readGroupMembers(pgid: number, leaderIdentity: EventWriter
     !sameIdentity(currentLeader, leaderIdentity) &&
     processGroupID(pgid) === pgid
   )
-    return []
-  const entries = await readdir("/proc").catch(() => [])
+    return { members: [], complete: true }
+  const entries = await readdir("/proc").catch(() => undefined)
+  if (!entries) return { members: [], complete: false }
+  let complete = true
   const identities = await Promise.all(
     entries.flatMap((entry) => {
       if (!/^\d+$/.test(entry)) return []
       const pid = Number(entry)
       return [
         (async () => {
-          const stat = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => undefined)
-          if (!stat || processGroupIDFromStat(stat) !== pgid) return
+          const stat = await readFile(`/proc/${pid}/stat`, "utf8").catch((error) => {
+            if (error instanceof Error && "code" in error && (error.code === "EACCES" || error.code === "EPERM"))
+              complete = false
+            return undefined
+          })
+          if (!stat || !isLiveProcessStat(stat) || processGroupIDFromStat(stat) !== pgid) return
           const identity = EventWriter.readIdentity(pid)
-          if (!hasIdentity(identity)) return
-          const currentStat = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => undefined)
-          if (!currentStat || processGroupIDFromStat(currentStat) !== pgid) return
+          if (!hasIdentity(identity)) {
+            const currentStat = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => undefined)
+            if (currentStat && isLiveProcessStat(currentStat) && processGroupIDFromStat(currentStat) === pgid)
+              complete = false
+            return
+          }
+          const currentStat = await readFile(`/proc/${pid}/stat`, "utf8").catch((error) => {
+            if (error instanceof Error && "code" in error && (error.code === "EACCES" || error.code === "EPERM"))
+              complete = false
+            return undefined
+          })
+          if (!currentStat || !isLiveProcessStat(currentStat) || processGroupIDFromStat(currentStat) !== pgid) return
           const currentIdentity = EventWriter.readIdentity(pid)
-          if (!sameIdentity(identity, currentIdentity)) return
+          if (!sameIdentity(identity, currentIdentity)) {
+            complete = false
+            return
+          }
           return identity
         })(),
       ]
     }),
   )
-  return identities.filter((identity): identity is EventWriter.ProcessIdentity => identity !== undefined)
+  return {
+    members: identities.filter((identity): identity is EventWriter.ProcessIdentity => identity !== undefined),
+    complete,
+  }
 }

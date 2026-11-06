@@ -700,7 +700,7 @@ describe("cross-spawn spawner", () => {
 
   describe("process control", () => {
     fx.live(
-      "signals a live process group when its identity reader is unavailable",
+      "decides to use the live-PGID fallback when identity is unavailable",
       Effect.gen(function* () {
         if (process.platform === "win32") return
 
@@ -723,8 +723,10 @@ describe("cross-spawn spawner", () => {
         recorded.members.push(identity)
         recordProcess(pgid, identity)
 
-        expect(ProcessGroup.signalGroup(pgid, [identity], "SIGKILL", () => undefined)).toBe(true)
-        expect(yield* Effect.promise(() => groupGone(pgid))).toBe(true)
+        expect(
+          ProcessGroup.decideGroupOwnership({ pgid, identities: [identity], readIdentity: () => undefined }),
+        ).toEqual({ action: "signal", evidence: "unavailable" })
+        expect(groupAlive(pgid)).toBe(true)
       }),
     )
 

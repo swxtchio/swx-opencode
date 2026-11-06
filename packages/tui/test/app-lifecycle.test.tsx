@@ -9,6 +9,7 @@ import path from "node:path"
 import { tmpdir } from "./fixture/fixture"
 import { createTuiResolvedConfig } from "./fixture/tui-runtime"
 import { createEventSource, createFetch, directory, json } from "./fixture/tui-sdk"
+import { processGroupMember, sameProcess } from "../../core/test/fixture/process-group"
 
 type SighupFixtureMode = "terminal" | "nohup" | "non-tty"
 type SighupFixtureResult =
@@ -34,6 +35,32 @@ type SighupFixtureResult =
       sighupHandlerAdded: false
       exitCode: number
     }
+
+type PipeDrain = { type: "drained"; stdout: string; stderr: string } | { type: "timeout" }
+
+async function drainPipeOutput(output: Promise<[string, string]>, timeoutMs: number): Promise<PipeDrain> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const drained = await Promise.race([
+    output.then(([stdout, stderr]) => ({ type: "drained" as const, stdout, stderr })),
+    new Promise<{ type: "timeout" }>((resolve) => {
+      timer = setTimeout(() => resolve({ type: "timeout" }), timeoutMs)
+    }),
+  ])
+  if (timer) clearTimeout(timer)
+  return drained
+}
+
+async function bounded<T>(promise: Promise<T>, timeoutMs: number): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const value = await Promise.race([
+    promise,
+    new Promise<undefined>((resolve) => {
+      timer = setTimeout(() => resolve(undefined), timeoutMs)
+    }),
+  ])
+  if (timer) clearTimeout(timer)
+  return value
+}
 
 async function runSighupFixture(mode: SighupFixtureMode): Promise<SighupFixtureResult> {
   if (process.platform !== "linux") throw new Error("SIGHUP process fixture requires Linux")
@@ -82,14 +109,30 @@ async function runSighupFixture(mode: SighupFixtureMode): Promise<SighupFixtureR
   if (!launcherIdentity?.bootID || !launcherIdentity.startTicks)
     throw new Error("SIGHUP launcher has no recorded start identity")
   let workerIdentity: EventWriter.ProcessIdentity | undefined
-  const sameProcess = (identity: EventWriter.ProcessIdentity) => {
-    const current = EventWriter.readIdentity(identity.pid)
-    return current?.bootID === identity.bootID && current?.startTicks === identity.startTicks
-  }
   const output = Promise.all([new Response(worker.stdout).text(), new Response(worker.stderr).text()])
+  const drainOutput = () => drainPipeOutput(output, 5_000)
+  const cleanupOwned = () => {
+    if (workerIdentity && sameProcess(workerIdentity)) {
+      try {
+        process.kill(workerIdentity.pid, "SIGKILL")
+      } catch {}
+    }
+    if (processGroupMember(launcherIdentity.pid, launcherIdentity)) {
+      try {
+        process.kill(-launcherIdentity.pid, "SIGKILL")
+      } catch {}
+      return
+    }
+    if (sameProcess(launcherIdentity)) {
+      try {
+        process.kill(launcherIdentity.pid, "SIGKILL")
+      } catch {}
+    }
+  }
   let result: SighupFixtureResult | undefined
   let failure: unknown
   let diagnostics = ""
+  let outputDrain: Awaited<ReturnType<typeof drainOutput>> | undefined
 
   try {
     const readyDeadline = Date.now() + 15_000
@@ -122,10 +165,7 @@ async function runSighupFixture(mode: SighupFixtureMode): Promise<SighupFixtureR
           }
         }
       } catch {}
-      if (!ready && !sameProcess(launcherIdentity)) {
-        const [stdout, stderr] = await output
-        throw new Error(`SIGHUP launcher exited before ready:\n${stdout}\n${stderr}`)
-      }
+      if (!ready && !sameProcess(launcherIdentity)) throw new Error("SIGHUP launcher exited before ready")
       if (!ready) await new Promise((resolve) => setTimeout(resolve, 20))
     }
     if (!ready) throw new Error("SIGHUP fixture did not report its readiness")
@@ -198,7 +238,11 @@ async function runSighupFixture(mode: SighupFixtureMode): Promise<SighupFixtureR
       ])
       if (timer) clearTimeout(timer)
       if (exitCode === undefined) throw new Error("SIGHUP worker did not finish its owned lifecycle")
-      const [stdout, stderr] = await output
+      cleanupOwned()
+      outputDrain = await drainOutput()
+      if (outputDrain.type === "timeout")
+        throw new Error("SIGHUP launcher exited while a writer still held stdout/stderr open after 5 seconds")
+      const { stdout, stderr } = outputDrain
       if (exitCode !== 0) throw new Error(`SIGHUP worker exited ${exitCode}: ${stdout}\n${stderr}`)
 
       const value: unknown = await Bun.file(resultFile).json()
@@ -243,16 +287,7 @@ async function runSighupFixture(mode: SighupFixtureMode): Promise<SighupFixtureR
   } catch (error) {
     failure = error
   } finally {
-    if (workerIdentity && sameProcess(workerIdentity)) {
-      try {
-        process.kill(workerIdentity.pid, "SIGKILL")
-      } catch {}
-    }
-    if (sameProcess(launcherIdentity)) {
-      try {
-        process.kill(launcherIdentity.pid, "SIGKILL")
-      } catch {}
-    }
+    cleanupOwned()
     let timer: ReturnType<typeof setTimeout> | undefined
     const closed = await Promise.race([
       worker.exited,
@@ -261,9 +296,14 @@ async function runSighupFixture(mode: SighupFixtureMode): Promise<SighupFixtureR
       }),
     ])
     if (timer) clearTimeout(timer)
-    const [stdout, stderr] = await output
-    diagnostics = `worker exit=${closed ?? "unconfirmed"}\n${stdout}\n${stderr}`
+    outputDrain ??= await drainOutput()
+    diagnostics =
+      outputDrain.type === "drained"
+        ? `worker exit=${closed ?? "unconfirmed"}\n${outputDrain.stdout}\n${outputDrain.stderr}`
+        : `worker exit=${closed ?? "unconfirmed"}\nstdout/stderr did not drain within 5 seconds`
     if (closed === undefined && failure === undefined) failure = new Error("SIGHUP worker survived fixture cleanup")
+    if (outputDrain.type === "timeout" && failure === undefined)
+      failure = new Error("SIGHUP launcher exited while a writer still held stdout/stderr open after 5 seconds")
   }
   if (failure) throw new Error(`${failure instanceof Error ? failure.message : String(failure)}\n${diagnostics}`, { cause: failure })
   if (!result) throw new Error(`SIGHUP fixture returned no result\n${diagnostics}`)
@@ -302,6 +342,58 @@ test("non-TTY listener policy leaves SIGHUP at the OS default", async () => {
     sighupHandlerAdded: false,
     exitCode: 129,
   })
+})
+
+test("SIGHUP output drain is bounded when a writer outlives its launcher", async () => {
+  if (process.platform !== "linux") return
+  await using temp = await tmpdir()
+  const writerPIDFile = path.join(temp.path, "writer.pid")
+  const exitFile = path.join(temp.path, "launcher.exit")
+  const program = [
+    "import os,subprocess,time",
+    "writer=subprocess.Popen(['sleep','30'])",
+    `open(${JSON.stringify(writerPIDFile)},"w").write(str(writer.pid))`,
+    `while not os.path.exists(${JSON.stringify(exitFile)}): time.sleep(0.01)`,
+  ].join("\n")
+  const launcher = Bun.spawn(["python3", "-c", program], {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    detached: true,
+  })
+  const identity = EventWriter.readIdentity(launcher.pid)
+  if (!identity?.bootID || !identity.startTicks) throw new Error("pipe fixture launcher has no process identity")
+  let writerIdentity: EventWriter.ProcessIdentity | undefined
+  const output = Promise.all([new Response(launcher.stdout).text(), new Response(launcher.stderr).text()])
+  try {
+    const writerPID = await bounded(
+      (async () => {
+        while (!(await Bun.file(writerPIDFile).exists())) await Bun.sleep(20)
+        return Number((await Bun.file(writerPIDFile).text()).trim())
+      })(),
+      5_000,
+    )
+    if (!writerPID) throw new Error("pipe fixture did not start its inherited writer")
+    writerIdentity = EventWriter.readIdentity(writerPID)
+    if (!writerIdentity?.bootID || !writerIdentity.startTicks)
+      throw new Error("pipe fixture writer has no process identity")
+    await Bun.write(exitFile, "exit")
+    expect(await bounded(launcher.exited, 5_000)).toBe(0)
+    expect(await drainPipeOutput(output, 100)).toEqual({ type: "timeout" })
+  } finally {
+    if (writerIdentity && sameProcess(writerIdentity)) {
+      try {
+        process.kill(writerIdentity.pid, "SIGKILL")
+      } catch {}
+    }
+    if (processGroupMember(launcher.pid, identity)) {
+      try {
+        process.kill(-launcher.pid, "SIGKILL")
+      } catch {}
+    }
+    await bounded(launcher.exited, 5_000)
+    expect((await drainPipeOutput(output, 5_000)).type).toBe("drained")
+  }
 })
 
 test("app.exit prints the session epilogue after scoped cleanup", async () => {

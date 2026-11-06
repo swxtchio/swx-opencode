@@ -26,7 +26,13 @@ import * as NodeChildProcess from "node:child_process"
 import { PassThrough } from "node:stream"
 import launch from "cross-spawn"
 import { EventWriter } from "./event/writer"
-import { isAlive, readGroupMembers, signalGroup } from "./process-group"
+import {
+  decideGroupOwnership,
+  hasIdentity,
+  readGroupMembers,
+  sameProcess,
+  signalGroup,
+} from "./process-group"
 import { makeGlobalNode } from "./effect/app-node"
 import { filesystem, path } from "./effect/app-node-platform"
 
@@ -36,6 +42,9 @@ type OwnedProcessGroup = {
   identity: EventWriter.ProcessIdentity
   cleanupOwed: boolean
   members: EventWriter.ProcessIdentity[]
+  membersPending: boolean
+  membersSnapshotComplete: boolean
+  generation: number
 }
 type GroupOwner = { value: OwnedProcessGroup | undefined }
 type CleanupRequest = { value: { killSignal: NodeJS.Signals; forceKillAfter: Duration.Input } | undefined }
@@ -44,6 +53,10 @@ export type ProcessGroupEvent = {
   readonly pgid: number
   readonly cleanupOwed: boolean
   readonly identity: EventWriter.ProcessIdentity
+  readonly members?: ReadonlyArray<EventWriter.ProcessIdentity>
+  readonly membersPending?: boolean
+  readonly membersSnapshotComplete?: boolean
+  readonly generation?: number
 }
 type ProcessGroupObserver = (event: ProcessGroupEvent) => Promise<void>
 
@@ -51,7 +64,10 @@ const groups = new Set<OwnedProcessGroup>()
 let exitHooked = false
 let processGroupObserver: ProcessGroupObserver | undefined
 const killGroups = () =>
-  groups.forEach((group) => signalGroup(group.pid, [group.identity, ...group.members], "SIGKILL"))
+  groups.forEach((group) => {
+    const decision = signalGroup(groupOwnershipInput(group), "SIGKILL")
+    if (decision.action === "prune") groups.delete(group)
+  })
 
 export function setProcessGroupObserver(observer: ProcessGroupObserver | undefined) {
   processGroupObserver = observer
@@ -72,42 +88,119 @@ function notifyProcessGroup(event: ProcessGroupEvent) {
 }
 
 function processGroupEvent(group: OwnedProcessGroup, action: ProcessGroupEvent["action"]): ProcessGroupEvent {
-  return { action, pgid: group.pid, cleanupOwed: group.cleanupOwed, identity: group.identity }
+  return {
+    action,
+    pgid: group.pid,
+    cleanupOwed: group.cleanupOwed,
+    identity: group.identity,
+    members: group.members,
+    membersPending: group.membersPending,
+    membersSnapshotComplete: group.membersSnapshotComplete,
+    generation: group.generation,
+  }
+}
+
+function groupOwnershipInput(group: OwnedProcessGroup) {
+  return {
+    pgid: group.pid,
+    identities: [group.identity, ...group.members],
+    cleanupOwed: group.cleanupOwed,
+    membersPending: group.membersPending,
+  }
 }
 
 function releaseGroup(group: OwnedProcessGroup) {
-  groups.delete(group)
+  if (!groups.delete(group)) return
   group.cleanupOwed = false
-  notifyProcessGroup(processGroupEvent(group, "release"))
+  group.membersPending = false
+  group.membersSnapshotComplete = true
+  group.generation++
+  return notifyProcessGroup(processGroupEvent(group, "release"))
 }
 
-async function rememberGroupMembers(group: OwnedProcessGroup) {
+async function rememberGroupMembers(group: OwnedProcessGroup, generation: number) {
+  const pendingLeader = group.cleanupOwed && hasIdentity(group.identity) && !sameProcess(group.identity)
+  group.membersPending = pendingLeader
+  group.membersSnapshotComplete = false
   const discovered = await readGroupMembers(group.pid, group.identity)
+  if (!groups.has(group) || group.generation !== generation) return { action: "prune", evidence: "gone" } as const
   const members = new Map(group.members.map((member) => [member.pid, member] as const))
-  discovered.forEach((member) => members.set(member.pid, member))
+  discovered.members.forEach((member) => members.set(member.pid, member))
   group.members = [...members.values()]
+  group.membersPending = pendingLeader && !discovered.complete
+  group.membersSnapshotComplete = discovered.complete
+  return decideGroupOwnership(groupOwnershipInput(group))
 }
 
 export async function shutdownOwnedProcessGroups() {
   if (globalThis.process.platform === "win32") return
   const owned = [...groups]
   if (!owned.length) return
+  const releaseNotifications: Promise<void>[] = []
   const announcements = owned.map((group) => {
     group.cleanupOwed = true
-    return notifyProcessGroup(processGroupEvent(group, "acquire"))
+    group.generation++
+    group.membersPending = hasIdentity(group.identity) && !sameProcess(group.identity)
+    group.membersSnapshotComplete = false
+    const ownership = {
+      pgid: group.pid,
+      identities: [group.identity, ...group.members],
+      cleanupOwed: group.cleanupOwed,
+      membersPending: group.membersPending,
+    }
+    const decision = decideGroupOwnership(ownership)
+    const announcement = notifyProcessGroup(processGroupEvent(group, "acquire"))
+    if (decision.action === "prune") {
+      const release = releaseGroup(group)
+      if (release) releaseNotifications.push(release.catch(() => {}))
+    }
+    if (decision.action === "signal" && decision.evidence === "pending") signalGroup(ownership, "SIGKILL")
+    return { group, generation: group.generation, decision, ownership, announcement }
   })
-  await Promise.all(announcements.map((notification) => notification?.catch(() => {})))
-  await Promise.all(owned.map((group) => rememberGroupMembers(group).catch(() => {})))
-  owned.forEach((group) => signalGroup(group.pid, [group.identity, ...group.members], "SIGKILL"))
+  await Promise.all(
+    announcements.map(async (item) => {
+      await item.announcement?.catch(() => {})
+      if (!groups.has(item.group) || item.group.generation !== item.generation) return
+      if (item.decision.action === "prune") return
+      if (item.decision.evidence !== "pending") {
+        const decision = signalGroup(item.ownership, "SIGKILL")
+        if (decision.action === "prune") {
+          await releaseGroup(item.group)?.catch(() => {})
+          return
+        }
+      }
+      const snapshot = await rememberGroupMembers(item.group, item.generation).catch(
+        () => ({ action: "signal", evidence: "pending" }) as const,
+      )
+      if (!groups.has(item.group) || item.group.generation !== item.generation) return
+      if (snapshot.action === "prune") {
+        await releaseGroup(item.group)?.catch(() => {})
+        return
+      }
+      const resolved = signalGroup(groupOwnershipInput(item.group), "SIGKILL")
+      if (resolved.action === "prune") await releaseGroup(item.group)?.catch(() => {})
+    }),
+  )
   const deadline = Date.now() + 5_000
   while (true) {
-    const survivors = owned.filter((group) => isAlive(group.pid))
+    const survivors = (
+      await Promise.all(
+        owned.map(async (group) => {
+          if (!groups.has(group)) return undefined
+          if (decideGroupOwnership(groupOwnershipInput(group)).action === "prune") {
+            await releaseGroup(group)?.catch(() => {})
+            return undefined
+          }
+          return group
+        }),
+      )
+    ).filter((group): group is OwnedProcessGroup => group !== undefined)
     if (!survivors.length) break
     if (Date.now() >= deadline)
       throw new Error(`Worker process groups survived shutdown: ${survivors.map((group) => group.pid).join(", ")}`)
     await new Promise((resolve) => setTimeout(resolve, 20))
   }
-  owned.forEach(releaseGroup)
+  await Promise.all([...releaseNotifications, ...owned.map((group) => releaseGroup(group)?.catch(() => {}))])
 }
 
 const toError = (err: unknown): Error => (err instanceof globalThis.Error ? err : new globalThis.Error(String(err)))
@@ -375,9 +468,21 @@ export const make = Effect.gen(function* () {
             cleanupRequest.value !== undefined ||
             (Predicate.isNotUndefined(command.options.forceKillAfter) && abnormal)
           if (group.cleanupOwed) {
+            group.generation++
+            group.membersPending = hasIdentity(group.identity) && !sameProcess(group.identity)
+            group.membersSnapshotComplete = false
+            const generation = group.generation
             const notification = notifyProcessGroup(processGroupEvent(group, "acquire"))
             if (notification) void notification.catch(() => {})
-            void rememberGroupMembers(group).catch(() => {})
+            void rememberGroupMembers(group, generation)
+              .then((decision) => {
+                if (!groups.has(group) || group.generation !== generation) return
+                if (decision.action === "prune") {
+                  releaseGroup(group)
+                  return
+                }
+              })
+              .catch(() => {})
           } else releaseGroup(group)
         }
         exit = args
@@ -394,6 +499,9 @@ export const make = Effect.gen(function* () {
             identity: EventWriter.readIdentity(proc.pid) ?? { pid: proc.pid, bootID: null, startTicks: null },
             cleanupOwed: false,
             members: [],
+            membersPending: false,
+            membersSnapshotComplete: false,
+            generation: 0,
           }
           groupOwner.value = group
           groups.add(group)
@@ -411,10 +519,44 @@ export const make = Effect.gen(function* () {
                   return
                 }
                 group.cleanupOwed = true
+                group.generation++
+                group.membersPending = hasIdentity(group.identity) && !sameProcess(group.identity)
+                group.membersSnapshotComplete = false
                 groups.add(group)
-                notifyProcessGroup(processGroupEvent(group, "acquire"))
-                await rememberGroupMembers(group).catch(() => {})
-                signalGroup(group.pid, [group.identity, ...group.members], "SIGKILL")
+                const generation = group.generation
+                const ownership = groupOwnershipInput(group)
+                const decision = decideGroupOwnership(ownership)
+                const announcement = notifyProcessGroup(processGroupEvent(group, "acquire"))
+                if (decision.action === "prune") {
+                  releaseGroup(group)
+                  resume(Effect.fail(toPlatformError("spawn", toError(error), command)))
+                  return
+                }
+                if (decision.evidence === "pending") {
+                  signalGroup(ownership, "SIGKILL")
+                } else {
+                  await announcement?.catch(() => {})
+                  const signalled = signalGroup(ownership, "SIGKILL")
+                  if (signalled.action === "prune") {
+                    releaseGroup(group)
+                    resume(Effect.fail(toPlatformError("spawn", toError(error), command)))
+                    return
+                  }
+                }
+                const snapshot = await rememberGroupMembers(group, generation).catch(
+                  () => ({ action: "signal", evidence: "pending" }) as const,
+                )
+                if (!groups.has(group) || group.generation !== generation) {
+                  resume(Effect.fail(toPlatformError("spawn", toError(error), command)))
+                  return
+                }
+                if (snapshot.action === "prune") {
+                  releaseGroup(group)
+                  resume(Effect.fail(toPlatformError("spawn", toError(error), command)))
+                  return
+                }
+                const resolved = signalGroup(groupOwnershipInput(group), "SIGKILL")
+                if (resolved.action === "prune") releaseGroup(group)
                 void Effect.runPromise(waitForGroup(group.pid, Duration.seconds(5))).then(
                   (gone) => {
                     if (gone) releaseGroup(group)
@@ -552,8 +694,18 @@ export const make = Effect.gen(function* () {
     const group = groupOwner.value
     if (group) {
       group.cleanupOwed = true
+      group.generation++
+      group.membersPending = hasIdentity(group.identity) && !sameProcess(group.identity)
+      group.membersSnapshotComplete = false
       groups.add(group)
+      const generation = group.generation
       notifyProcessGroup(processGroupEvent(group, "acquire"))
+      void rememberGroupMembers(group, generation)
+        .then((decision) => {
+          if (!groups.has(group) || group.generation !== generation) return
+          if (decision.action === "prune") releaseGroup(group)
+        })
+        .catch(() => {})
     }
     const send = (next: NodeJS.Signals) => {
       if (process.platform === "win32") return killGroup(command, proc, next)
