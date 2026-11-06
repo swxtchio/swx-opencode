@@ -5,11 +5,11 @@ import path from "path"
 import { fileURLToPath } from "url"
 import { UI } from "@/cli/ui"
 import { errorMessage } from "@opencode-ai/tui/util/error"
-import { withTimeout } from "@/util/timeout"
 import { withNetworkOptions, resolveNetworkOptionsNoConfig, hasArg } from "@/cli/network"
 import { Filesystem } from "@/util/filesystem"
 import type { GlobalEvent } from "@opencode-ai/sdk/v2"
 import type { EventSource } from "@opencode-ai/tui/context/sdk"
+import { ProcessGroup } from "../tui/process-group"
 import { writeHeapSnapshot } from "v8"
 import { ServerAuth } from "@/server/auth"
 import { validateSession } from "../tui/validate-session"
@@ -193,6 +193,8 @@ export const TuiThreadCommand = cmd({
     }
 
     const unguard = win32InstallCtrlCGuard()
+    let stopWorker: (() => Promise<void>) | undefined
+    let runStarted = false
     try {
       const { TuiConfig } = await import("@/config/tui")
       if (args.fork && !args.continue && !args.session) {
@@ -219,18 +221,36 @@ export const TuiThreadCommand = cmd({
         ),
       })
       const client = Rpc.client<typeof rpc>(worker)
+      const owner = ProcessGroup.makeOwner({
+        client: {
+          subscribe: (handler) => client.on<ProcessGroup.Event>("process.group", handler),
+          acknowledge: async (eventID) => client.call("ackProcessGroup", { eventID }),
+          shutdown: async () => client.call("shutdown", undefined),
+        },
+        worker,
+      })
       const reload = () => {
         client.call("reload", undefined).catch(() => {})
       }
       process.on("SIGUSR2", reload)
 
-      let stopped = false
-      const stop = async () => {
-        if (stopped) return
-        stopped = true
+      stopWorker = async () => {
         process.off("SIGUSR2", reload)
-        await withTimeout(client.call("shutdown", undefined), 5000).catch(() => {})
-        worker.terminate()
+        await owner.stop()
+        const stoppedFile = process.env.SWX_TUI_GROUP_TUI_STOP_FILE
+        if (process.env.OPENCODE_TEST_HOME && process.env.SWX_TUI_GROUP_TUI_TEST === "1" && stoppedFile)
+          await Bun.write(stoppedFile, "stopped")
+      }
+
+      if (process.env.OPENCODE_TEST_HOME && process.env.SWX_TUI_GROUP_TUI_TEST === "1") {
+        const readyFile = process.env.SWX_TUI_GROUP_TUI_READY_FILE
+        if (!readyFile) throw new Error("TUI process-group test readiness file is missing")
+        const group = await client.call("testSpawnProcessGroup", {
+          resistTerm: true,
+          blockShutdown: false,
+          exitMode: "long",
+        })
+        await Bun.write(readyFile, JSON.stringify(group))
       }
 
       const prompt = await input(args.prompt)
@@ -276,6 +296,7 @@ export const TuiThreadCommand = cmd({
         const { Effect } = await import("effect")
         const { run } = await import("../tui/layer")
         const { createLegacyTuiPluginHost } = await import("@/plugin/tui/runtime")
+        runStarted = true
         await Effect.runPromise(
           run({
             url: transport.url,
@@ -303,12 +324,21 @@ export const TuiThreadCommand = cmd({
           }),
         )
       } finally {
-        await stop()
+        await stopWorker?.()
       }
     } finally {
       try {
-        unguard?.()
-      } catch {}
+        if (stopWorker && !runStarted) await stopWorker()
+      } finally {
+        try {
+          unguard?.()
+        } catch {}
+      }
+    }
+    const testExitGate = process.env.SWX_TUI_GROUP_TUI_EXIT_GATE_FILE
+    if (process.env.OPENCODE_TEST_HOME && process.env.SWX_TUI_GROUP_TUI_TEST === "1" && testExitGate) {
+      const deadline = Date.now() + 30_000
+      while (Date.now() < deadline && !(await Bun.file(testExitGate).exists())) await Bun.sleep(20)
     }
     process.exit()
   },

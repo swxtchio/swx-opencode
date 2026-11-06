@@ -1,6 +1,5 @@
 import { afterEach, describe, expect } from "bun:test"
 import fs from "node:fs/promises"
-import { readFileSync, readdirSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { Cause, Deferred, Duration, Effect, Exit, Fiber, Option, Stream } from "effect"
@@ -8,9 +7,11 @@ import type * as PlatformError from "effect/PlatformError"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import type { ChildProcessHandle } from "effect/unstable/process/ChildProcessSpawner"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { ProcessGroup } from "@opencode-ai/core/process-group"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventWriter } from "@opencode-ai/core/event/writer"
 import { testEffect } from "../lib/effect"
+import { groupAlive, processChildren, processGroupMembers, processIdentity, sameProcess } from "../fixture/process-group"
 
 const live = LayerNode.compile(CrossSpawnSpawner.node)
 const fx = testEffect(live)
@@ -62,15 +63,6 @@ async function gone(pid: number, timeout = 5_000) {
   return !alive(pid)
 }
 
-function groupAlive(pgid: number) {
-  try {
-    process.kill(-pgid, 0)
-    return true
-  } catch (error) {
-    return !(error instanceof Error && "code" in error && error.code === "ESRCH")
-  }
-}
-
 async function groupGone(pgid: number, timeout = 5_000) {
   const end = Date.now() + timeout
   while (Date.now() < end) {
@@ -78,15 +70,6 @@ async function groupGone(pgid: number, timeout = 5_000) {
     await new Promise((resolve) => setTimeout(resolve, 20))
   }
   return !groupAlive(pgid)
-}
-
-function processIdentity(pid: number) {
-  const identity = EventWriter.readIdentity(pid)
-  if (identity?.bootID && identity.startTicks) return identity
-  const started = Bun.spawnSync(["ps", "-p", String(pid), "-o", "lstart="])
-    .stdout.toString()
-    .trim()
-  return started ? { pid, bootID: "ps", startTicks: started } : undefined
 }
 
 const writeAtomically = (filename: string, contents: string) =>
@@ -108,14 +91,8 @@ const ownerProbe = (value: unknown): { pgid: number; child: number } | undefined
 
 const processIdentityRecord = (value: unknown): value is EventWriter.ProcessIdentity => {
   if (typeof value !== "object" || value === null) return false
-  const result = value as Record<string, unknown>
-  return (
-    positivePID(result.pid) &&
-    typeof result.bootID === "string" &&
-    result.bootID.length > 0 &&
-    typeof result.startTicks === "string" &&
-    result.startTicks.length > 0
-  )
+  const identity = processIdentity(value)
+  return Boolean(identity?.bootID && identity.startTicks)
 }
 
 const identityProbe = (value: unknown): { pgid: number; members: EventWriter.ProcessIdentity[] } | undefined => {
@@ -169,11 +146,6 @@ const readReadySignal = async (filename: string, timeout = 5_000) => {
   throw new Error("fixture ready signal was not atomically published")
 }
 
-function sameProcess(identity: EventWriter.ProcessIdentity) {
-  const current = processIdentity(identity.pid)
-  return current?.bootID === identity.bootID && current?.startTicks === identity.startTicks
-}
-
 async function processExited(identity: EventWriter.ProcessIdentity, timeout = 5_000) {
   const end = Date.now() + timeout
   while (Date.now() < end) {
@@ -210,58 +182,6 @@ const recordProcess = (pgid: number, identity: EventWriter.ProcessIdentity) => {
   const group = ownedProcessGroups.get(pgid) ?? { pgid, members: new Map<number, EventWriter.ProcessIdentity>() }
   ownedProcessGroups.set(pgid, group)
   group.members.set(identity.pid, identity)
-}
-
-const processGroupMembers = (pgid: number) => {
-  if (process.platform === "linux") {
-    return readdirSync("/proc").flatMap((entry) => {
-      if (!/^\d+$/.test(entry)) return []
-      const pid = Number(entry)
-      let stat: string
-      try {
-        stat = readFileSync(`/proc/${pid}/stat`, "utf8")
-      } catch {
-        return []
-      }
-      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ")
-      return Number(fields[2]) === pgid ? [pid] : []
-    })
-  }
-  const result = Bun.spawnSync(["ps", "-e", "-o", "pid=,pgid="])
-  if (result.exitCode !== 0) throw new Error(`could not inspect process group ${pgid}`)
-  return result.stdout
-    .toString()
-    .split("\n")
-    .flatMap((line) => {
-      const [pid, group] = line.trim().split(/\s+/).map(Number)
-      return pid && group === pgid ? [pid] : []
-    })
-}
-
-const processChildren = (parentPID: number) => {
-  if (process.platform === "linux") {
-    return readdirSync("/proc").flatMap((entry) => {
-      if (!/^\d+$/.test(entry)) return []
-      const pid = Number(entry)
-      let stat: string
-      try {
-        stat = readFileSync(`/proc/${pid}/stat`, "utf8")
-      } catch {
-        return []
-      }
-      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ")
-      return Number(fields[1]) === parentPID ? [pid] : []
-    })
-  }
-  const result = Bun.spawnSync(["ps", "-e", "-o", "pid=,ppid="])
-  if (result.exitCode !== 0) throw new Error(`could not inspect children of process ${parentPID}`)
-  return result.stdout
-    .toString()
-    .split("\n")
-    .flatMap((line) => {
-      const [pid, parent] = line.trim().split(/\s+/).map(Number)
-      return pid && parent === parentPID ? [pid] : []
-    })
 }
 
 const recoverDetachedChild = (parent: EventWriter.ProcessIdentity, group: RecordedProcessGroup) =>
@@ -488,6 +408,106 @@ const processTreeReady = (
     return identity
   })
 
+type OwnerExitMode = "live" | "cleanup-owed" | "released"
+
+const ownerExitProbe = (mode: OwnerExitMode) =>
+  Effect.gen(function* () {
+    if (process.platform === "win32") return
+
+    const temp = yield* Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (temp) => Effect.promise(() => temp[Symbol.asyncDispose]()).pipe(Effect.asVoid),
+    )
+    const identityFile = path.join(temp.path, "group.json")
+    const releaseFile = path.join(temp.path, "release")
+    const worker = Bun.spawn(
+      [
+        process.execPath,
+        "test",
+        "--timeout",
+        "30000",
+        "./test/effect/cross-spawn-spawner.test.ts",
+        "-t",
+        "Core process-tree boundary worker",
+      ],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          SWX_CORE_SPAWNER_PROBE_MODE: `owner-exit-${mode}`,
+          SWX_CORE_SPAWNER_PROBE_FILE: identityFile,
+          SWX_CORE_SPAWNER_READY_FILE: releaseFile,
+        },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    )
+    const workerIdentity = processIdentity(worker.pid)
+    if (!workerIdentity?.bootID || !workerIdentity.startTicks)
+      throw new Error("process-tree owner-exit worker has no recorded start identity")
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        if (!sameProcess(workerIdentity)) return
+        try {
+          process.kill(workerIdentity.pid, "SIGKILL")
+        } catch {}
+      }),
+    )
+    const output = Promise.all([new Response(worker.stdout).text(), new Response(worker.stderr).text()])
+    const probe = yield* Effect.promise(async () => {
+      const deadline = Date.now() + 15_000
+      while (Date.now() < deadline) {
+        const result = await readIdentityRecord(identityFile)
+        if (result) return result
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      }
+      throw new Error(`owner-exit fixture did not publish its ${mode} process group`)
+    })
+    if (probe.members.length !== 2) throw new Error(`owner-exit fixture recorded ${probe.members.length} group members`)
+    const pgid = probe.pgid
+    const leader = probe.members.find((member) => member.pid === pgid)
+    const descendant = probe.members.find((member) => member.pid !== pgid)
+    if (!leader || !descendant) throw new Error("owner-exit fixture did not record its leader and descendant")
+    const ownership: RecordedProcessGroup = { pgid, members: probe.members }
+    ownership.members.forEach((member) => recordProcess(pgid, member))
+    yield* Effect.addFinalizer(() => cleanupRecordedProcessGroup(ownership))
+
+    const beforeExit = {
+      groupAlive: groupAlive(pgid),
+      leaderAlive: sameProcess(leader),
+      descendantAlive: sameProcess(descendant),
+    }
+    expect(beforeExit).toEqual(
+      mode === "live"
+        ? { groupAlive: true, leaderAlive: true, descendantAlive: true }
+        : { groupAlive: true, leaderAlive: false, descendantAlive: true },
+    )
+
+    yield* writeAtomically(releaseFile, "ready")
+    const exitCode = yield* Effect.promise(() => worker.exited).pipe(Effect.timeout("20 seconds"))
+    const outputText = (yield* Effect.promise(() => output)).join("\n")
+    if (exitCode !== 0) throw new Error(`owner-exit worker failed (${exitCode}): ${outputText}`)
+
+    if (mode === "released") {
+      expect({
+        groupAlive: groupAlive(pgid),
+        leaderAlive: sameProcess(leader),
+        descendantAlive: sameProcess(descendant),
+      }).toEqual({ groupAlive: true, leaderAlive: false, descendantAlive: true })
+      yield* cleanupRecordedProcessGroup(ownership)
+      expect(yield* Effect.promise(() => groupGone(pgid))).toBe(true)
+      return
+    }
+
+    const gone = yield* Effect.promise(() => groupGone(pgid))
+    expect({
+      groupGone: gone,
+      leaderAlive: sameProcess(leader),
+      descendantAlive: sameProcess(descendant),
+    }).toEqual({ groupGone: true, leaderAlive: false, descendantAlive: false })
+  })
+
 describe("cross-spawn spawner", () => {
   describe("basic spawning", () => {
     fx.effect(
@@ -679,6 +699,73 @@ describe("cross-spawn spawner", () => {
   })
 
   describe("process control", () => {
+    fx.live(
+      "decides to use the live-PGID fallback when identity is unavailable",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+
+        const recorded: RecordedProcessGroup = { pgid: undefined, members: [] }
+        yield* Effect.addFinalizer(() => cleanupRecordedProcessGroup(recorded))
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+        const handle = yield* spawner.spawn(
+          js('process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)', {
+            detached: true,
+            stdin: "ignore",
+            stdout: "ignore",
+            stderr: "ignore",
+            forceKillAfter: "3 seconds",
+          }),
+        )
+        const pgid = Number(handle.pid)
+        recorded.pgid = pgid
+        const identity = processIdentity(pgid)
+        if (!identity) throw new Error("identity fallback fixture has no process identity")
+        recorded.members.push(identity)
+        recordProcess(pgid, identity)
+
+        expect(
+          ProcessGroup.decideGroupOwnership({ pgid, identities: [identity], readIdentity: () => undefined }),
+        ).toEqual({ action: "signal", evidence: "unavailable" })
+        expect(groupAlive(pgid)).toBe(true)
+      }),
+    )
+
+    fx.live(
+      "refutes a reused live leader before honoring a pending snapshot",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+
+        const group: RecordedProcessGroup = { pgid: undefined, members: [] }
+        yield* Effect.addFinalizer(() => cleanupRecordedProcessGroup(group))
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+        const handle = yield* spawner.spawn(
+          js("setInterval(() => {}, 1000)", {
+            detached: true,
+            stdin: "ignore",
+            stdout: "ignore",
+            stderr: "ignore",
+          }),
+        )
+        const pgid = Number(handle.pid)
+        group.pgid = pgid
+        const identity = processIdentity(pgid)
+        if (!identity?.bootID || !identity.startTicks) throw new Error("reused-leader fixture has no identity")
+        group.members.push(identity)
+        recordProcess(pgid, identity)
+        const stale = { ...identity, startTicks: `${identity.startTicks}:stale` }
+
+        expect(groupAlive(pgid)).toBe(true)
+        expect(
+          ProcessGroup.decideGroupOwnership({
+            pgid,
+            identities: [stale],
+            cleanupOwed: true,
+            membersPending: true,
+          }),
+        ).toEqual({ action: "prune", evidence: "refuted" })
+      }),
+    )
+
     fx.effect(
       "kills a running process",
       Effect.gen(function* () {
@@ -943,6 +1030,47 @@ describe("cross-spawn spawner", () => {
       "Core process-tree boundary worker",
       Effect.gen(function* () {
         if (!timeoutProbeMode || process.platform === "win32") return
+        if (timeoutProbeMode.startsWith("owner-exit-")) {
+          if (!timeoutProbeFile || !timeoutProbeReadyFile)
+            throw new Error("owner-exit probe paths were not supplied")
+          const mode = timeoutProbeMode.slice("owner-exit-".length)
+          if (mode !== "live" && mode !== "cleanup-owed" && mode !== "released")
+            throw new Error(`unknown owner-exit mode: ${mode}`)
+          const source =
+            mode === "released"
+              ? processTreeSource(resistantDescendant, 'process.on("SIGUSR1", () => process.exit(0))')
+              : termExitingParent(resistantDescendant)
+          const handle = yield* js(source)
+          const pgid = Number(handle.pid)
+          const leader = processIdentity(pgid)
+          if (!leader?.bootID || !leader.startTicks) throw new Error("owner-exit worker leader has no start identity")
+          recordProcess(pgid, leader)
+          const descendant = yield* processTreeReady(handle, pgid)
+
+          if (mode === "cleanup-owed") {
+            yield* handle.kill({ forceKillAfter: "2 minutes" }).pipe(Effect.forkChild)
+            if (!(yield* Effect.promise(() => processExited(leader))))
+              throw new Error("cleanup-owed leader did not exit before owner handoff")
+          }
+          if (mode === "released") {
+            process.kill(pgid, "SIGUSR1")
+            expect(yield* handle.exitCode.pipe(Effect.timeout("5 seconds"))).toBe(ChildProcessSpawner.ExitCode(0))
+          }
+
+          const beforeExit = {
+            groupAlive: groupAlive(pgid),
+            leaderAlive: sameProcess(leader),
+            descendantAlive: sameProcess(descendant),
+          }
+          expect(beforeExit).toEqual(
+            mode === "live"
+              ? { groupAlive: true, leaderAlive: true, descendantAlive: true }
+              : { groupAlive: true, leaderAlive: false, descendantAlive: true },
+          )
+          yield* writeAtomically(timeoutProbeFile, JSON.stringify({ pgid, members: [leader, descendant] }))
+          yield* Effect.promise(() => readReadySignal(timeoutProbeReadyFile, 20_000))
+          process.exit(0)
+        }
         if (!timeoutProbeOwnerFile || !timeoutProbeFile || !timeoutProbeReadyFile)
           throw new Error("process-tree probe paths were not supplied")
 
@@ -967,7 +1095,7 @@ describe("cross-spawn spawner", () => {
         if (!sameProcess(leader) || !sameProcess(descendant)) throw new Error("timeout worker fixture was not live")
         if (timeoutProbeMode === "timeout") yield* Effect.never
       }),
-      timeoutProbeMode === "timeout" ? 5_000 : 15_000,
+      timeoutProbeMode === "timeout" ? 5_000 : timeoutProbeMode.startsWith("owner-exit-") ? 30_000 : 15_000,
     )
 
     fx.live(
@@ -1065,6 +1193,236 @@ describe("cross-spawn spawner", () => {
         yield* run("child-started")
       }),
       30_000,
+    )
+
+    fx.live(
+      "abrupt owner exit kills a live detached group",
+      ownerExitProbe("live"),
+      30_000,
+    )
+
+    fx.live(
+      "abrupt owner exit keeps a cleanup-owed group after its leader exits",
+      ownerExitProbe("cleanup-owed"),
+      30_000,
+    )
+
+    fx.live(
+      "abrupt owner exit leaves descendants released by leader exit",
+      ownerExitProbe("released"),
+      30_000,
+    )
+
+    fx.live(
+      "detached spawn releases its owner entry when acquire acknowledgement rejects or is delayed",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+        for (const mode of ["rejected", "delayed"] as const) {
+          let pgid: number | undefined
+          const events: CrossSpawnSpawner.ProcessGroupEvent[] = []
+          const releaseObserved = Promise.withResolvers<void>()
+          const group: RecordedProcessGroup = { pgid: undefined, members: [] }
+          yield* Effect.addFinalizer(() => cleanupRecordedProcessGroup(group))
+          CrossSpawnSpawner.setProcessGroupObserver(async (event) => {
+            events.push(event)
+            if (event.action === "release") releaseObserved.resolve()
+            if (event.action !== "acquire" || event.cleanupOwed) return
+            pgid = event.pgid
+            group.pgid = event.pgid
+            const leader = processIdentity(event.pgid)
+            if (leader) {
+              group.members.push(leader)
+              recordProcess(event.pgid, leader)
+            }
+            expect(groupAlive(event.pgid)).toBe(true)
+            if (mode === "delayed") await new Promise((resolve) => setTimeout(resolve, 25))
+            throw new Error(`injected ${mode} process-group acknowledgement failure`)
+          })
+          yield* Effect.addFinalizer(() => Effect.sync(() => CrossSpawnSpawner.setProcessGroupObserver(undefined)))
+          const result = yield* Effect.exit(
+            spawner.spawn(js("setInterval(() => {}, 1000)", { detached: true })).pipe(Effect.timeout("10 seconds")),
+          )
+          expect(Exit.isFailure(result)).toBe(true)
+          if (Exit.isFailure(result))
+            expect(Cause.prettyErrors(result.cause).join("\n")).toContain("ChildProcess.spawn")
+          if (pgid === undefined) throw new Error(`${mode} acquire acknowledgement was not observed`)
+          yield* Effect.promise(() => releaseObserved.promise).pipe(Effect.timeout("5 seconds"))
+          expect(events.at(-1)?.action).toBe("release")
+          expect(events.at(-1)?.identity).toEqual(events[0]?.identity)
+          expect(yield* Effect.promise(() => groupGone(pgid!))).toBe(true)
+        }
+      }),
+      30_000,
+    )
+
+    fx.live(
+      "a late initial-acquire failure does not re-own a leader-exited released group",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+        for (const mode of ["rejected", "delayed"] as const) {
+          const initialObserved = Promise.withResolvers<CrossSpawnSpawner.ProcessGroupEvent>()
+          const releaseObserved = Promise.withResolvers<void>()
+          const allowFailure = Promise.withResolvers<void>()
+          const events: CrossSpawnSpawner.ProcessGroupEvent[] = []
+          const owner = new Map<number, CrossSpawnSpawner.ProcessGroupEvent>()
+          const group: RecordedProcessGroup = { pgid: undefined, members: [] }
+          yield* Effect.addFinalizer(() => cleanupRecordedProcessGroup(group))
+          CrossSpawnSpawner.setProcessGroupObserver(async (event) => {
+            events.push(event)
+            if (event.action === "acquire") owner.set(event.pgid, event)
+            else if (owner.get(event.pgid)?.identity === event.identity) owner.delete(event.pgid)
+            if (event.action === "release") releaseObserved.resolve()
+            if (event.action === "acquire" && !event.cleanupOwed) {
+              group.pgid = event.pgid
+              const leader = processIdentity(event.pgid)
+              if (leader) {
+                group.members.push(leader)
+                recordProcess(event.pgid, leader)
+              }
+              initialObserved.resolve(event)
+              await allowFailure.promise
+              if (mode === "delayed") await new Promise((resolve) => setTimeout(resolve, 25))
+              throw new Error(`injected ${mode} initial-acquire acknowledgement failure`)
+            }
+          })
+          yield* Effect.addFinalizer(() => Effect.sync(() => CrossSpawnSpawner.setProcessGroupObserver(undefined)))
+          const spawning = yield* spawner
+            .spawn(js("setTimeout(() => process.exit(0), 100)", { detached: true }))
+            .pipe(Effect.forkChild)
+          const initial = yield* Effect.promise(() => initialObserved.promise).pipe(Effect.timeout("5 seconds"))
+          const pgid = initial.pgid
+          yield* Effect.promise(() => releaseObserved.promise).pipe(Effect.timeout("5 seconds"))
+          expect(yield* Effect.promise(() => groupGone(pgid))).toBe(true)
+
+          const originalKill = process.kill.bind(process)
+          const signalled: Array<NodeJS.Signals | number | undefined> = []
+          const patchedKill: typeof process.kill = (pid, signal) => {
+            if (pid === -pgid && signal === "SIGKILL") {
+              signalled.push(signal)
+              return true
+            }
+            return originalKill(pid, signal)
+          }
+          yield* Effect.addFinalizer(() => Effect.sync(() => void (process.kill = originalKill)))
+          process.kill = patchedKill
+          allowFailure.resolve()
+          const result = yield* Fiber.join(spawning).pipe(Effect.timeout("5 seconds"), Effect.exit)
+          expect(Exit.isFailure(result)).toBe(true)
+          expect(events.map((event) => event.action)).toEqual(["acquire", "release"])
+          expect(owner.size).toBe(0)
+          expect(signalled).toEqual([])
+          expect(events.at(-1)?.identity).toEqual(initial.identity)
+        }
+      }),
+      30_000,
+    )
+
+    fx.live(
+      "group cleanup signals before a delayed ownership acknowledgement and releases without waiting for its ack",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+
+        const events: { action: string; cleanupOwed: boolean; groupAlive: boolean }[] = []
+        const cleanupAnnounced = Promise.withResolvers<void>()
+        const allowSignal = Promise.withResolvers<void>()
+        const releaseAnnounced = Promise.withResolvers<void>()
+        const allowReleaseAck = Promise.withResolvers<void>()
+        const releaseAckFinished = Promise.withResolvers<void>()
+        const signalIssued = Promise.withResolvers<void>()
+        const signalState = { sent: false }
+        let releaseAckSettled = false
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            allowSignal.resolve()
+            allowReleaseAck.resolve()
+          }),
+        )
+        CrossSpawnSpawner.setProcessGroupObserver(async (event) => {
+          events.push({ action: event.action, cleanupOwed: event.cleanupOwed, groupAlive: groupAlive(event.pgid) })
+          if (event.action === "acquire" && event.cleanupOwed) {
+            cleanupAnnounced.resolve()
+            await allowSignal.promise
+          }
+          if (event.action === "release") {
+            releaseAnnounced.resolve()
+            await allowReleaseAck.promise
+            releaseAckSettled = true
+            releaseAckFinished.resolve()
+          }
+        })
+        yield* Effect.addFinalizer(() => Effect.sync(() => CrossSpawnSpawner.setProcessGroupObserver(undefined)))
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+        const handle = yield* spawner.spawn(js("setInterval(() => {}, 1000)", { detached: true }))
+        const pgid = Number(handle.pid)
+        const leader = processIdentity(pgid)
+        if (!leader?.bootID || !leader.startTicks) throw new Error("spawned group leader has no identity")
+        expect(processGroupMembers(pgid).includes(leader.pid)).toBe(true)
+        recordProcess(pgid, leader)
+        yield* Effect.addFinalizer(() => cleanupRecordedProcessGroup({ pgid, members: [leader] }))
+        const originalKill = process.kill.bind(process)
+        const patchedKill: typeof process.kill = (pid, signal) => {
+          if (pid === -pgid && signal === "SIGUSR2") {
+            signalState.sent = true
+            signalIssued.resolve()
+          }
+          return originalKill(pid, signal)
+        }
+        yield* Effect.addFinalizer(() => Effect.sync(() => void (process.kill = originalKill)))
+        process.kill = patchedKill
+        const killing = yield* handle.kill({ killSignal: "SIGUSR2", forceKillAfter: "2 seconds" }).pipe(Effect.forkChild)
+        yield* Effect.promise(() => cleanupAnnounced.promise).pipe(Effect.timeout("5 seconds"))
+        expect(events.some((event) => event.action === "acquire" && !event.cleanupOwed && event.groupAlive)).toBe(true)
+        expect(events.some((event) => event.action === "acquire" && event.cleanupOwed && event.groupAlive)).toBe(true)
+        yield* Effect.promise(() => signalIssued.promise).pipe(Effect.timeout("3 seconds"))
+        expect(signalState.sent).toBe(true)
+        yield* Effect.promise(() => releaseAnnounced.promise).pipe(Effect.timeout("5 seconds"))
+
+        expect(events.some((event) => event.action === "release")).toBe(true)
+        yield* Fiber.join(killing).pipe(Effect.timeout("5 seconds"))
+        expect(releaseAckSettled).toBe(false)
+        // Release is a point-in-time ownership fact; cleanup completion guarantees the signalled PGID is gone.
+        const gone = yield* Effect.promise(() => groupGone(pgid, 5_000))
+        if (!gone) throw new Error("signalled process group remained alive after cleanup completed")
+        allowReleaseAck.resolve()
+        yield* Effect.promise(() => releaseAckFinished.promise).pipe(Effect.timeout("5 seconds"))
+        expect(signalState.sent).toBe(true)
+      }),
+      20_000,
+    )
+
+    fx.live(
+      "group cleanup still signals and releases after its cleanup-owed acknowledgement rejects",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+
+        const group: RecordedProcessGroup = { pgid: undefined, members: [] }
+        const releaseObserved = Promise.withResolvers<void>()
+        yield* Effect.addFinalizer(() => cleanupRecordedProcessGroup(group))
+        CrossSpawnSpawner.setProcessGroupObserver(async (event) => {
+          if (event.action === "acquire" && event.cleanupOwed)
+            throw new Error("injected cleanup-owed acknowledgement rejection")
+          if (event.action === "release") releaseObserved.resolve()
+        })
+        yield* Effect.addFinalizer(() => Effect.sync(() => CrossSpawnSpawner.setProcessGroupObserver(undefined)))
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+        const handle = yield* spawner.spawn(js("setInterval(() => {}, 1000)", { detached: true }))
+        const pgid = Number(handle.pid)
+        group.pgid = pgid
+        const leader = processIdentity(pgid)
+        if (!leader?.bootID || !leader.startTicks) throw new Error("spawned group leader has no identity")
+        group.members.push(leader)
+        recordProcess(pgid, leader)
+
+        const result = yield* Effect.exit(handle.kill({ forceKillAfter: "2 seconds" }).pipe(Effect.timeout("5 seconds")))
+        expect(Exit.isSuccess(result)).toBe(true)
+        yield* Effect.promise(() => releaseObserved.promise).pipe(Effect.timeout("5 seconds"))
+        expect(yield* Effect.promise(() => groupGone(pgid))).toBe(true)
+      }),
+      15_000,
     )
 
     fx.live(
