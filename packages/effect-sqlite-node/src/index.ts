@@ -1,7 +1,6 @@
 export * as NodeSqliteClient from "./index"
 
 import { DatabaseSync, type SQLInputValue } from "node:sqlite"
-import { Deferred } from "effect"
 import { identity } from "effect/Function"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
@@ -14,7 +13,7 @@ import * as Client from "effect/unstable/sql/SqlClient"
 import type { Connection } from "effect/unstable/sql/SqlConnection"
 import { classifySqliteError, LockTimeoutError, SqlError } from "effect/unstable/sql/SqlError"
 import * as Statement from "effect/unstable/sql/Statement"
-import { retryLocked } from "./retry"
+import { makeRetryOwnership } from "./retry"
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name"
 const nativeBusyTimeoutMs = 5
@@ -107,7 +106,7 @@ export const make = (
             try: () => statement.all(...(params as SQLInputValue[])) as Array<Record<string, unknown>>,
             catch: statementError,
           })
-          return retryLocked(execute, sql)
+          return execute
         })
 
       const runValues = (sql: string, params: ReadonlyArray<unknown> = []) =>
@@ -120,7 +119,7 @@ export const make = (
               statement.all(...(params as SQLInputValue[])) as unknown as ReadonlyArray<ReadonlyArray<unknown>>,
             catch: statementError,
           })
-          return retryLocked(execute, sql)
+          return execute
         })
 
       return identity<SqliteConnection>({
@@ -151,55 +150,75 @@ export const make = (
     })
 
     const semaphore = yield* Semaphore.make(1)
+    const ownership = yield* makeRetryOwnership(semaphore)
     const connection = yield* makeConnection
-    const withPermit = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-      Effect.scoped(
-        Effect.uninterruptibleMask((restore) =>
-          Effect.gen(function* () {
-            const immediate = yield* semaphore.withPermitsIfAvailable(1)(restore(effect))
-            if (immediate._tag === "Some") return immediate.value
-            const acquired = yield* Deferred.make<void>()
-            yield* semaphore
-              .withPermits(1)(Effect.andThen(Deferred.succeed(acquired, undefined), Effect.never))
-              .pipe(Effect.forkScoped({ startImmediately: true }))
-            yield* restore(Deferred.await(acquired))
-            return yield* restore(effect)
-          }),
-        ),
-      )
-    const lockedConnection = identity<SqliteConnection>({
+    const transactionConnection = (
+      scope: Scope.Scope,
+      initialLease: Scope.Closeable,
+      operation: ReturnType<typeof ownership.createOperation>,
+    ) => {
+      const transaction = ownership.transaction(scope, initialLease, operation)
+
+      return identity<SqliteConnection>({
+        execute(sql, params, transformRows) {
+          const result = transaction.run(sql, connection.execute(sql, params, undefined))
+          return transformRows ? Effect.map(result, transformRows) : result
+        },
+        executeRaw(sql, params) {
+          return transaction.run(sql, connection.executeRaw(sql, params))
+        },
+        executeValues(sql, params) {
+          return transaction.run(sql, connection.executeValues(sql, params))
+        },
+        executeUnprepared(sql, params, transformRows) {
+          return this.execute(sql, params, transformRows)
+        },
+        executeStream() {
+          return Stream.die("executeStream not implemented")
+        },
+        loadExtension(path) {
+          return transaction.withLease(
+            connection.loadExtension(path),
+            () => ownership.oneShot(operation, connection.loadExtension(path)),
+          )
+        },
+      })
+    }
+    const runStatement = <A>(
+      sql: string,
+      effect: Effect.Effect<A, SqlError>,
+      operation: ReturnType<typeof ownership.createOperation>,
+    ) => ownership.statement(sql, effect, operation)
+    const lockedConnection = (operation: ReturnType<typeof ownership.createOperation>) => identity<SqliteConnection>({
       execute(sql, params, transformRows) {
-        return withPermit(connection.execute(sql, params, transformRows))
+        const result = runStatement(sql, connection.execute(sql, params, undefined), operation)
+        return transformRows ? Effect.map(result, transformRows) : result
       },
       executeRaw(sql, params) {
-        return withPermit(connection.executeRaw(sql, params))
+        return runStatement(sql, connection.executeRaw(sql, params), operation)
       },
       executeValues(sql, params) {
-        return withPermit(connection.executeValues(sql, params))
+        return runStatement(sql, connection.executeValues(sql, params), operation)
       },
       executeUnprepared(sql, params, transformRows) {
-        return withPermit(connection.executeUnprepared(sql, params, transformRows))
+        return this.execute(sql, params, transformRows)
       },
       executeStream(sql, params, transformRows) {
         return connection.executeStream(sql, params, transformRows)
       },
       loadExtension(path) {
-        return withPermit(connection.loadExtension(path))
+        return ownership.oneShot(operation, connection.loadExtension(path))
       },
     })
-    const acquirer = Effect.succeed(lockedConnection)
-    // Keep retries serialized on the native connection, including their backoff interval.
-    // The scoped child owns the permit so cancellation can release it during acquisition.
-    const transactionAcquirer = Effect.uninterruptibleMask((restore) =>
-      Effect.gen(function* () {
-        const acquired = yield* Deferred.make<void>()
-        yield* semaphore
-          .withPermits(1)(Effect.andThen(Deferred.succeed(acquired, undefined), Effect.never))
-          .pipe(Effect.forkScoped({ startImmediately: true }))
-        yield* restore(Deferred.await(acquired))
-        return connection
-      }),
-    )
+    const acquirer = Effect.sync(() => lockedConnection(ownership.createOperation()))
+    // A failed BEGIN owns the connection only for that native attempt. After BEGIN succeeds, its lease stays with the
+    // transaction scope so other statements cannot join it.
+    const transactionAcquirer = Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      const operation = ownership.createOperation()
+      const connectionLease = yield* ownership.acquireTransactionLease(scope, operation)
+      return transactionConnection(scope, connectionLease, operation)
+    })
 
     return Object.assign(
       (yield* Client.make({

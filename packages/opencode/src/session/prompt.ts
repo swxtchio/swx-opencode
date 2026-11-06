@@ -52,6 +52,7 @@ import { SessionPromptQueue } from "@opencode-ai/schema/session-prompt-queue"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
+import { Sqlite } from "@opencode-ai/core/database/sqlite"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { eq } from "drizzle-orm"
@@ -1499,7 +1500,7 @@ const layer = Layer.effect(
           ),
         )
       return yield* drain(input.sessionID, entry.own.id)
-    }, Effect.scoped)
+    }, Effect.scoped, Sqlite.withRetryWindow)
 
     // Failed originals are reported through the existing session error channel.
     const rejected = (sessionID: SessionID) => (cause: Cause.Cause<unknown>) =>
@@ -2062,7 +2063,7 @@ const layer = Layer.effect(
           }),
         ))
       return yield* drain(input.sessionID, undefined, messageID, input.messageID !== undefined).pipe(Effect.orDie)
-    })
+    }, Sqlite.withRetryWindow)
 
     // Runs or joins the session's drain. With `own`, returns the reply the turn
     // that prompt joined recorded for it: the drain's final message may answer
@@ -2184,7 +2185,7 @@ const layer = Layer.effect(
       // gets the run's final message, as every caller did before the queue. A
       // prompt still pending on a parked session gets it from the re-drain.
       return yield* withdrawn.pipe(Effect.as(result))
-    })
+    }, Sqlite.withRetryWindow)
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
       "SessionPrompt.shell",

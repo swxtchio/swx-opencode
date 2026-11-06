@@ -34,6 +34,7 @@ import { isDeepStrictEqual } from "node:util"
 import { createHash } from "node:crypto"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { sqliteLockMessage } from "@/util/sqlite-error"
+import { Sqlite } from "@opencode-ai/core/database/sqlite"
 import { MachineMessage } from "./machine-message"
 import { MessageV2 } from "./message-v2"
 import { MessageID, PartID, SessionID } from "./schema"
@@ -115,13 +116,11 @@ export class HistoricalIdentityError extends Schema.TaggedErrorClass<HistoricalI
   { sessionID: SessionID, messageID: MessageID, message: Schema.String },
 ) {}
 
-// Each consume attempt waits out the statement lock window, so a lock released
-// within about this many windows lets the run go on.
+// Attempts share the SessionPrompt retry window; this count only bounds repeated immediate refusals.
 const consumeAttempts = 5
-// Bounds an attempt's wait for the session permit, the shared connection and
-// BEGIN together: its own statement window plus one other statement's window
-// ahead of it on the connection. The body, once begun, is not timed.
+// Bounds one wait for the session permit, shared connection, and BEGIN. The body, once begun, is not timed.
 const consumeAcquireBackstop = Duration.seconds(20)
+const consumeAcquireBackstopSlack = Duration.millis(250)
 // A review hold's lease (#212). Its client renews it on activity and closes its
 // view after 5 minutes without any, so a live view always renews in time; the
 // lease only ends a hold whose client vanished without releasing it.
@@ -454,8 +453,12 @@ const layer = Layer.effect(
     // The write lock is taken at BEGIN. A deferred transaction would pin a read
     // snapshot in assertWritableIn, and a commit by another writer while its
     // write waits on the lock would leave that snapshot stale.
-    const writable = <A, E>(sessionID: SessionID, effect: (tx: DatabaseTransaction) => Effect.Effect<A, E>) =>
-      db.transaction(
+    const writable = <A, E>(
+      sessionID: SessionID,
+      effect: (tx: DatabaseTransaction) => Effect.Effect<A, E>,
+      inheritRetryWindow = false,
+    ) => {
+      const transaction = db.transaction(
         (tx) =>
           Effect.gen(function* () {
             yield* EventV2.assertWritableIn(tx, sessionID)
@@ -463,6 +466,8 @@ const layer = Layer.effect(
           }),
         { behavior: "immediate" },
       )
+      return inheritRetryWindow ? transaction : Sqlite.withRetryWindow(transaction)
+    }
 
     const exclusive: Interface["exclusive"] = (sessionID, effect) => semaphore(locks, sessionID).withPermit(effect)
 
@@ -754,6 +759,7 @@ const layer = Layer.effect(
       // A sender that has not classified its prompt yet (#249) cannot be held to
       // a delivery here; it reconciles again with one once it has.
       deferred = false,
+      inheritRetryWindow = false,
     ) {
       const now = Date.now()
       if (input.parts.some((part) => part.type === "text" && part.metadata?.sessionQueuePendingOriginal))
@@ -976,6 +982,7 @@ const layer = Layer.effect(
                 ),
           ),
         ),
+        inheritRetryWindow,
       ).pipe(Effect.orDie)
       if (result.kind === "absent") return undefined
       if (result.kind === "delivered") return result.item
@@ -991,8 +998,13 @@ const layer = Layer.effect(
       return item
     })
 
-    const admitLocked = (input: AdmitInput, markers?: ConfigV1.Info["machine_message_markers"], deferred = false) =>
-      reconcileAdmission(input, false, markers, deferred).pipe(
+    const admitLocked = (
+      input: AdmitInput,
+      markers?: ConfigV1.Info["machine_message_markers"],
+      deferred = false,
+      inheritRetryWindow = false,
+    ) =>
+      reconcileAdmission(input, false, markers, deferred, inheritRetryWindow).pipe(
         Effect.flatMap((item) =>
           item ? Effect.succeed(item) : Effect.die(new Error("admission did not allocate an original")),
         ),
@@ -1143,32 +1155,35 @@ const layer = Layer.effect(
         Effect.sync(() => {
           if (key && preparations.get(key) === owner) preparations.delete(key)
         })
-      return Effect.acquireUseRelease(
-        exclusive(
-          input.sessionID,
-          Effect.gen(function* () {
-            yield* assertFreshIdentityLocked(input.sessionID, input.messageID)
-            const owner = Symbol()
-            if (key) preparations.set(key, owner)
-            return owner
-          }),
+      return Sqlite.withRetryWindow(
+        Effect.acquireUseRelease(
+          exclusive(
+            input.sessionID,
+            Effect.gen(function* () {
+              yield* assertFreshIdentityLocked(input.sessionID, input.messageID)
+              const owner = Symbol()
+              if (key) preparations.set(key, owner)
+              return owner
+            }),
+          ),
+          (owner) =>
+            Effect.gen(function* () {
+              // A caller interrupt must not abandon native IO or hook promises and reopen the identity.
+              const prepared = yield* input.prepare().pipe(Effect.uninterruptible)
+              return yield* exclusive(
+                input.sessionID,
+                Effect.gen(function* () {
+                  // Handoff to durable custody is serialized, but shell and hook IO never hold the session permit.
+                  yield* release(owner)
+                  yield* assertFreshIdentityLocked(input.sessionID, input.messageID)
+                  // Admission shares this preparation's retry budget; don't renew it in writable.
+                  const own = yield* admitLocked(prepared, undefined, false, true)
+                  return { input: prepared, own }
+                }),
+              )
+            }),
+          release,
         ),
-        (owner) =>
-          Effect.gen(function* () {
-            // A caller interrupt must not abandon native IO or hook promises and reopen the identity.
-            const prepared = yield* input.prepare().pipe(Effect.uninterruptible)
-            return yield* exclusive(
-              input.sessionID,
-              Effect.gen(function* () {
-                // Handoff to durable custody is serialized, but shell and hook IO never hold the session permit.
-                yield* release(owner)
-                yield* assertFreshIdentityLocked(input.sessionID, input.messageID)
-                const own = yield* admitLocked(prepared)
-                return { input: prepared, own }
-              }),
-            )
-          }),
-        release,
       )
     }
 
@@ -2964,31 +2979,45 @@ const layer = Layer.effect(
     // Only an attempt whose consume never ran is made again, so no executed
     // transaction body is replayed. Success is the attempt's own commit.
     const consume = Effect.fn("SessionQueue.consume")(function* (sessionID: SessionID) {
+      const startedAt = performance.now()
+      let sawLock = false
       for (let attempts = 1; ; attempts++) {
-        const attempt = yield* consumeAttempt(sessionID)
+        const window = yield* Sqlite.retryWindowStatus
+        const localElapsedMs = performance.now() - startedAt
+        const remainingMs = Math.max(0, Math.min(window.remainingMs, window.windowMs - localElapsedMs))
+        const backstopMs = Math.max(
+          1,
+          Math.min(
+            Duration.toMillis(consumeAcquireBackstop) + Duration.toMillis(consumeAcquireBackstopSlack),
+            Math.ceil(remainingMs + Duration.toMillis(consumeAcquireBackstopSlack)),
+          ),
+        )
+        const attempt = yield* consumeAttempt(sessionID, Duration.millis(backstopMs))
         if (attempt.kind === "consumed") return attempt.seen
+        sawLock ||= attempt.kind === "locked" || window.sawLock
         yield* Effect.logWarning(
           attempt.kind === "locked"
             ? "queue consume met a held write lock"
             : "queue consume waited past its acquisition backstop",
           { "session.id": sessionID, attempts },
         )
-        if (attempts === consumeAttempts)
+        const current = yield* Sqlite.retryWindowStatus
+        const waitedMs = Math.max(Math.round(performance.now() - startedAt), current.elapsedMs)
+        const remaining = Math.min(current.remainingMs, current.windowMs - (performance.now() - startedAt))
+        if (attempts === consumeAttempts || remaining <= 0)
           return yield* Effect.die(
             new ConsumeLockedError({
               sessionID,
-              attempts: consumeAttempts,
-              message: `SessionQueue.consume could not begin its write in ${consumeAttempts} attempts; session ${sessionID} stopped, and its queued prompts stay pending until it is prompted again`,
+              attempts,
+              message: `${sawLock || current.sawLock ? "SQLite lock contention" : current.sawPermit ? "SQLite connection acquisition" : "SQLite write acquisition"} persisted for ${waitedMs} ms while SessionQueue.consume tried to begin its write; session ${sessionID} stopped, and its queued prompts stay pending until it is prompted again`,
             }),
           )
       }
     })
 
-    // The driver waits for its connection and retries BEGIN uninterruptibly, so
-    // the attempt runs in its own fiber and the backstop stops waiting for it
-    // rather than interrupting it. An abandoned attempt that later reaches its
-    // body rolls back without deleting anything.
-    const consumeAttempt = Effect.fnUntraced(function* (sessionID: SessionID) {
+    // The backstop abandons only the waiter: a cleanup BEGIN may acquire the connection later, but the body guard then
+    // rolls it back before the queue delete. Permit wait stays asynchronous and never pins the connection.
+    const consumeAttempt = Effect.fnUntraced(function* (sessionID: SessionID, backstop: Duration.Input) {
       const state = { began: false, abandoned: false }
       // Whether the abandon won: a body that began first is waited for instead,
       // so a committed consume is never reported as a backstop.
@@ -2998,27 +3027,29 @@ const layer = Layer.effect(
           state.abandoned = true
           return Fiber.interrupt(fiber).pipe(Effect.forkIn(scope), Effect.as(true))
         })
-      const fiber = yield* exclusive(
-        sessionID,
-        writable(sessionID, (tx) =>
-          Effect.suspend(() => {
-            if (state.abandoned) return Effect.interrupt
-            state.began = true
-            return tx
-              .delete(SessionPromptQueueTable)
-              .where(
-                and(
-                  eq(SessionPromptQueueTable.session_id, sessionID),
-                  isNotNull(SessionPromptQueueTable.time_promoted),
-                ),
-              )
-              .run()
-              .pipe(Effect.map(() => wakes.get(sessionID) ?? 0))
-          }),
+      const fiber = yield* Sqlite.withUnboundedPermitWait(
+        exclusive(
+          sessionID,
+          writable(sessionID, (tx) =>
+            Effect.suspend(() => {
+              if (state.abandoned) return Effect.interrupt
+              state.began = true
+              return tx
+                .delete(SessionPromptQueueTable)
+                .where(
+                  and(
+                    eq(SessionPromptQueueTable.session_id, sessionID),
+                    isNotNull(SessionPromptQueueTable.time_promoted),
+                  ),
+                )
+                .run()
+                .pipe(Effect.map(() => wakes.get(sessionID) ?? 0))
+            }),
+          ),
         ),
       ).pipe(Effect.forkIn(scope, { startImmediately: true }))
       const waited = yield* Fiber.await(fiber).pipe(
-        Effect.timeoutOption(consumeAcquireBackstop),
+        Effect.timeoutOption(backstop),
         Effect.onInterrupt(() => abandon(fiber)),
       )
       if (Option.isNone(waited) && (yield* abandon(fiber))) return { kind: "backstop" as const }

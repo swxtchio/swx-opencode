@@ -383,10 +383,8 @@ it.live(
       const tui = yield* boot({ directory })
 
       yield* tui.prompt("start the running turn")
-      yield* pollWithTimeout(
-        lastUsers(llm).pipe(Effect.map((users) => (users.includes("start the running turn") ? true : undefined))),
-        "the initial provider request never started",
-      )
+      yield* llm.wait(1)
+      expect((yield* lastUsers(llm)).includes("start the running turn")).toBe(true)
       yield* tui.compose("earlier composer prompt")
       yield* tui.compose("selected composer prompt")
       const admitted = yield* pollWithTimeout(
@@ -504,10 +502,8 @@ it.live(
       const automation = "OBSERVER: machine appended work"
 
       yield* tui.prompt("start the running turn")
-      yield* pollWithTimeout(
-        lastUsers(llm).pipe(Effect.map((users) => (users.includes("start the running turn") ? true : undefined))),
-        "the initial provider request never started",
-      )
+      yield* llm.wait(1)
+      expect((yield* lastUsers(llm)).includes("start the running turn")).toBe(true)
       yield* tui.compose("first composer instruction")
       yield* tui.compose(automation)
       yield* tui.compose("last composer instruction")
@@ -743,10 +739,8 @@ it.live(
       const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
       const tui = yield* boot({ directory })
       yield* tui.prompt("start the active turn")
-      yield* pollWithTimeout(
-        lastUsers(llm).pipe(Effect.map((users) => (users.includes("start the active turn") ? true : undefined))),
-        "the initial provider request never started",
-      )
+      yield* llm.wait(1)
+      expect((yield* lastUsers(llm)).includes("start the active turn")).toBe(true)
       yield* tui.compose("queued for the idle session")
       yield* pollWithTimeout(
         tui.rows.pipe(
