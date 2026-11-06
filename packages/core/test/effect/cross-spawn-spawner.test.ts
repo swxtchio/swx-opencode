@@ -1381,14 +1381,15 @@ describe("cross-spawn spawner", () => {
         expect(signalState.sent).toBe(true)
         yield* Effect.promise(() => releaseAnnounced.promise).pipe(Effect.timeout("5 seconds"))
 
-        const release = events.find((event) => event.action === "release")
-        expect(release?.groupAlive).toBe(false)
+        expect(events.some((event) => event.action === "release")).toBe(true)
         yield* Fiber.join(killing).pipe(Effect.timeout("5 seconds"))
         expect(releaseAckSettled).toBe(false)
+        // Release is a point-in-time ownership fact; cleanup completion guarantees the signalled PGID is gone.
+        const gone = yield* Effect.promise(() => groupGone(pgid, 5_000))
+        if (!gone) throw new Error("signalled process group remained alive after cleanup completed")
         allowReleaseAck.resolve()
         yield* Effect.promise(() => releaseAckFinished.promise).pipe(Effect.timeout("5 seconds"))
         expect(signalState.sent).toBe(true)
-        expect(yield* Effect.promise(() => groupGone(pgid))).toBe(true)
       }),
       20_000,
     )
