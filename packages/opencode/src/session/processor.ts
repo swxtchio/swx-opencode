@@ -27,6 +27,7 @@ import { FailureOrigin } from "@opencode-ai/core/observability/failure-origin"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
+import { Sqlite } from "@opencode-ai/core/database/sqlite"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
 
 const DOOM_LOOP_THRESHOLD = 3
@@ -255,7 +256,10 @@ const layer = Layer.effect(
       let refused = 0
       let reportAt = 4
       // Update-only: if the assistant was removed while the lock was held, the retry must not recreate it.
-      yield* Effect.suspend(() => session.updateExistingMessage(message)).pipe(
+      // Retain the generic 10s attempt window so the 4th and 8th progress reports stay timely.
+      yield* Effect.suspend(() =>
+        Sqlite.withFreshRetryWindow(session.updateExistingMessage(message), Duration.seconds(10)),
+      ).pipe(
         Effect.catchDefect((defect) => (sqliteLockMessage(defect) ? Effect.fail(defect) : Effect.die(defect))),
         Effect.tapError(() => {
           refused++

@@ -4,6 +4,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Runner } from "@/effect/runner"
 import { BackgroundJob } from "@/background/job"
 import { Effect, Latch, Layer, Scope, Context } from "effect"
+import { Sqlite } from "@opencode-ai/core/database/sqlite"
 import { Session } from "./session"
 import { SessionID } from "./schema"
 import { SessionStatus } from "./status"
@@ -109,7 +110,7 @@ const layer = Layer.effect(
       return yield* (yield* runner(sessionID, onInterrupt))
         .startShell(work, ready)
         .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
-    })
+    }, Sqlite.withRetryWindow)
 
     return Service.of({ assertNotBusy, cancel, current, ensureRunning, startShell })
   }),

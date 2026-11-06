@@ -1,5 +1,6 @@
 import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { Database } from "@opencode-ai/core/database/database"
+import { Sqlite } from "@opencode-ai/core/database/sqlite"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { describe, expect } from "bun:test"
@@ -76,6 +77,7 @@ describe("HttpApi error middleware", () => {
         if (!isSqlError(error)) return
         expect(error.reason._tag).toBe("LockTimeoutError")
         expect(error.reason.cause).toMatchObject({ code: "SQLITE_BUSY" })
+        expect(Sqlite.lockWaitMs(error)).toBeGreaterThanOrEqual(10_000)
         expect(error.message).not.toContain("secret_lock_fixture")
         expect(error.message).not.toContain("direct_parameter")
 
@@ -123,6 +125,7 @@ describe("HttpApi error middleware", () => {
         if (!isSqlError(error)) return
         expect(error.reason._tag).toBe("LockTimeoutError")
         expect(error.reason.cause).toMatchObject({ code: "SQLITE_LOCKED" })
+        expect(Sqlite.lockWaitMs(error)).toBeGreaterThanOrEqual(10_000)
         expect(error.message).not.toContain("secret_lock_fixture")
         expect(error.message).not.toContain("secret_parameter")
 

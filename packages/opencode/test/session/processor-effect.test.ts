@@ -2,13 +2,14 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { eq } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
+import { retryWindowStatus, withFreshRetryWindow } from "@opencode-ai/core/database/sqlite"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { afterAll, expect } from "bun:test"
 import { Database as Sqlite } from "bun:sqlite"
 import { tool } from "ai"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer, Logger, Option, Scheduler, Schema, Stream } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Logger, Option, Scheduler, Schema, Stream } from "effect"
 import { isSqlError } from "effect/unstable/sql/SqlError"
 import { mkdtemp, rm } from "node:fs/promises"
 import os from "node:os"
@@ -431,6 +432,7 @@ const sqliteTerminalDbPaths = ([2, 3] as const).map((failures) => ({
 }))
 const heldLockDbPath = path.join(import.meta.dir, `.opencode-sqlite-held-lock-${crypto.randomUUID()}.db`)
 const streamLockDbPath = path.join(import.meta.dir, `.opencode-sqlite-stream-lock-${crypto.randomUUID()}.db`)
+const streamDeltaWindowDbPath = path.join(import.meta.dir, `.opencode-sqlite-stream-window-${crypto.randomUUID()}.db`)
 const routedEnv = LayerNode.compile(root, [
   ...replacements,
   [LLM.node, routedLLM],
@@ -460,6 +462,9 @@ afterAll(async () => {
       streamLockDbPath,
       `${streamLockDbPath}-wal`,
       `${streamLockDbPath}-shm`,
+      streamDeltaWindowDbPath,
+      `${streamDeltaWindowDbPath}-wal`,
+      `${streamDeltaWindowDbPath}-shm`,
       routerLabelDbPath,
       `${routerLabelDbPath}-wal`,
       `${routerLabelDbPath}-shm`,
@@ -579,7 +584,18 @@ type HeldLock = {
   replayed: number
   skipped?: Deferred.Deferred<void>
 }
+type StreamDeltaWindowGates = {
+  ready: Deferred.Deferred<void>
+  first: Deferred.Deferred<void>
+  firstDeltaStarted: Deferred.Deferred<void>
+  afterFirst: Deferred.Deferred<void>
+  second: Deferred.Deferred<void>
+  secondDeltaStarted: Deferred.Deferred<void>
+  afterSecond: Deferred.Deferred<void>
+  deltaCalls: number
+}
 const heldLocks = new Map<SessionID, HeldLock>()
+const streamDeltaWindowGates = new Map<string, StreamDeltaWindowGates>()
 const heldLockWrite = <A, E, R>(lock: HeldLock | undefined, write: Effect.Effect<A, E, R>) =>
   Effect.suspend(() => {
     if (!lock) return write
@@ -624,6 +640,13 @@ const heldLockSession = LayerNode.make({
               lock.holder.run("BEGIN IMMEDIATE")
             }
             return heldLockWrite(lock, real.updateMessage(msg))
+          }),
+        updatePartDelta: (input) =>
+          Effect.suspend(() => {
+            const gates = streamDeltaWindowGates.get(input.sessionID)
+            if (!gates) return real.updatePartDelta(input)
+            const started = gates.deltaCalls++ === 0 ? gates.firstDeltaStarted : gates.secondDeltaStarted
+            return Deferred.succeed(started, undefined).pipe(Effect.andThen(real.updatePartDelta(input)))
           }),
         updateExistingMessage: (msg: SessionV1.Info) =>
           Effect.suspend(() => {
@@ -671,6 +694,54 @@ const heldLockLLM = Layer.succeed(
         ),
       ),
   }),
+)
+const streamDeltaWindowLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: (input) => {
+      const gates = streamDeltaWindowGates.get(input.sessionID)
+      if (!gates) return Stream.die(new Error("stream delta window gates were not registered"))
+      return Stream.concat(
+        Stream.make(LLMEvent.stepStart({ index: 0 }), LLMEvent.textStart({ id: "text-1" })),
+        Stream.concat(
+          Stream.unwrap(
+            Effect.gen(function* () {
+              yield* Deferred.succeed(gates.ready, undefined)
+              yield* Deferred.await(gates.first)
+              return Stream.make(LLMEvent.textDelta({ id: "text-1", text: "first " }))
+            }),
+          ),
+          Stream.concat(
+            Stream.unwrap(
+              Effect.gen(function* () {
+                yield* Deferred.succeed(gates.afterFirst, undefined)
+                yield* Deferred.await(gates.second)
+                return Stream.make(LLMEvent.textDelta({ id: "text-1", text: "continued" }))
+              }),
+            ),
+            Stream.unwrap(
+              Effect.gen(function* () {
+                yield* Deferred.succeed(gates.afterSecond, undefined)
+                return Stream.make(
+                  LLMEvent.textEnd({ id: "text-1" }),
+                  LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+                  LLMEvent.finish({ reason: "stop" }),
+                )
+              }),
+            ),
+          ),
+        ),
+      )
+    },
+  }),
+)
+const itStreamDeltaWindow = testEffect(
+  LayerNode.compile(root, [
+    ...replacements,
+    [LLM.node, streamDeltaWindowLLM],
+    [Session.node, heldLockSession],
+    [Database.node, Database.layerFromPath(streamDeltaWindowDbPath)],
+  ]),
 )
 const sqliteLockFailure = defer<unknown>()
 const sqliteLockLLM = Layer.succeed(
@@ -2001,6 +2072,146 @@ const failTurnUnderHeldLock = Effect.fn("test.failTurnUnderHeldLock")(function* 
   return { chat, msg, lock, exit, terminal }
 })
 
+itStreamDeltaWindow.live(
+  "session.processor retires a recovered permit wait between streamed text deltas",
+  () =>
+    provideTmpdirInstance(
+      (dir) =>
+        withFreshRetryWindow(
+          Effect.gen(function* () {
+            const { processors, session, provider } = yield* boot()
+            const database = yield* Database.Service
+            const client = database.db.$client
+            const chat = yield* session.create({})
+            const parent = yield* user(chat.id, "streamed retry window")
+            const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+            const model = yield* provider.getModel(ref.providerID, ref.modelID)
+            const gates: StreamDeltaWindowGates = {
+              ready: yield* Deferred.make<void>(),
+              first: yield* Deferred.make<void>(),
+              firstDeltaStarted: yield* Deferred.make<void>(),
+              afterFirst: yield* Deferred.make<void>(),
+              second: yield* Deferred.make<void>(),
+              secondDeltaStarted: yield* Deferred.make<void>(),
+              afterSecond: yield* Deferred.make<void>(),
+              deltaCalls: 0,
+            }
+            streamDeltaWindowGates.set(chat.id, gates)
+            yield* Effect.addFinalizer(() => Effect.sync(() => void streamDeltaWindowGates.delete(chat.id)))
+
+            const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model })
+            const run = yield* handle
+              .process({
+                user: {
+                  id: parent.id,
+                  sessionID: chat.id,
+                  role: "user",
+                  time: parent.time,
+                  agent: parent.agent,
+                  model: { providerID: ref.providerID, modelID: ref.modelID },
+                } satisfies SessionV1.User,
+                sessionID: chat.id,
+                model,
+                agent: agent(),
+                system: [],
+                messages: [{ role: "user", content: "streamed retry window" }],
+                tools: {},
+              })
+              .pipe(Effect.forkChild({ startImmediately: true }))
+            yield* awaitWithTimeout(Deferred.await(gates.ready), "stream never reached its first text delta", "5 seconds")
+
+            const holdConnection = (entered: Deferred.Deferred<void>, release: Deferred.Deferred<void>) =>
+              client
+                .withTransaction(
+                  Effect.gen(function* () {
+                    yield* Deferred.succeed(entered, undefined)
+                    yield* Deferred.await(release)
+                  }),
+                )
+                .pipe(Effect.forkChild({ startImmediately: true }))
+            const firstEntered = yield* Deferred.make<void>()
+            const firstRelease = yield* Deferred.make<void>()
+            yield* Effect.addFinalizer(() => Deferred.succeed(firstRelease, undefined))
+            const firstHolder = yield* holdConnection(firstEntered, firstRelease)
+            yield* awaitWithTimeout(Deferred.await(firstEntered), "first permit holder did not start", "2 seconds")
+            yield* Deferred.succeed(gates.first, undefined)
+            yield* awaitWithTimeout(
+              Deferred.await(gates.firstDeltaStarted),
+              "processor did not call Session.updatePartDelta for the first chunk",
+              "2 seconds",
+            )
+            yield* waitFor(
+              retryWindowStatus.pipe(Effect.map((status) => (status.sawPermit ? true : undefined))),
+              "the first streaming delta did not wait on the held connection",
+              2_000,
+            )
+            yield* Deferred.succeed(firstRelease, undefined)
+            yield* awaitWithTimeout(
+              Deferred.await(gates.afterFirst),
+              "the recovered first delta did not finish before the stream paused",
+              "5 seconds",
+            )
+            yield* Fiber.join(firstHolder)
+            const afterFirst = yield* retryWindowStatus
+
+            const windowMs = 500
+            yield* Effect.sleep(Duration.millis(windowMs + 100))
+
+            const secondEntered = yield* Deferred.make<void>()
+            const secondRelease = yield* Deferred.make<void>()
+            yield* Effect.addFinalizer(() => Deferred.succeed(secondRelease, undefined))
+            const secondHolder = yield* holdConnection(secondEntered, secondRelease)
+            yield* awaitWithTimeout(Deferred.await(secondEntered), "second permit holder did not start", "2 seconds")
+            yield* Deferred.succeed(gates.second, undefined)
+            yield* awaitWithTimeout(
+              Deferred.await(gates.secondDeltaStarted),
+              "processor did not call Session.updatePartDelta for the later chunk",
+              "2 seconds",
+            )
+            yield* Effect.yieldNow
+            const beforeRelease = run.pollUnsafe()
+            yield* Deferred.succeed(secondRelease, undefined)
+            const afterSecond = yield* Effect.raceFirst(
+              Deferred.await(gates.afterSecond).pipe(Effect.as("continued" as const)),
+              Fiber.await(run).pipe(Effect.as("ended" as const)),
+            ).pipe(
+              Effect.timeoutOrElse({
+                duration: "5 seconds",
+                orElse: () => Effect.fail(new Error("the processor did not continue past its second streamed delta")),
+              }),
+            )
+            if (afterSecond === "ended") {
+              const earlyExit = yield* Fiber.await(run)
+              yield* Effect.fail(
+                new Error(
+                  `processor ended before the stream continued: ${Exit.isFailure(earlyExit) ? Cause.pretty(earlyExit.cause) : "success"}`,
+                ),
+              )
+            }
+            const exit = yield* Fiber.await(run).pipe(
+              Effect.timeoutOrElse({
+                duration: "5 seconds",
+                orElse: () => Effect.fail(new Error("the streamed text did not finish after the second permit released")),
+              }),
+            )
+            yield* Fiber.join(secondHolder)
+
+            const text = (yield* MessageV2.parts(msg.id)).find(
+              (part): part is SessionV1.TextPart => part.type === "text",
+            )
+            expect(afterFirst).toMatchObject({ elapsedMs: 0, sawPermit: false })
+            expect(beforeRelease).toBeUndefined()
+            expect(Exit.isSuccess(exit)).toBe(true)
+            if (Exit.isSuccess(exit)) expect(exit.value).toBe("continue")
+            expect(text?.text).toBe("first continued")
+          }),
+          Duration.millis(500),
+        ),
+      { config: cfg },
+    ),
+  30_000,
+)
+
 itHeldLock.live(
   "processor persists a failed turn once a lock held across every terminalizing write is released",
   () =>
@@ -2595,7 +2806,9 @@ itSqliteLock.live(
           })
           yield* off
           const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
-          const lockMessage = "Database is locked (SQLITE_BUSY)"
+          const lockMessage = sqliteLockMessage(error)
+          if (!lockMessage) throw new Error("SQLite busy error did not produce a lock message")
+          expect(lockMessage).toBe("Database is locked (SQLITE_BUSY)")
 
           expect(result).toBe("stop")
           expect(handle.message.error).toMatchObject({ name: "UnknownError", data: { message: lockMessage } })

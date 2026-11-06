@@ -2,6 +2,7 @@ export * as DatabaseTransaction from "./transaction"
 
 import { Cause, Context, Effect, Exit, Fiber, Option, Scope } from "effect"
 import type { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
+import { Sqlite } from "./sqlite"
 
 type Database = EffectDrizzleSqlite.EffectSQLiteDatabase
 type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0]
@@ -40,6 +41,8 @@ export function wrap<T extends Database>(db: T, scope: Scope.Scope) {
             parent.value.completions?.push(...frame.completions)
             return result.value
           }
+          // Only the outermost successful immediate commit releases the write lock; a nested savepoint must not reset it.
+          if (config?.behavior === "immediate") yield* Sqlite.resetRetryWindow
           // The connection has been released. Bind committed state before any observer can yield.
           const completed = yield* Effect.forEach(frame.completions, (effect) => Effect.exit(effect)).pipe(
             Effect.provideService(Notifications, { owner }),
