@@ -5,6 +5,17 @@ const readyFile = process.env.SWX_TUI_SIGHUP_READY_FILE
 const resultFile = process.env.SWX_TUI_SIGHUP_RESULT_FILE
 const acknowledgementFile = process.env.SWX_TUI_SIGHUP_ACK_FILE
 if (!readyFile || !resultFile || !acknowledgementFile) throw new Error("SIGHUP fixture paths are missing")
+const pipeWriterFile = process.env.SWX_TUI_SIGHUP_PIPE_WRITER_FILE
+
+if (pipeWriterFile) {
+  const writer = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
+    stdin: "ignore",
+    stdout: "inherit",
+    stderr: "inherit",
+    detached: true,
+  })
+  await Bun.write(pipeWriterFile, String(writer.pid))
+}
 
 const identity = EventWriter.readIdentity(process.pid)
 if (!identity?.bootID || !identity.startTicks) throw new Error("nohup SIGHUP worker has no start identity")

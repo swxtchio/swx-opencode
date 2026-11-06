@@ -15,6 +15,7 @@ import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecy
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventWriter } from "@opencode-ai/core/event/writer"
+import { readGroupMembers } from "@opencode-ai/core/process-group"
 import { ProcessGroup } from "./process-group"
 
 Heap.start()
@@ -35,7 +36,26 @@ let server: Awaited<ReturnType<typeof Server.listen>> | undefined
 let testShutdownGate: Promise<void> | undefined
 const testSpawnerRuntimes = new Set<unknown>()
 
-const groupTracker = ProcessGroup.makeWorkerTracker((event) => Rpc.emit("process.group", event))
+const groupDiscoveryHoldFile = process.env.OPENCODE_TEST_HOME
+  ? process.env.SWX_TUI_GROUP_DISCOVERY_HOLD_FILE
+  : undefined
+const groupDiscoveryFailure = process.env.OPENCODE_TEST_HOME && process.env.SWX_TUI_GROUP_DISCOVERY_FAILURE === "1"
+const groupTracker = ProcessGroup.makeWorkerTracker(
+  (event) => Rpc.emit("process.group", event),
+  5_000,
+  async (pgid, identity) => {
+    if (groupDiscoveryHoldFile) {
+      const startedFile = `${groupDiscoveryHoldFile}.started`
+      const releaseFile = `${groupDiscoveryHoldFile}.release`
+      await Bun.write(startedFile, JSON.stringify({ pgid }))
+      const deadline = Date.now() + 30_000
+      while (Date.now() < deadline && !(await Bun.file(releaseFile).exists())) await Bun.sleep(20)
+      if (!(await Bun.file(releaseFile).exists())) throw new Error("test group discovery was not released")
+    }
+    if (groupDiscoveryFailure) throw new Error("injected process-group discovery failure")
+    return readGroupMembers(pgid, identity)
+  },
+)
 CrossSpawnSpawner.setProcessGroupObserver(groupTracker.observe)
 
 export const rpc = {
@@ -112,6 +132,43 @@ export const rpc = {
     )
     void runtime.runFork(task)
     return await spawned.promise
+  },
+  async testCompletedProcessGroups(input: { count: number }) {
+    if (!process.env.OPENCODE_TEST_HOME || !Number.isSafeInteger(input.count) || input.count < 1 || input.count > 64)
+      throw new Error("completed process-group test inputs are invalid")
+    const runtime = ManagedRuntime.make(LayerNode.compile(CrossSpawnSpawner.node))
+    testSpawnerRuntimes.add(runtime)
+    return runtime.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const spawner = yield* ChildProcessSpawner
+          const sizes: number[] = []
+          for (let index = 0; index < input.count; index++) {
+            const child = yield* spawner.spawn(
+              ChildProcess.make(process.execPath, ["-e", "process.exit(0)"], {
+                stdin: "ignore",
+                stdout: "ignore",
+                stderr: "ignore",
+                detached: true,
+              }),
+            )
+            yield* child.exitCode.pipe(Effect.timeout("5 seconds"))
+            const size = yield* Effect.promise(async () => {
+              const deadline = Date.now() + 5_000
+              while (groupTracker.size > 0 && Date.now() < deadline) await Bun.sleep(20)
+              return groupTracker.size
+            })
+            if (size !== 0) throw new Error(`completed process group ${index} remained tracked`)
+            sizes.push(size)
+          }
+          return sizes
+        }),
+      ),
+    )
+  },
+  testProcessGroupTrackerSize() {
+    if (!process.env.OPENCODE_TEST_HOME) throw new Error("test process-group fixture is not configured")
+    return groupTracker.size
   },
   ackProcessGroup(input: { eventID: number }) {
     return groupTracker.acknowledge(input.eventID)

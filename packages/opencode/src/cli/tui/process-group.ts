@@ -3,9 +3,10 @@ import type { ProcessGroupEvent } from "@opencode-ai/core/cross-spawn-spawner"
 import {
   decideGroupOwnership,
   hasIdentity,
+  isAlive,
   isGroupMember,
+  isLiveProcess,
   readGroupMembers,
-  sameProcess,
   sameIdentity,
   signalGroup,
 } from "@opencode-ai/core/process-group"
@@ -17,7 +18,9 @@ export type Event = ProcessGroupEvent & {
   readonly members: ReadonlyArray<EventWriter.ProcessIdentity>
   readonly membersPending: boolean
   readonly membersSnapshotComplete: boolean
+  readonly membersUnavailable: boolean
   readonly generation: number
+  readonly ownershipSequence: number
 }
 
 export type WorkerTracker = {
@@ -50,6 +53,7 @@ function groupOwnershipInput(group: Event, readIdentity: IdentityReader) {
     identities: [group.identity, ...group.members],
     cleanupOwed: group.cleanupOwed,
     membersPending: group.membersPending,
+    membersUnavailable: group.membersUnavailable,
     readIdentity,
   }
 }
@@ -77,11 +81,67 @@ export function makeWorkerTracker(
   emit: (event: Event) => void,
   ackTimeoutMs = 5_000,
   readMembers = readGroupMembers,
+  releasedMemberLifetimeMs = 5_000,
 ): WorkerTracker {
   const groups = new Map<number, Event>()
-  const queues = new Map<number, Promise<void>>()
+  const releasedMembers = new Map<
+    number,
+    {
+      identity: EventWriter.ProcessIdentity
+      members: ReadonlyArray<EventWriter.ProcessIdentity>
+      membersUnavailable: boolean
+      expiresAt: number
+    }
+  >()
+  const releasedTimers = new Map<number, ReturnType<typeof setTimeout>>()
+  const pendingSnapshots = new Map<number, number>()
+  const latestSnapshots = new Map<number, number>()
   const pending = new Map<number, { resolve: () => void }>()
   let eventID = 0
+  let ownershipSequence = 0
+
+  const retireReleasedMembers = (pgid: number) => {
+    const timer = releasedTimers.get(pgid)
+    if (timer) clearTimeout(timer)
+    releasedTimers.delete(pgid)
+    releasedMembers.delete(pgid)
+  }
+
+  const pruneReleasedMembers = () =>
+    releasedMembers.forEach((entry, pgid) => {
+      if (Date.now() >= entry.expiresAt || !isAlive(pgid)) retireReleasedMembers(pgid)
+    })
+
+  const rememberReleasedMembers = (
+    pgid: number,
+    identity: EventWriter.ProcessIdentity,
+    members: ReadonlyArray<EventWriter.ProcessIdentity>,
+    membersUnavailable: boolean,
+    decision: ReturnType<typeof decideGroupOwnership>,
+  ) => {
+    if (decision.action === "prune" || (!members.length && decision.evidence !== "unavailable")) {
+      retireReleasedMembers(pgid)
+      return
+    }
+    retireReleasedMembers(pgid)
+    const entry = { identity, members, membersUnavailable, expiresAt: Date.now() + releasedMemberLifetimeMs }
+    releasedMembers.set(pgid, entry)
+    const timer = setTimeout(() => {
+      if (releasedMembers.get(pgid) === entry) retireReleasedMembers(pgid)
+    }, releasedMemberLifetimeMs)
+    timer.unref?.()
+    releasedTimers.set(pgid, timer)
+  }
+
+  const finishSnapshot = (pgid: number) => {
+    const count = (pendingSnapshots.get(pgid) ?? 1) - 1
+    if (count > 0) {
+      pendingSnapshots.set(pgid, count)
+      return
+    }
+    pendingSnapshots.delete(pgid)
+    latestSnapshots.delete(pgid)
+  }
 
   const publish = async (event: Event) => {
     const acknowledgement = Promise.withResolvers<void>()
@@ -95,50 +155,37 @@ export function makeWorkerTracker(
     }
   }
 
-  const observeOrdered = async (event: ProcessGroupEvent) => {
+  const observe = (event: ProcessGroupEvent) => {
+    pruneReleasedMembers()
     const previous = groups.get(event.pgid)
-    const identity = hasIdentity(event.identity) ? event.identity : previous?.identity ?? event.identity
+    const released = releasedMembers.get(event.pgid)
+    const identity = hasIdentity(event.identity)
+      ? event.identity
+      : previous?.identity ?? released?.identity ?? event.identity
+    const reuseReleasedMembers =
+      event.action === "acquire" && released !== undefined && sameIdentity(released.identity, identity)
+    if (released && event.action === "acquire" && !reuseReleasedMembers) retireReleasedMembers(event.pgid)
+    const sequence = ++ownershipSequence
+    if (pendingSnapshots.has(event.pgid)) latestSnapshots.set(event.pgid, sequence)
     const members = new Map<number, EventWriter.ProcessIdentity>()
     if (previous && sameIdentity(previous.identity, identity))
       previous.members.forEach((member) => members.set(member.pid, member))
+    if (reuseReleasedMembers) released.members.forEach((member) => members.set(member.pid, member))
     event.members?.forEach((member) => members.set(member.pid, member))
     const currentMembers = [...members.values()].filter((member) => isGroupMember(event.pgid, member))
     const generation = event.generation ?? previous?.generation ?? 0
     const membersSnapshotComplete = event.membersSnapshotComplete ?? false
+    const membersUnavailable = event.membersUnavailable ?? released?.membersUnavailable ?? false
     const membersPending =
       event.membersPending ??
-      (event.cleanupOwed && !membersSnapshotComplete && hasIdentity(identity) && !sameProcess(identity))
+      (event.cleanupOwed && !membersSnapshotComplete && !membersUnavailable && hasIdentity(identity) && !isLiveProcess(identity))
     const decision = decideGroupOwnership({
       pgid: event.pgid,
       identities: [identity, ...currentMembers],
       cleanupOwed: event.cleanupOwed,
       membersPending,
+      membersUnavailable,
     })
-    if (event.action === "acquire" && decision.action === "signal") {
-      groups.set(event.pgid, {
-        ...event,
-        eventID: -1,
-        identity,
-        members: currentMembers,
-        membersPending,
-        membersSnapshotComplete,
-        generation,
-      })
-    }
-    if (event.action === "release") {
-      const currentDecision = previous
-        ? decideGroupOwnership({
-            pgid: event.pgid,
-            identities: [previous.identity, ...previous.members],
-            cleanupOwed: previous.cleanupOwed,
-            membersPending: previous.membersPending,
-          })
-        : decision
-      if ((previous && sameIdentity(previous.identity, identity)) || currentDecision.action === "prune")
-        groups.delete(event.pgid)
-    }
-    if (decision.action === "prune" && event.action === "acquire") groups.delete(event.pgid)
-    const needsSnapshot = event.action === "acquire" && event.cleanupOwed && !membersSnapshotComplete
     const enriched: Event = {
       ...event,
       eventID: eventID++,
@@ -146,71 +193,117 @@ export function makeWorkerTracker(
       members: currentMembers,
       membersPending,
       membersSnapshotComplete,
+      membersUnavailable,
       generation,
+      ownershipSequence: sequence,
     }
+    if (event.action === "acquire") {
+      retireReleasedMembers(event.pgid)
+      if (decision.action === "signal") groups.set(event.pgid, enriched)
+      else groups.delete(event.pgid)
+    }
+    const releaseMatches = !previous || sameIdentity(previous.identity, identity)
+    if (event.action === "release") {
+      const currentDecision = previous
+        ? decideGroupOwnership({
+            pgid: event.pgid,
+            identities: [previous.identity, ...previous.members],
+            cleanupOwed: previous.cleanupOwed,
+            membersPending: previous.membersPending,
+            membersUnavailable: previous.membersUnavailable,
+          })
+        : decision
+      if (releaseMatches || currentDecision.action === "prune") groups.delete(event.pgid)
+      if (releaseMatches && released && sameIdentity(released.identity, identity)) retireReleasedMembers(event.pgid)
+    }
+    const needsSnapshot =
+      (event.action === "acquire" &&
+        decision.action === "signal" &&
+        event.cleanupOwed &&
+        !membersSnapshotComplete &&
+        !membersUnavailable) ||
+      (event.action === "release" &&
+        releaseMatches &&
+        !membersSnapshotComplete &&
+        !membersUnavailable &&
+        isAlive(event.pgid))
+    if (needsSnapshot) {
+      pendingSnapshots.set(event.pgid, (pendingSnapshots.get(event.pgid) ?? 0) + 1)
+      latestSnapshots.set(event.pgid, sequence)
+    }
+    if (event.action === "release" && !needsSnapshot && releaseMatches) {
+      rememberReleasedMembers(
+        event.pgid,
+        identity,
+        currentMembers,
+        membersUnavailable,
+        decideGroupOwnership({
+          pgid: event.pgid,
+          identities: [identity, ...currentMembers],
+          cleanupOwed: false,
+          membersPending: false,
+          membersUnavailable,
+        }),
+      )
+    }
+    const acknowledgement = publish(enriched)
     if (!needsSnapshot) {
-      await publish(enriched)
-      return
+      if (!pendingSnapshots.has(event.pgid)) latestSnapshots.delete(event.pgid)
+      return acknowledgement
     }
 
-    const initialAck = publish(enriched).then(
-      () => ({ ok: true as const }),
-      (error) => ({ ok: false as const, error }),
-    )
-    const snapshot = readMembers(event.pgid, identity).then(
-      (found) => ({ ok: true as const, found }),
-      (error) => ({ ok: false as const, error }),
-    )
-    const [ack, discovery] = await Promise.all([initialAck, snapshot])
-    if (!discovery.ok) {
-      if (!ack.ok) throw ack.error
-      return
-    }
-
-    const resolvedMembers = new Map(currentMembers.map((member) => [member.pid, member] as const))
-    discovery.found.members.forEach((member) => resolvedMembers.set(member.pid, member))
-    const nextMembers = [...resolvedMembers.values()]
-    const nextMembersPending = membersPending && !discovery.found.complete
-    const nextDecision = decideGroupOwnership({
-      pgid: event.pgid,
-      identities: [identity, ...nextMembers],
-      cleanupOwed: event.cleanupOwed,
-      membersPending: nextMembersPending,
-    })
-    const resolvedEvent: Event = {
-      ...enriched,
-      action: nextDecision.action === "prune" ? "release" : "acquire",
-      eventID: eventID++,
-      members: nextDecision.action === "prune" ? [] : nextMembers,
-      membersPending: nextMembersPending,
-      membersSnapshotComplete: discovery.found.complete,
-    }
-    if (nextDecision.action === "signal")
-      groups.set(event.pgid, { ...resolvedEvent, action: "acquire" })
-    if (nextDecision.action === "prune") groups.delete(event.pgid)
-    const resolvedAck = publish(resolvedEvent).then(
-      () => ({ ok: true as const }),
-      (error) => ({ ok: false as const, error }),
-    )
-    const result = await resolvedAck
-    if (!ack.ok) throw ack.error
-    if (!result.ok) throw result.error
+    void readMembers(event.pgid, identity)
+      .catch(() => ({ members: [], complete: false }))
+      .then((discovery) => {
+        if (latestSnapshots.get(event.pgid) !== sequence) return
+        const current = groups.get(event.pgid)
+        if (event.action === "acquire" && current?.ownershipSequence !== sequence) return
+        if (event.action === "release" && current) return
+        const resolvedMembers = new Map(currentMembers.map((member) => [member.pid, member] as const))
+        discovery.members.forEach((member) => resolvedMembers.set(member.pid, member))
+        const nextMembers = [...resolvedMembers.values()].filter((member) => isGroupMember(event.pgid, member))
+        const nextMembersUnavailable = !discovery.complete
+        if (event.action === "release") {
+          const releasedDecision = decideGroupOwnership({
+            pgid: event.pgid,
+            identities: [identity, ...nextMembers],
+            cleanupOwed: false,
+            membersPending: false,
+            membersUnavailable: nextMembersUnavailable,
+          })
+          rememberReleasedMembers(event.pgid, identity, nextMembers, nextMembersUnavailable, releasedDecision)
+          return
+        }
+        const nextDecision = decideGroupOwnership({
+          pgid: event.pgid,
+          identities: [identity, ...nextMembers],
+          cleanupOwed: event.cleanupOwed,
+          membersPending: false,
+          membersUnavailable: nextMembersUnavailable,
+        })
+        const resolvedEvent: Event = {
+          ...enriched,
+          action: nextDecision.action === "prune" ? "release" : "acquire",
+          eventID: eventID++,
+          members: nextDecision.action === "prune" ? [] : nextMembers,
+          membersPending: false,
+          membersSnapshotComplete: discovery.complete,
+          membersUnavailable: nextMembersUnavailable,
+        }
+        if (nextDecision.action === "signal") groups.set(event.pgid, resolvedEvent)
+        if (nextDecision.action === "prune") {
+          groups.delete(event.pgid)
+          retireReleasedMembers(event.pgid)
+        }
+        return publish(resolvedEvent)
+      })
+      .catch(() => {})
+      .finally(() => finishSnapshot(event.pgid))
+    return acknowledgement
   }
 
   return {
-    observe(event) {
-      const previous = queues.get(event.pgid)
-      const current = previous ? previous.then(() => observeOrdered(event)) : observeOrdered(event)
-      const tail = current.then(
-        () => undefined,
-        () => undefined,
-      )
-      queues.set(event.pgid, tail)
-      void tail.then(() => {
-        if (queues.get(event.pgid) === tail) queues.delete(event.pgid)
-      })
-      return current
-    },
+    observe,
     acknowledge(id) {
       const acknowledgement = pending.get(id)
       if (!acknowledgement) return false
@@ -219,7 +312,8 @@ export function makeWorkerTracker(
       return true
     },
     get size() {
-      return groups.size
+      pruneReleasedMembers()
+      return new Set([...groups.keys(), ...releasedMembers.keys(), ...pendingSnapshots.keys()]).size
     },
   }
 }
@@ -234,19 +328,25 @@ export function makeOwner(input: {
   const readIdentity = input.readIdentity ?? EventWriter.readIdentity
   const unsubscribe = input.client.subscribe((event) => {
     const current = groups.get(event.pgid)
+    if (current && event.ownershipSequence < current.ownershipSequence) {
+      void input.client.acknowledge(event.eventID).catch(() => {})
+      return
+    }
     const identity = current && hasIdentity(current.identity) && !hasIdentity(event.identity) ? current.identity : event.identity
     const members = new Map<number, EventWriter.ProcessIdentity>()
     current?.members.forEach((member) => members.set(member.pid, member))
     event.members.forEach((member) => members.set(member.pid, member))
     const membersSnapshotComplete = event.membersSnapshotComplete ?? current?.membersSnapshotComplete ?? false
+    const membersUnavailable = event.membersUnavailable ?? current?.membersUnavailable ?? false
     const next: Event = {
       ...event,
       identity,
       members: [...members.values()],
       membersPending:
         event.membersPending ??
-        (event.cleanupOwed && !membersSnapshotComplete && hasIdentity(identity) && !sameProcess(identity)),
+        (event.cleanupOwed && !membersSnapshotComplete && !membersUnavailable && hasIdentity(identity) && !isLiveProcess(identity)),
       membersSnapshotComplete,
+      membersUnavailable,
       generation: event.generation ?? current?.generation ?? 0,
     }
     const decision = decideGroupOwnership({
@@ -254,6 +354,7 @@ export function makeOwner(input: {
       identities: [next.identity, ...next.members],
       cleanupOwed: next.cleanupOwed,
       membersPending: next.membersPending,
+      membersUnavailable: next.membersUnavailable,
       readIdentity,
     })
     if (event.action === "acquire") {
@@ -269,6 +370,7 @@ export function makeOwner(input: {
           identities: [current.identity, ...current.members],
           cleanupOwed: current.cleanupOwed,
           membersPending: current.membersPending,
+          membersUnavailable: current.membersUnavailable,
           readIdentity,
         }).action === "prune"
       ) {

@@ -62,7 +62,7 @@ async function bounded<T>(promise: Promise<T>, timeoutMs: number): Promise<T | u
   return value
 }
 
-async function runSighupFixture(mode: SighupFixtureMode): Promise<SighupFixtureResult> {
+async function runSighupFixture(mode: SighupFixtureMode, pipeWriterFile?: string): Promise<SighupFixtureResult> {
   if (process.platform !== "linux") throw new Error("SIGHUP process fixture requires Linux")
   await using temp = await tmpdir()
   const readyFile = path.join(temp.path, "ready.json")
@@ -79,6 +79,7 @@ async function runSighupFixture(mode: SighupFixtureMode): Promise<SighupFixtureR
     SWX_TUI_SIGHUP_READY_FILE: readyFile,
     SWX_TUI_SIGHUP_RESULT_FILE: resultFile,
     SWX_TUI_SIGHUP_ACK_FILE: acknowledgementFile,
+    SWX_TUI_SIGHUP_PIPE_WRITER_FILE: pipeWriterFile,
   }
   const options = {
     cwd: process.cwd(),
@@ -344,57 +345,46 @@ test("non-TTY listener policy leaves SIGHUP at the OS default", async () => {
   })
 })
 
-test("SIGHUP output drain is bounded when a writer outlives its launcher", async () => {
+test("runSighupFixture fails inside its drain bound when a writer outlives the launcher", async () => {
   if (process.platform !== "linux") return
   await using temp = await tmpdir()
   const writerPIDFile = path.join(temp.path, "writer.pid")
-  const exitFile = path.join(temp.path, "launcher.exit")
-  const program = [
-    "import os,subprocess,time",
-    "writer=subprocess.Popen(['sleep','30'])",
-    `open(${JSON.stringify(writerPIDFile)},"w").write(str(writer.pid))`,
-    `while not os.path.exists(${JSON.stringify(exitFile)}): time.sleep(0.01)`,
-  ].join("\n")
-  const launcher = Bun.spawn(["python3", "-c", program], {
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-    detached: true,
-  })
-  const identity = EventWriter.readIdentity(launcher.pid)
-  if (!identity?.bootID || !identity.startTicks) throw new Error("pipe fixture launcher has no process identity")
   let writerIdentity: EventWriter.ProcessIdentity | undefined
-  const output = Promise.all([new Response(launcher.stdout).text(), new Response(launcher.stderr).text()])
+  let result:
+    | { readonly type: "rejected"; readonly message: string }
+    | { readonly type: "resolved" }
+    | undefined
   try {
-    const writerPID = await bounded(
-      (async () => {
-        while (!(await Bun.file(writerPIDFile).exists())) await Bun.sleep(20)
-        return Number((await Bun.file(writerPIDFile).text()).trim())
-      })(),
-      5_000,
+    result = await bounded(
+      runSighupFixture("non-tty", writerPIDFile).then(
+        () => ({ type: "resolved" as const }),
+        (error: unknown) => ({
+          type: "rejected" as const,
+          message: error instanceof Error ? error.message : String(error),
+        }),
+      ),
+      12_000,
     )
-    if (!writerPID) throw new Error("pipe fixture did not start its inherited writer")
-    writerIdentity = EventWriter.readIdentity(writerPID)
-    if (!writerIdentity?.bootID || !writerIdentity.startTicks)
-      throw new Error("pipe fixture writer has no process identity")
-    await Bun.write(exitFile, "exit")
-    expect(await bounded(launcher.exited, 5_000)).toBe(0)
-    expect(await drainPipeOutput(output, 100)).toEqual({ type: "timeout" })
+    const writerPID = Number((await Bun.file(writerPIDFile).text().catch(() => "")).trim())
+    if (Number.isSafeInteger(writerPID) && writerPID > 0) writerIdentity = EventWriter.readIdentity(writerPID)
+    expect(result?.type).toBe("rejected")
+    if (result?.type === "rejected")
+      expect(result.message).toContain("SIGHUP launcher exited while a writer still held stdout/stderr open")
   } finally {
     if (writerIdentity && sameProcess(writerIdentity)) {
       try {
         process.kill(writerIdentity.pid, "SIGKILL")
       } catch {}
     }
-    if (processGroupMember(launcher.pid, identity)) {
-      try {
-        process.kill(-launcher.pid, "SIGKILL")
-      } catch {}
-    }
-    await bounded(launcher.exited, 5_000)
-    expect((await drainPipeOutput(output, 5_000)).type).toBe("drained")
+    if (writerIdentity)
+      await bounded(
+        (async () => {
+          while (sameProcess(writerIdentity!)) await Bun.sleep(20)
+        })(),
+        5_000,
+      )
   }
-})
+}, 20_000)
 
 test("app.exit prints the session epilogue after scoped cleanup", async () => {
   const setup = await createTestRenderer({ width: 80, height: 24, useThread: false })

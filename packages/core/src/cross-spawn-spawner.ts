@@ -29,8 +29,8 @@ import { EventWriter } from "./event/writer"
 import {
   decideGroupOwnership,
   hasIdentity,
+  isLiveProcess,
   readGroupMembers,
-  sameProcess,
   signalGroup,
 } from "./process-group"
 import { makeGlobalNode } from "./effect/app-node"
@@ -44,6 +44,7 @@ type OwnedProcessGroup = {
   members: EventWriter.ProcessIdentity[]
   membersPending: boolean
   membersSnapshotComplete: boolean
+  membersUnavailable: boolean
   generation: number
 }
 type GroupOwner = { value: OwnedProcessGroup | undefined }
@@ -56,6 +57,7 @@ export type ProcessGroupEvent = {
   readonly members?: ReadonlyArray<EventWriter.ProcessIdentity>
   readonly membersPending?: boolean
   readonly membersSnapshotComplete?: boolean
+  readonly membersUnavailable?: boolean
   readonly generation?: number
 }
 type ProcessGroupObserver = (event: ProcessGroupEvent) => Promise<void>
@@ -96,6 +98,7 @@ function processGroupEvent(group: OwnedProcessGroup, action: ProcessGroupEvent["
     members: group.members,
     membersPending: group.membersPending,
     membersSnapshotComplete: group.membersSnapshotComplete,
+    membersUnavailable: group.membersUnavailable,
     generation: group.generation,
   }
 }
@@ -106,6 +109,7 @@ function groupOwnershipInput(group: OwnedProcessGroup) {
     identities: [group.identity, ...group.members],
     cleanupOwed: group.cleanupOwed,
     membersPending: group.membersPending,
+    membersUnavailable: group.membersUnavailable,
   }
 }
 
@@ -113,22 +117,24 @@ function releaseGroup(group: OwnedProcessGroup) {
   if (!groups.delete(group)) return
   group.cleanupOwed = false
   group.membersPending = false
-  group.membersSnapshotComplete = true
+  group.membersUnavailable = false
   group.generation++
   return notifyProcessGroup(processGroupEvent(group, "release"))
 }
 
 async function rememberGroupMembers(group: OwnedProcessGroup, generation: number) {
-  const pendingLeader = group.cleanupOwed && hasIdentity(group.identity) && !sameProcess(group.identity)
+  const pendingLeader = group.cleanupOwed && hasIdentity(group.identity) && !isLiveProcess(group.identity)
   group.membersPending = pendingLeader
   group.membersSnapshotComplete = false
-  const discovered = await readGroupMembers(group.pid, group.identity)
+  group.membersUnavailable = false
+  const discovered = await readGroupMembers(group.pid, group.identity).catch(() => ({ members: [], complete: false }))
   if (!groups.has(group) || group.generation !== generation) return { action: "prune", evidence: "gone" } as const
   const members = new Map(group.members.map((member) => [member.pid, member] as const))
   discovered.members.forEach((member) => members.set(member.pid, member))
   group.members = [...members.values()]
-  group.membersPending = pendingLeader && !discovered.complete
+  group.membersPending = false
   group.membersSnapshotComplete = discovered.complete
+  group.membersUnavailable = !discovered.complete
   return decideGroupOwnership(groupOwnershipInput(group))
 }
 
@@ -140,8 +146,9 @@ export async function shutdownOwnedProcessGroups() {
   const announcements = owned.map((group) => {
     group.cleanupOwed = true
     group.generation++
-    group.membersPending = hasIdentity(group.identity) && !sameProcess(group.identity)
+    group.membersPending = hasIdentity(group.identity) && !isLiveProcess(group.identity)
     group.membersSnapshotComplete = false
+    group.membersUnavailable = false
     const ownership = {
       pgid: group.pid,
       identities: [group.identity, ...group.members],
@@ -169,9 +176,11 @@ export async function shutdownOwnedProcessGroups() {
           return
         }
       }
-      const snapshot = await rememberGroupMembers(item.group, item.generation).catch(
-        () => ({ action: "signal", evidence: "pending" }) as const,
-      )
+      const snapshot = await rememberGroupMembers(item.group, item.generation).catch(() => {
+        item.group.membersPending = false
+        item.group.membersUnavailable = true
+        return decideGroupOwnership(groupOwnershipInput(item.group))
+      })
       if (!groups.has(item.group) || item.group.generation !== item.generation) return
       if (snapshot.action === "prune") {
         await releaseGroup(item.group)?.catch(() => {})
@@ -469,8 +478,9 @@ export const make = Effect.gen(function* () {
             (Predicate.isNotUndefined(command.options.forceKillAfter) && abnormal)
           if (group.cleanupOwed) {
             group.generation++
-            group.membersPending = hasIdentity(group.identity) && !sameProcess(group.identity)
+            group.membersPending = hasIdentity(group.identity) && !isLiveProcess(group.identity)
             group.membersSnapshotComplete = false
+            group.membersUnavailable = false
             const generation = group.generation
             const notification = notifyProcessGroup(processGroupEvent(group, "acquire"))
             if (notification) void notification.catch(() => {})
@@ -501,6 +511,7 @@ export const make = Effect.gen(function* () {
             members: [],
             membersPending: false,
             membersSnapshotComplete: false,
+            membersUnavailable: false,
             generation: 0,
           }
           groupOwner.value = group
@@ -520,8 +531,9 @@ export const make = Effect.gen(function* () {
                 }
                 group.cleanupOwed = true
                 group.generation++
-                group.membersPending = hasIdentity(group.identity) && !sameProcess(group.identity)
+                group.membersPending = hasIdentity(group.identity) && !isLiveProcess(group.identity)
                 group.membersSnapshotComplete = false
+                group.membersUnavailable = false
                 groups.add(group)
                 const generation = group.generation
                 const ownership = groupOwnershipInput(group)
@@ -543,9 +555,11 @@ export const make = Effect.gen(function* () {
                     return
                   }
                 }
-                const snapshot = await rememberGroupMembers(group, generation).catch(
-                  () => ({ action: "signal", evidence: "pending" }) as const,
-                )
+                const snapshot = await rememberGroupMembers(group, generation).catch(() => {
+                  group.membersPending = false
+                  group.membersUnavailable = true
+                  return decideGroupOwnership(groupOwnershipInput(group))
+                })
                 if (!groups.has(group) || group.generation !== generation) {
                   resume(Effect.fail(toPlatformError("spawn", toError(error), command)))
                   return
@@ -695,8 +709,9 @@ export const make = Effect.gen(function* () {
     if (group) {
       group.cleanupOwed = true
       group.generation++
-      group.membersPending = hasIdentity(group.identity) && !sameProcess(group.identity)
+      group.membersPending = hasIdentity(group.identity) && !isLiveProcess(group.identity)
       group.membersSnapshotComplete = false
+      group.membersUnavailable = false
       groups.add(group)
       const generation = group.generation
       notifyProcessGroup(processGroupEvent(group, "acquire"))

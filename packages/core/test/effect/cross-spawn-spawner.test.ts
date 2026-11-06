@@ -730,6 +730,42 @@ describe("cross-spawn spawner", () => {
       }),
     )
 
+    fx.live(
+      "refutes a reused live leader before honoring a pending snapshot",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+
+        const group: RecordedProcessGroup = { pgid: undefined, members: [] }
+        yield* Effect.addFinalizer(() => cleanupRecordedProcessGroup(group))
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+        const handle = yield* spawner.spawn(
+          js("setInterval(() => {}, 1000)", {
+            detached: true,
+            stdin: "ignore",
+            stdout: "ignore",
+            stderr: "ignore",
+          }),
+        )
+        const pgid = Number(handle.pid)
+        group.pgid = pgid
+        const identity = processIdentity(pgid)
+        if (!identity?.bootID || !identity.startTicks) throw new Error("reused-leader fixture has no identity")
+        group.members.push(identity)
+        recordProcess(pgid, identity)
+        const stale = { ...identity, startTicks: `${identity.startTicks}:stale` }
+
+        expect(groupAlive(pgid)).toBe(true)
+        expect(
+          ProcessGroup.decideGroupOwnership({
+            pgid,
+            identities: [stale],
+            cleanupOwed: true,
+            membersPending: true,
+          }),
+        ).toEqual({ action: "prune", evidence: "refuted" })
+      }),
+    )
+
     fx.effect(
       "kills a running process",
       Effect.gen(function* () {

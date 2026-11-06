@@ -24,6 +24,16 @@ export function sameProcess(identity: EventWriter.ProcessIdentity, readIdentity 
   return sameIdentity(identity, readIdentity(identity.pid))
 }
 
+export function isLiveProcess(identity: EventWriter.ProcessIdentity, readIdentity = EventWriter.readIdentity) {
+  if (!hasIdentity(identity) || !sameIdentity(identity, readIdentity(identity.pid)) || process.platform !== "linux")
+    return false
+  try {
+    return isLiveProcessStat(readFileSync(`/proc/${identity.pid}/stat`, "utf8"))
+  } catch {
+    return false
+  }
+}
+
 export function processGroupIDFromStat(stat: string) {
   const value = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[2])
   return Number.isSafeInteger(value) && value > 0 ? value : undefined
@@ -91,6 +101,7 @@ export type GroupOwnershipInput = {
   readonly identities: Iterable<EventWriter.ProcessIdentity>
   readonly cleanupOwed?: boolean
   readonly membersPending?: boolean
+  readonly membersUnavailable?: boolean
   readonly readIdentity?: IdentityReader
 }
 export type GroupMembersSnapshot = {
@@ -101,12 +112,24 @@ export type GroupMembersSnapshot = {
 export function decideGroupOwnership(input: GroupOwnershipInput): GroupOwnershipDecision {
   if (!isAlive(input.pgid)) return { action: "prune", evidence: "gone" }
   const readIdentity = input.readIdentity ?? EventWriter.readIdentity
-  const confirmed = Array.from(input.identities).some(
+  const identities = Array.from(input.identities)
+  const recordedLeader = identities.find((identity) => identity.pid === input.pgid && hasIdentity(identity))
+  const currentLeader = readIdentity(input.pgid)
+  // A different live leader at pid==pgid proves the recorded group number was reused.
+  if (
+    recordedLeader &&
+    hasIdentity(currentLeader) &&
+    !sameIdentity(recordedLeader, currentLeader) &&
+    isGroupMember(input.pgid, currentLeader, readIdentity)
+  )
+    return { action: "prune", evidence: "refuted" }
+  const confirmed = identities.some(
     (identity) => hasIdentity(identity) && isGroupMember(input.pgid, identity, readIdentity),
   )
   if (confirmed) return { action: "signal", evidence: "confirmed" }
   if (input.cleanupOwed && input.membersPending) return { action: "signal", evidence: "pending" }
-  if (!hasIdentity(readIdentity(process.pid))) return { action: "signal", evidence: "unavailable" }
+  if (input.membersUnavailable || !hasIdentity(readIdentity(process.pid)))
+    return { action: "signal", evidence: "unavailable" }
   return { action: "prune", evidence: "refuted" }
 }
 

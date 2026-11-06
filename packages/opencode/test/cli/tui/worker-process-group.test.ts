@@ -7,7 +7,13 @@ import path from "node:path"
 import { withTimeout } from "../../../src/util/timeout"
 import { groupAlive, processGroupFixture, processIdentity, sameProcess } from "../../../../core/test/fixture/process-group"
 import type { ProcessGroupFixture, ProcessIdentity } from "../../../../core/test/fixture/process-group"
-type OwnerGroupEvent = { readonly action: string; readonly cleanupOwed: boolean; readonly groupAlive: boolean }
+type OwnerGroupEvent = {
+  readonly action: string
+  readonly cleanupOwed: boolean
+  readonly groupAlive: boolean
+  readonly membersPending: boolean
+  readonly membersUnavailable: boolean
+}
 
 const cases = [
   { action: "exit", name: "exit-gated", resistTerm: true, blockShutdown: true, exitMode: "long", result: "gone" },
@@ -46,6 +52,14 @@ const cases = [
     result: "released",
   },
   { action: "worker-error", name: "worker-error", resistTerm: true, blockShutdown: false, exitMode: "long", result: "gone" },
+  {
+    action: "discovery-failure",
+    name: "discovery-failure",
+    resistTerm: true,
+    blockShutdown: false,
+    exitMode: "cleanup-owed",
+    result: "gone",
+  },
   { action: "stop-confirmed", name: "stop-confirmed", resistTerm: false, blockShutdown: false, exitMode: "long", result: "gone" },
 ] as const
 
@@ -60,7 +74,11 @@ function ownerGroupEvents(value: unknown): OwnerGroupEvent[] {
       "cleanupOwed" in event &&
       typeof event.cleanupOwed === "boolean" &&
       "groupAlive" in event &&
-      typeof event.groupAlive === "boolean",
+      typeof event.groupAlive === "boolean" &&
+      "membersPending" in event &&
+      typeof event.membersPending === "boolean" &&
+      "membersUnavailable" in event &&
+      typeof event.membersUnavailable === "boolean",
   )
 }
 
@@ -83,6 +101,8 @@ async function runOwnerCase(input: (typeof cases)[number]) {
   const recordFile = path.join(home, `worker-process-group-${input.name}.json`)
   const resultFile = path.join(home, `worker-process-group-${input.name}-result.json`)
   const ownerStartFile = path.join(home, `worker-process-group-${input.name}-owner.json`)
+  const discoveryHoldFile = input.action === "stop-confirmed" ? path.join(home, "cleanup-discovery") : undefined
+  const cleanupAcquireEventFile = input.action === "stop-confirmed" ? path.join(home, "cleanup-acquire.json") : undefined
   const ownerFile = path.join(import.meta.dir, "worker-process-group-owner.ts")
   const env = Object.fromEntries(
     Object.entries({
@@ -98,6 +118,9 @@ async function runOwnerCase(input: (typeof cases)[number]) {
       SWX_TUI_GROUP_RECORD_FILE: recordFile,
       SWX_TUI_GROUP_RESIST_TERM: input.resistTerm ? "1" : "0",
       SWX_TUI_GROUP_EXIT_MODE: input.exitMode,
+      SWX_TUI_GROUP_DISCOVERY_FAILURE: input.action === "discovery-failure" ? "1" : undefined,
+      SWX_TUI_GROUP_DISCOVERY_HOLD_FILE: discoveryHoldFile,
+      SWX_TUI_GROUP_CLEANUP_ACQUIRE_EVENT_FILE: cleanupAcquireEventFile,
       SWX_TUI_BLOCK_SHUTDOWN: input.blockShutdown ? "1" : "0",
       SWX_TUI_OWNER_ACTION: input.action,
       SWX_TUI_GROUP_ACK_MODE:
@@ -159,6 +182,22 @@ async function runOwnerCase(input: (typeof cases)[number]) {
     }
     fixture = startup.fixture
     expect(fixture.pgid).toBe(fixture.leader.pid)
+    if (input.action === "stop-confirmed") {
+      if (!discoveryHoldFile || !cleanupAcquireEventFile) throw new Error("cleanup discovery witness paths are missing")
+      await withTimeout(
+        (async () => {
+          while (!(await Bun.file(cleanupAcquireEventFile).exists())) await Bun.sleep(20)
+        })(),
+        5_000,
+      )
+      await withTimeout(
+        (async () => {
+          while (!(await Bun.file(`${discoveryHoldFile}.started`).exists())) await Bun.sleep(20)
+        })(),
+        5_000,
+      )
+      await Bun.write(`${discoveryHoldFile}.release`, "release")
+    }
 
     const ownerResultState = await withTimeout(
       Promise.race([
@@ -216,6 +255,15 @@ async function runOwnerCase(input: (typeof cases)[number]) {
       expect("cleanupOwed" in ownerResult && ownerResult.cleanupOwed).toBe(true)
       expect(events.some((event) => event.action === "acquire" && event.cleanupOwed && event.groupAlive)).toBe(true)
     }
+    if (input.action === "discovery-failure") {
+      expect("ownerSize" in ownerResult && ownerResult.ownerSize).toBe(0)
+      expect(events.some((event) => event.action === "acquire" && event.cleanupOwed && event.membersPending)).toBe(true)
+      expect(
+        events.some(
+          (event) => event.action === "acquire" && event.cleanupOwed && event.membersUnavailable && !event.membersPending,
+        ),
+      ).toBe(true)
+    }
     if (input.result === "released") {
       expect(
         "ownerSize" in ownerResult &&
@@ -245,6 +293,7 @@ async function runOwnerCase(input: (typeof cases)[number]) {
     expect(sameProcess(fixture.leader)).toBe(false)
     expect(sameProcess(fixture.descendant)).toBe(false)
   } finally {
+    if (discoveryHoldFile) await Bun.write(`${discoveryHoldFile}.release`, "release").catch(() => {})
     if (fixture && (sameProcess(fixture.leader) || sameProcess(fixture.descendant))) {
       try {
         process.kill(-fixture.pgid, "SIGKILL")
@@ -270,6 +319,158 @@ test(
   120_000,
 )
 
+test("real Core cleanup publication beats a delayed initial acquire acknowledgement", async () => {
+  if (process.platform !== "linux") return
+  await using directory = await tmpdir()
+  const home = directory.path
+  const recordFile = path.join(home, "pending-owner-record.json")
+  const resultFile = path.join(home, "pending-owner-result.json")
+  const ownerStartFile = path.join(home, "pending-owner-start.json")
+  const firstEventFile = path.join(home, "pending-owner-first-event.json")
+  const pendingEventFile = path.join(home, "pending-owner-cleanup-event.json")
+  const initialAckStartedFile = path.join(home, "pending-owner-initial-ack-started")
+  const initialAckReleaseFile = path.join(home, "pending-owner-initial-ack-release")
+  const discoveryHoldFile = path.join(home, "pending-owner-discovery")
+  const ownerExitFile = path.join(home, "pending-owner-exit")
+  const ownerFile = path.join(import.meta.dir, "worker-process-group-owner.ts")
+  const ownerProcess = Bun.spawn([process.execPath, ownerFile], {
+    cwd: process.cwd(),
+    env: Object.fromEntries(
+      Object.entries({
+        ...process.env,
+        HOME: home,
+        OPENCODE_TEST_HOME: home,
+        OPENCODE_DB: ":memory:",
+        OPENCODE_CONFIG_CONTENT: "{}",
+        OPENCODE_DISABLE_PROJECT_CONFIG: "1",
+        OPENCODE_DISABLE_AUTOUPDATE: "1",
+        OPENCODE_DISABLE_AUTOCOMPACT: "1",
+        OPENCODE_DISABLE_MODELS_FETCH: "1",
+        SWX_TUI_GROUP_RECORD_FILE: recordFile,
+        SWX_TUI_GROUP_RESIST_TERM: "1",
+        SWX_TUI_GROUP_EXIT_MODE: "cleanup-owed",
+        SWX_TUI_GROUP_ACK_MODE: "delayed-initial",
+        SWX_TUI_GROUP_DISCOVERY_FAILURE: undefined,
+        SWX_TUI_GROUP_FIRST_EVENT_FILE: firstEventFile,
+        SWX_TUI_GROUP_PENDING_EVENT_FILE: pendingEventFile,
+        SWX_TUI_GROUP_INITIAL_ACK_STARTED_FILE: initialAckStartedFile,
+        SWX_TUI_GROUP_INITIAL_ACK_RELEASE_FILE: initialAckReleaseFile,
+        SWX_TUI_GROUP_DISCOVERY_HOLD_FILE: discoveryHoldFile,
+        SWX_TUI_OWNER_ACTION: "pending-owner-exit",
+        SWX_TUI_OWNER_START_FILE: ownerStartFile,
+        SWX_TUI_OWNER_RESULT_FILE: resultFile,
+        SWX_TUI_OWNER_EXIT_FILE: ownerExitFile,
+      }).filter((entry): entry is [string, string] => entry[1] !== undefined),
+    ),
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    detached: true,
+  })
+  const output = Promise.all([new Response(ownerProcess.stdout).text(), new Response(ownerProcess.stderr).text()])
+  const ownerIdentity = processIdentity(ownerProcess.pid)
+  let pgid: number | undefined
+  let descendant: ProcessIdentity | undefined
+
+  try {
+    const firstEvent = await withTimeout(
+      (async () => {
+        const deadline = Date.now() + 10_000
+        while (Date.now() < deadline) {
+          try {
+            const value: unknown = await Bun.file(firstEventFile).json()
+            if (typeof value === "object" && value !== null && "pgid" in value && typeof value.pgid === "number") {
+              const identity = "identity" in value ? processIdentity(value.identity) : undefined
+              if (identity) return { pgid: value.pgid, identity }
+            }
+          } catch {}
+          await Bun.sleep(20)
+        }
+        throw new Error("Core did not publish the initial acquire event")
+      })(),
+      12_000,
+    )
+    pgid = firstEvent.pgid
+    await withTimeout(
+      (async () => {
+        while (!(await Bun.file(initialAckStartedFile).exists())) await Bun.sleep(20)
+      })(),
+      5_000,
+    )
+    descendant = await withTimeout(
+      (async () => {
+        const deadline = Date.now() + 5_000
+        while (Date.now() < deadline) {
+          const pid = Number((await Bun.file(`${recordFile}.descendant`).text().catch(() => "")).trim())
+          const identity = processIdentity(pid)
+          if (identity && isGroupMember(pgid!, identity)) return identity
+          await Bun.sleep(20)
+        }
+        throw new Error("real Core producer did not start a live descendant")
+      })(),
+      5_500,
+    )
+    await Bun.write(`${recordFile}.exit`, "exit")
+    const pendingSeen = await withTimeout(
+      (async () => {
+        while (!(await Bun.file(pendingEventFile).exists())) await Bun.sleep(20)
+        return true
+      })(),
+      2_000,
+    ).then(
+      () => true,
+      () => false,
+    )
+    const discoveryHeld = await withTimeout(
+      (async () => {
+        while (!(await Bun.file(`${discoveryHoldFile}.started`).exists())) await Bun.sleep(20)
+        return true
+      })(),
+      2_000,
+    ).then(
+      () => true,
+      () => false,
+    )
+    expect(await Bun.file(initialAckReleaseFile).exists()).toBe(false)
+    await Bun.write(ownerExitFile, "exit")
+    const ownerExit = await withTimeout(ownerProcess.exited, 10_000)
+    if (ownerExit !== 0) {
+      const [stdout, stderr] = await withTimeout(output, 2_000)
+      throw new Error(`pending owner exited ${ownerExit}: ${stdout}\n${stderr}`)
+    }
+    const result: unknown = await Bun.file(resultFile).json()
+    const events = ownerGroupEvents(
+      typeof result === "object" && result !== null && "events" in result ? result.events : undefined,
+    )
+    expect(pendingSeen).toBe(true)
+    expect(discoveryHeld).toBe(true)
+    expect(events.some((event) => event.cleanupOwed && event.membersPending)).toBe(true)
+    await withTimeout(
+      (async () => {
+        while (isGroupMember(pgid!, descendant)) await Bun.sleep(20)
+      })(),
+      5_000,
+    )
+    expect(isGroupMember(pgid, descendant)).toBe(false)
+  } finally {
+    await Bun.write(`${recordFile}.exit`, "exit").catch(() => {})
+    await Bun.write(initialAckReleaseFile, "release").catch(() => {})
+    await Bun.write(`${discoveryHoldFile}.release`, "release").catch(() => {})
+    await Bun.write(ownerExitFile, "exit").catch(() => {})
+    if (pgid && descendant && isGroupMember(pgid, descendant)) {
+      try {
+        process.kill(-pgid, "SIGKILL")
+      } catch {}
+    }
+    if (ownerIdentity && sameProcess(ownerIdentity)) {
+      try {
+        process.kill(ownerProcess.pid, "SIGKILL")
+      } catch {}
+    }
+    await withTimeout(ownerProcess.exited, 5_000).catch(() => undefined)
+  }
+}, 30_000)
+
 test("owner uses the live-PGID fallback when process identity is unavailable", async () => {
   if (process.platform === "win32") return
   const child = Bun.spawn([process.execPath, "-e", 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)'], {
@@ -291,6 +492,7 @@ test("owner uses the live-PGID fallback when process identity is unavailable", a
     membersPending: false,
     membersSnapshotComplete: false,
     generation: 1,
+    ownershipSequence: 1,
   }
   const worker = { onerror: null as ((event: ErrorEvent) => unknown) | null, terminate: () => {} }
   const owner = ProcessGroup.makeOwner({
@@ -578,6 +780,64 @@ test("stop prunes a refuted live PGID without waiting for its deadline", async (
   }
 })
 
+test("owner prunes a refuted live leader even while cleanup discovery is pending", async () => {
+  if (process.platform !== "linux") return
+  const child = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "ignore",
+    detached: true,
+  })
+  const identity = EventWriter.readIdentity(child.pid)
+  if (!identity?.bootID || !identity.startTicks) throw new Error("refuted pending fixture has no identity")
+  const stale = { ...identity, startTicks: `${identity.startTicks}:stale` }
+  const event: ProcessGroup.Event = {
+    eventID: 1,
+    action: "acquire",
+    pgid: child.pid,
+    cleanupOwed: true,
+    identity: stale,
+    members: [],
+    membersPending: true,
+    membersSnapshotComplete: false,
+    generation: 1,
+    ownershipSequence: 1,
+  }
+  const worker = { onerror: null as ((event: ErrorEvent) => unknown) | null, terminate: () => {} }
+  const owner = ProcessGroup.makeOwner({
+    client: {
+      subscribe(handler) {
+        handler(event)
+        return () => {}
+      },
+      acknowledge: async () => undefined,
+      shutdown: async () => true,
+    },
+    worker,
+  })
+  const originalKill = process.kill.bind(process)
+  const forwarded: Array<NodeJS.Signals | number | string | undefined> = []
+  process.kill = ((pid, signal) => {
+    if (pid === -child.pid && signal === "SIGKILL") forwarded.push(signal)
+    return originalKill(pid, signal)
+  }) as typeof process.kill
+  try {
+    expect(groupAlive(child.pid)).toBe(true)
+    expect(owner.has(child.pid)).toBe(false)
+    await withTimeout(owner.stop(), 500)
+    expect(forwarded).toEqual([])
+    expect(sameProcess(identity)).toBe(true)
+  } finally {
+    process.kill = originalKill
+    if (sameProcess(identity)) {
+      try {
+        process.kill(-child.pid, "SIGKILL")
+      } catch {}
+    }
+    await withTimeout(child.exited, 5_000)
+  }
+})
+
 test("release then reacquire uses recorded descendant identity after the leader exits", async () => {
   if (process.platform !== "linux") return
   for (const mode of ["rejected", "delayed"] as const) {
@@ -692,141 +952,7 @@ test("release then reacquire uses recorded descendant identity after the leader 
   }
 })
 
-test("pending ownership kills a descendant when its owner exits before discovery resolves", async () => {
-  if (process.platform !== "linux") return
-  await using directory = await tmpdir()
-  const leaderPIDFile = path.join(directory.path, "pending-leader.pid")
-  const descendantPIDFile = path.join(directory.path, "pending-descendant.pid")
-  const leaderExitFile = path.join(directory.path, "pending-leader.exit")
-  const leaderExitedFile = path.join(directory.path, "pending-leader.exited")
-  const reapLeaderFile = path.join(directory.path, "pending-leader.reap")
-  const ownerReadyFile = path.join(directory.path, "pending-owner.ready")
-  const descendantCode = 'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(10**6)'
-  const leaderCode = [
-    "import os,subprocess,sys,time",
-    `child=subprocess.Popen([sys.executable,"-c",${JSON.stringify(descendantCode)}],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)`,
-    `open(${JSON.stringify(descendantPIDFile)},"w").write(str(child.pid))`,
-    `while not os.path.exists(${JSON.stringify(leaderExitFile)}): time.sleep(0.01)`,
-  ].join("\n")
-  const reaperCode = [
-    "import os,subprocess,sys,time",
-    `leader=subprocess.Popen([sys.executable,"-c",${JSON.stringify(leaderCode)}],start_new_session=True,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)`,
-    `open(${JSON.stringify(leaderPIDFile)},"w").write(str(leader.pid))`,
-    "os.waitid(os.P_PID,leader.pid,os.WEXITED|os.WNOWAIT)",
-    `open(${JSON.stringify(leaderExitedFile)},"w").write("ready")`,
-    `while not os.path.exists(${JSON.stringify(reapLeaderFile)}): time.sleep(0.01)`,
-    "os.waitpid(leader.pid,0)",
-  ].join("\n")
-  const reaper = Bun.spawn(["python3", "-c", reaperCode], {
-    stdin: "ignore",
-    stdout: "ignore",
-    stderr: "ignore",
-  })
-  const reaperIdentity = processIdentity(reaper.pid)
-  let owner: Bun.Subprocess | undefined
-  let ownerIdentity: ProcessIdentity | undefined
-  let pgid: number | undefined
-  let descendant: ProcessIdentity | undefined
-
-  try {
-    pgid = await withTimeout(
-      (async () => {
-        const deadline = Date.now() + 5_000
-        while (Date.now() < deadline) {
-          const pid = Number((await Bun.file(leaderPIDFile).text().catch(() => "")).trim())
-          if (Number.isSafeInteger(pid) && pid > 0) return pid
-          await Bun.sleep(20)
-        }
-        throw new Error("pending fixture did not publish its detached leader")
-      })(),
-      5_500,
-    )
-    const leader = EventWriter.readIdentity(pgid)
-    if (!leader?.bootID || !leader.startTicks) throw new Error("pending fixture leader has no identity")
-    descendant = await withTimeout(
-      (async () => {
-        const deadline = Date.now() + 5_000
-        while (Date.now() < deadline) {
-          const pid = Number((await Bun.file(descendantPIDFile).text().catch(() => "")).trim())
-          const identity = processIdentity(pid)
-          if (identity && sameProcess(identity)) return identity
-          await Bun.sleep(20)
-        }
-        throw new Error("pending fixture did not publish its live descendant")
-      })(),
-      5_500,
-    )
-    expect(groupAlive(pgid)).toBe(true)
-    expect(isGroupMember(pgid, descendant)).toBe(true)
-
-    await Bun.write(leaderExitFile, "exit")
-    await withTimeout(
-      (async () => {
-        while ((await Bun.file(leaderExitedFile).text().catch(() => "")).trim() !== "ready") await Bun.sleep(20)
-      })(),
-      5_000,
-    )
-    const zombieLeader = EventWriter.readIdentity(pgid)
-    if (!zombieLeader || zombieLeader.startTicks !== leader.startTicks)
-      throw new Error("pending fixture did not retain the exited leader for the held discovery window")
-    expect(isGroupMember(pgid, descendant)).toBe(true)
-
-    const ownerFile = path.join(import.meta.dir, "worker-process-group-pending-owner.ts")
-    owner = Bun.spawn([process.execPath, ownerFile], {
-      env: Object.fromEntries(
-        Object.entries({
-          ...process.env,
-          SWX_TUI_PENDING_PGID: String(pgid),
-          SWX_TUI_PENDING_READY_FILE: ownerReadyFile,
-        }).filter((entry): entry is [string, string] => entry[1] !== undefined),
-      ),
-      stdin: "ignore",
-      stdout: "ignore",
-      stderr: "ignore",
-      detached: true,
-    })
-    ownerIdentity = processIdentity(owner.pid)
-    await withTimeout(
-      (async () => {
-        while (!(await Bun.file(ownerReadyFile).exists())) await Bun.sleep(20)
-      })(),
-      5_000,
-    )
-    expect(await withTimeout(owner.exited, 5_000)).toBe(0)
-    await withTimeout(
-      (async () => {
-        while (isGroupMember(pgid!, descendant)) await Bun.sleep(20)
-      })(),
-      5_000,
-    )
-    expect(isGroupMember(pgid, descendant)).toBe(false)
-
-    await Bun.write(reapLeaderFile, "reap")
-    expect(await withTimeout(reaper.exited, 5_000)).toBe(0)
-  } finally {
-    await Bun.write(leaderExitFile, "exit").catch(() => {})
-    if (pgid && descendant && isGroupMember(pgid, descendant)) {
-      try {
-        process.kill(-pgid, "SIGKILL")
-      } catch {}
-    }
-    await Bun.write(reapLeaderFile, "reap").catch(() => {})
-    if (owner && ownerIdentity && sameProcess(ownerIdentity)) {
-      try {
-        process.kill(owner.pid, "SIGKILL")
-      } catch {}
-    }
-    if (reaperIdentity && sameProcess(reaperIdentity)) {
-      try {
-        process.kill(reaper.pid, "SIGKILL")
-      } catch {}
-    }
-    if (owner) await withTimeout(owner.exited, 5_000).catch(() => undefined)
-    await withTimeout(reaper.exited, 5_000).catch(() => undefined)
-  }
-})
-
-test("a release cannot overtake a held acquire snapshot or be followed by resurrection", async () => {
+test("a newer release rejects an older held snapshot without resurrecting the group", async () => {
   if (process.platform === "win32") return
   const child = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
     stdin: "ignore",
@@ -879,6 +1005,8 @@ test("a release cannot overtake a held acquire snapshot or be followed by resurr
   try {
     const acquire = tracker.observe({ action: "acquire", ...group })
     await withTimeout(initialEvent.promise, 5_000)
+    if (sameProcess(identity)) process.kill(-child.pid, "SIGKILL")
+    await withTimeout(child.exited, 5_000)
     const release = tracker.observe({
       ...group,
       action: "release",
@@ -887,12 +1015,20 @@ test("a release cannot overtake a held acquire snapshot or be followed by resurr
       membersSnapshotComplete: true,
       generation: 2,
     })
-    expect(events.map((event) => event.action)).toEqual(["acquire"])
-    expect(owner.has(child.pid)).toBe(true)
+    await release
+    expect(events.map((event) => event.action)).toEqual(["acquire", "release"])
+    expect(owner.has(child.pid)).toBe(false)
+    expect(tracker.size).toBe(1)
 
     discovery.resolve({ members: [identity], complete: true })
-    await Promise.all([acquire, release])
-    expect(events.map((event) => event.action)).toEqual(["acquire", "acquire", "release"])
+    await acquire
+    await withTimeout(
+      (async () => {
+        while (tracker.size > 0) await Bun.sleep(20)
+      })(),
+      5_000,
+    )
+    expect(events.map((event) => event.action)).toEqual(["acquire", "release"])
     expect(owner.has(child.pid)).toBe(false)
     expect(tracker.size).toBe(0)
   } finally {
@@ -907,42 +1043,84 @@ test("a release cannot overtake a held acquire snapshot or be followed by resurr
   }
 })
 
-test("worker tracker retires ownership after many completed detached commands", async () => {
+test("Core-spawned completed commands retire Worker tracker ownership", async () => {
   if (process.platform === "win32") return
-  let tracker: ProcessGroup.WorkerTracker
-  tracker = ProcessGroup.makeWorkerTracker((event) => tracker.acknowledge(event.eventID))
-  const baseline = tracker.size
-  for (const index of Array.from({ length: 16 }, (_value, index) => index)) {
-    const child = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], {
-      stdin: "ignore",
-      stdout: "ignore",
-      stderr: "ignore",
-      detached: true,
-    })
-    const identity = processIdentity(child.pid)
-    if (!identity) throw new Error(`completed-command fixture ${index} has no process identity`)
-    const group = {
-      pgid: child.pid,
-      cleanupOwed: false,
-      identity,
-      members: [],
-      membersPending: false,
-      generation: 1,
+  await using directory = await tmpdir()
+  const home = directory.path
+  const recordFile = path.join(home, "retirement-record.json")
+  const resultFile = path.join(home, "retirement-result.json")
+  const ownerStartFile = path.join(home, "retirement-owner.json")
+  const ownerFile = path.join(import.meta.dir, "worker-process-group-owner.ts")
+  const ownerProcess = Bun.spawn([process.execPath, ownerFile], {
+    cwd: process.cwd(),
+    env: Object.fromEntries(
+      Object.entries({
+        ...process.env,
+        HOME: home,
+        OPENCODE_TEST_HOME: home,
+        OPENCODE_DB: ":memory:",
+        OPENCODE_CONFIG_CONTENT: "{}",
+        OPENCODE_DISABLE_PROJECT_CONFIG: "1",
+        OPENCODE_DISABLE_AUTOUPDATE: "1",
+        OPENCODE_DISABLE_AUTOCOMPACT: "1",
+        OPENCODE_DISABLE_MODELS_FETCH: "1",
+        SWX_TUI_GROUP_RECORD_FILE: recordFile,
+        SWX_TUI_GROUP_DISCOVERY_FAILURE: undefined,
+        SWX_TUI_GROUP_DISCOVERY_HOLD_FILE: undefined,
+        SWX_TUI_OWNER_ACTION: "retire-many",
+        SWX_TUI_OWNER_START_FILE: ownerStartFile,
+        SWX_TUI_OWNER_RESULT_FILE: resultFile,
+      }).filter((entry): entry is [string, string] => entry[1] !== undefined),
+    ),
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    detached: true,
+  })
+  const output = Promise.all([new Response(ownerProcess.stdout).text(), new Response(ownerProcess.stderr).text()])
+  const ownerIdentity = processIdentity(ownerProcess.pid)
+  try {
+    await withTimeout(
+      (async () => {
+        while (!(await Bun.file(ownerStartFile).exists())) await Bun.sleep(20)
+      })(),
+      10_000,
+    )
+    const result = await withTimeout(
+      Promise.race([
+        (async () => {
+          const deadline = Date.now() + 25_000
+          while (Date.now() < deadline) {
+            try {
+              const value: unknown = await Bun.file(resultFile).json()
+              if (typeof value === "object" && value !== null) return { type: "result" as const, value }
+            } catch {}
+            await Bun.sleep(20)
+          }
+          throw new Error("retirement fixture did not publish its tracker sizes")
+        })(),
+        ownerProcess.exited.then((code) => ({ type: "exit" as const, code })),
+      ]),
+      30_000,
+    )
+    if (result.type === "exit") {
+      const [stdout, stderr] = await withTimeout(output, 5_000)
+      throw new Error(`retirement owner exited ${result.code}: ${stdout}\n${stderr}`)
     }
-    try {
-      await tracker.observe({ action: "acquire", ...group })
-      expect(tracker.size).toBe(baseline + 1)
-      if (sameProcess(identity)) process.kill(-child.pid, "SIGKILL")
-      await withTimeout(child.exited, 5_000)
-      await tracker.observe({ ...group, action: "release", generation: 2 })
-      expect(tracker.size).toBe(baseline)
-    } finally {
-      if (sameProcess(identity)) {
-        try {
-          process.kill(-child.pid, "SIGKILL")
-        } catch {}
-      }
-      await withTimeout(child.exited, 5_000)
+    if (typeof result.value !== "object" || result.value === null || !("sizes" in result.value))
+      throw new Error("retirement owner returned no tracker size list")
+    const sizes = Array.isArray(result.value.sizes)
+      ? result.value.sizes.filter((size): size is number => typeof size === "number")
+      : []
+    expect(sizes).toEqual(Array.from({ length: 24 }, () => 0))
+    expect("ownerSize" in result.value && result.value.ownerSize).toBe(0)
+    expect(await withTimeout(ownerProcess.exited, 5_000)).toBe(0)
+  } finally {
+    if (ownerIdentity && sameProcess(ownerIdentity)) {
+      try {
+        process.kill(ownerProcess.pid, "SIGKILL")
+      } catch {}
     }
+    await withTimeout(ownerProcess.exited, 5_000).catch(() => undefined)
   }
-})
+}, 35_000)
