@@ -27,7 +27,7 @@ Newest first. Each entry names the upstream range brought in.
 - **2026-11-06** `696f41bc8e..055d95bb7e`, 84 upstream commits (fm/oc-v2-sync-394). Conflicts: see the resolution notes below.
   - `.gitignore` keeps both the test scratch and upstream artifact ignores. `package.json` keeps the fork Bun 1.4.4 and Solid 1.9.15 selections while taking upstream xAI 3.0.139. The Core runner applies the new identity headers to its provider turn and preserves the fork's auxiliary request helper. The OpenCode build keeps both the native library copy and upstream macOS ad-hoc re-signing.
   - Browser and Copilot donor behavior remains at one production owner; keep the fork's acknowledged late-exit and interleaved-replay tests. The run-process test keeps the real child exit signal with the live harness timeout; the Session LLM tests cover root/child sessions on built-in and custom providers; message conversion retains both existing checks and upstream xAI coverage.
-  - nix/hashes.json refresh pending: values come from the FFF native platform validation nix-node-modules job logs (all four systems) once the PR leaves draft.
+  - `nix/hashes.json` records the four native `nodeModules` outputs from FFF native platform validation run `42331661816` at PR head `8c6ebf4803b6000c5c607f25f66bac9e774018fb`; the run logs for all four systems match the values now stored in the file.
 - **2026-09-26** `2406400f0a..696f41bc8e`, 18 upstream commits (sync-upstream-20260926-095526). Conflicts: none.
   Upstream changed the local `setup-bun` action (explicit Bun version, Windows pinned to 1.4.2, the hoisted-linker
   workaround dropped, cache keyed by Bun version); reviewed and its pinned digest in `check-workflow-guards.ts`

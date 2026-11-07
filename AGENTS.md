@@ -155,6 +155,7 @@ const table = sqliteTable("session", {
 - `bun test` and `npm test` refuse at the repo root (guard: `do-not-run-tests-from-root`). Run one package's tests
   from its directory, like `packages/opencode`, or the whole unit suite with `tests/run.sh`, which runs every
   package's `test` through turbo as CI does and passes extra arguments on (`tests/run.sh --filter=@opencode-ai/core`).
+- `nix/hashes.json` values come from the FFF native platform validation `nix-node-modules` job logs (four systems, two of them macOS), which skip draft PRs; no fleet host runs nix, so a lockfile-changing PR refreshes them from that job after it leaves draft.
 
 ## Type Checking
 
