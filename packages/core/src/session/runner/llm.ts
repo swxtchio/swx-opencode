@@ -102,6 +102,8 @@ import { llmClient } from "../../effect/app-node-platform"
 
 const sessionHttp = (session: SessionSchema.Info) => ({
   headers: {
+    "x-opencode-session-id": session.id,
+    ...(session.parentID ? { "x-opencode-parent-session-id": session.parentID } : {}),
     "x-session-affinity": session.id,
     "X-Session-Id": session.id,
     ...(session.parentID ? { "x-parent-session-id": session.parentID } : {}),

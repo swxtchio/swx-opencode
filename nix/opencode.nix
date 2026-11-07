@@ -4,6 +4,7 @@
   callPackage,
   bun,
   nodejs,
+  darwin,
   sysctl,
   makeBinaryWrapper,
   models-dev,
@@ -25,6 +26,11 @@ stdenvNoCC.mkDerivation (finalAttrs: {
     makeBinaryWrapper
     models-dev
     writableTmpDirAsHomeHook
+  ]
+  ++ lib.optionals stdenvNoCC.hostPlatform.isDarwin [
+    # build.ts signs the Darwin binary after embedding the native library.
+    darwin.sigtool
+    darwin.cctools
   ];
 
   configurePhase = ''
@@ -37,10 +43,15 @@ stdenvNoCC.mkDerivation (finalAttrs: {
     runHook postConfigure
   '';
 
-  env.MODELS_DEV_API_JSON = "${models-dev}/dist/_api.json";
-  env.OPENCODE_DISABLE_MODELS_FETCH = true;
-  env.OPENCODE_VERSION = finalAttrs.version;
-  env.OPENCODE_CHANNEL = "prod";
+  env = {
+    MODELS_DEV_API_JSON = "${models-dev}/dist/_api.json";
+    OPENCODE_DISABLE_MODELS_FETCH = true;
+    OPENCODE_VERSION = finalAttrs.version;
+    OPENCODE_CHANNEL = "prod";
+  }
+  // lib.optionalAttrs stdenvNoCC.hostPlatform.isDarwin {
+    CODESIGN_ALLOCATE = "${darwin.cctools}/bin/${darwin.cctools.targetPrefix}codesign_allocate";
+  };
 
   buildPhase = ''
     runHook preBuild

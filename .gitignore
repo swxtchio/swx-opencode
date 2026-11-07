@@ -36,3 +36,4 @@ tsconfig.tsbuildinfo
 
 # Scratch state written by tools invoked from script/ during tests.
 script/.local/
+/artifacts/
